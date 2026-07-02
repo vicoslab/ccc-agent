@@ -649,6 +649,38 @@ class TestCheckBeforeFinal(unittest.TestCase):
         self.assertEqual(reloaded.repair_attempts, 1)
         self.assertIn(".env", text)
 
+    def test_same_file_conflict_requests_llm_repair_before_final(self):
+        session, root = self.h.running_session()
+        rel = "Projects/proj-a/conflict.txt"
+        base_path = os.path.join(root.base, rel)
+        os.makedirs(os.path.dirname(base_path), exist_ok=True)
+        with open(base_path, "w") as fh:
+            fh.write("alpha\nbeta\n")
+        branch_dir = os.path.join(root.store, "branches", root.branch)
+        os.makedirs(os.path.join(branch_dir, "touch-content"), exist_ok=True)
+        key = ctl._touch_content_key("/" + rel)
+        with open(os.path.join(branch_dir, "touch-content", key), "wb") as fh:
+            fh.write(b"alpha\nbeta\n")
+        with open(os.path.join(branch_dir, "touches.json"), "w") as fh:
+            json.dump({
+                "/" + rel: {
+                    "path": "/" + rel,
+                    "base_at_first_touch": ctl._path_identity(base_path),
+                    "base_content_key": key,
+                }
+            }, fh)
+        with open(base_path, "w") as fh:
+            fh.write("alpha current\nbeta\n")
+        self.touch(root, rel, "alpha session\nbeta\n")
+
+        result, text, reloaded = self.check(session.session_id)
+
+        self.assertEqual(result, ctl.CHECK_REPAIR)
+        self.assertEqual(reloaded.repair_attempts, 1)
+        self.assertIn("potential-conflict", text)
+        self.assertIn("/storage/user/Projects/proj-a/conflict.txt", text)
+        self.assertIn("latest session would win", text)
+
     def test_check_before_final_ignores_infra_patterns(self):
         session, root = self.h.running_session()
         session.policy["ignore_patterns"] = ["/storage/user/.codex"]

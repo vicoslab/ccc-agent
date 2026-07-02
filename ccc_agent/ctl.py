@@ -31,6 +31,113 @@ CHECK_EXHAUSTED = "exhausted"  # dirty, budget spent: defer to human review
 # States whose BranchFS branches should already be closed/discarded. Failed and
 # pending-review sessions are deliberately kept for manual recovery/review.
 CLEANUP_STATES = ("auto-committed", "committed", "aborted")
+MAX_TEXT_MERGE_BYTES = 1024 * 1024
+
+
+def _touch_content_key(relpath):
+    return relpath.encode("utf-8", "surrogateescape").hex() + ".base"
+
+
+def _branch_dir(root):
+    return os.path.join(root.store, "branches", root.branch)
+
+
+def _touches_path(root):
+    return os.path.join(_branch_dir(root), "touches.json")
+
+
+def _touch_content_path(root, key):
+    return os.path.join(_branch_dir(root), "touch-content", key)
+
+
+def _load_touch_records(root):
+    try:
+        with open(_touches_path(root)) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _path_identity(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return {"exists": False, "kind": "missing", "bytes": 0,
+                "mtime_ns": None}
+    if os.path.isdir(path) and not os.path.islink(path):
+        kind = "dir"
+        size = 0
+    elif os.path.islink(path):
+        kind = "symlink"
+        size = 0
+    elif os.path.isfile(path):
+        kind = "file"
+        size = st.st_size
+    else:
+        kind = "other"
+        size = 0
+    return {"exists": True, "kind": kind, "bytes": size,
+            "mtime_ns": getattr(st, "st_mtime_ns", None)}
+
+
+def _read_bounded_text(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not os.path.isfile(path) or st.st_size > MAX_TEXT_MERGE_BYTES:
+        return None
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if b"\0" in data:
+        return None
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return data
+
+
+def _changed_range(base, changed):
+    prefix = 0
+    while prefix < len(base) and prefix < len(changed) and base[prefix] == changed[prefix]:
+        prefix += 1
+    suffix = 0
+    while (suffix < len(base) - prefix and suffix < len(changed) - prefix and
+           base[len(base) - 1 - suffix] == changed[len(changed) - 1 - suffix]):
+        suffix += 1
+    base_end = len(base) - suffix
+    changed_end = len(changed) - suffix
+    return prefix, base_end, changed[prefix:changed_end]
+
+
+def _try_three_way_text_merge(base, current, session):
+    if current == session:
+        return session
+    if base == current:
+        return session
+    if base == session:
+        return current
+    try:
+        base_lines = base.decode("utf-8").splitlines(True)
+        current_lines = current.decode("utf-8").splitlines(True)
+        session_lines = session.decode("utf-8").splitlines(True)
+    except UnicodeDecodeError:
+        return None
+    cur_start, cur_end, cur_repl = _changed_range(base_lines, current_lines)
+    ses_start, ses_end, ses_repl = _changed_range(base_lines, session_lines)
+    if not (cur_end <= ses_start or ses_end <= cur_start):
+        return None
+    if cur_start <= ses_start:
+        merged = (base_lines[:cur_start] + cur_repl +
+                  base_lines[cur_end:ses_start] + ses_repl +
+                  base_lines[ses_end:])
+    else:
+        merged = (base_lines[:ses_start] + ses_repl +
+                  base_lines[ses_end:cur_start] + cur_repl +
+                  base_lines[cur_end:])
+    return "".join(merged).encode("utf-8")
 
 
 def _utc_seconds(stamp):
@@ -544,17 +651,28 @@ class Controller(object):
         # files) stays in the branch and is discarded unless an operator
         # explicitly opts in with include_ignored.
         changes = self._changes(session, include_ignored=include_ignored)
+        commit_reports = []
         try:
             for root, change in changes:
-                self._apply_change_from_store(root, change)
+                report = self._apply_change_from_store(root, change)
+                if report:
+                    commit_reports.append(report)
         except Exception as exc:
             session.add_event("error", "commit failed, branch preserved: %s" % exc)
             self.store.save(session)
             raise ControlError("commit failed, branch preserved: %s" % exc)
+        self._write_commit_conflict_report(session, commit_reports)
         for name, root in sorted(session.protected_roots.items()):
             self._discard_branch(session, name, root, "commit cleanup",
                                  strict=False)
             session.add_event("committed-root", name)
+        conflicts = [r for r in commit_reports if r.get("kind") == "conflict"]
+        auto_merges = [r for r in commit_reports if r.get("kind") == "auto_merge"]
+        if conflicts or auto_merges:
+            session.add_event(
+                "commit-conflict-report",
+                "%d auto-merge(s), %d conflict(s); latest session won conflicts"
+                % (len(auto_merges), len(conflicts)))
         session.transition("committed")
         self.store.save(session)
         return session
@@ -579,10 +697,86 @@ class Controller(object):
         delta = os.path.join(root.store, "branches", root.branch, "files", rel)
         return rel, delta, os.path.join(root.base, rel)
 
+    def _touch_record_for_rel(self, root, rel):
+        touches = _load_touch_records(root)
+        return touches.get("/" + rel) or touches.get(rel)
+
+    def _commit_report_for_change(self, root, change, rel, delta, base):
+        record = self._touch_record_for_rel(root, rel)
+        if not record:
+            return None, None
+        base_at_first = record.get("base_at_first_touch") or {}
+        current = _path_identity(base)
+        if base_at_first == current:
+            return None, None
+
+        action = "delete" if change.op == "D" else (
+            "modify" if base_at_first.get("exists") else "create")
+        common = {
+            "root": root.name,
+            "path": change.path,
+            "relpath": "/" + rel,
+            "session_action": action,
+            "base_at_first_touch": base_at_first,
+            "base_at_commit": current,
+        }
+
+        if (change.op != "D" and base_at_first.get("kind") == "file" and
+                current.get("kind") == "file"):
+            key = record.get("base_content_key") or _touch_content_key("/" + rel)
+            try:
+                with open(_touch_content_path(root, key), "rb") as fh:
+                    base_bytes = fh.read()
+            except OSError:
+                base_bytes = None
+            current_bytes = _read_bounded_text(base)
+            session_bytes = _read_bounded_text(delta)
+            if (base_bytes is not None and current_bytes is not None and
+                    session_bytes is not None):
+                merged = _try_three_way_text_merge(base_bytes, current_bytes,
+                                                   session_bytes)
+                if merged is not None:
+                    report = dict(common)
+                    report.update({"kind": "auto_merge",
+                                   "resolution": "clean_text_merge"})
+                    return report, merged
+
+        report = dict(common)
+        report.update({"kind": "conflict",
+                       "resolution": "session_won",
+                       "reason": "parent_changed_after_first_touch"})
+        return report, None
+
+    def _write_commit_conflict_report(self, session, reports):
+        if not reports:
+            return
+        review = self.store.review_dir(session.session_id)
+        os.makedirs(review, exist_ok=True)
+        path = os.path.join(review, "commit-conflicts.json")
+        data = {
+            "auto_merges": [r for r in reports if r.get("kind") == "auto_merge"],
+            "conflicts": [r for r in reports if r.get("kind") == "conflict"],
+        }
+        with open(path, "w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
     def _apply_change_from_store(self, root, change):
         """Apply one change to base by reading its delta from the store (the
         branch is not mounted post-session)."""
-        _rel, delta, base = self._store_paths(root, change)
+        rel, delta, base = self._store_paths(root, change)
+        report, merged = self._commit_report_for_change(root, change, rel, delta, base)
+        if merged is not None:
+            parent = os.path.dirname(base)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if os.path.islink(base):
+                os.unlink(base)
+            elif os.path.isdir(base):
+                shutil.rmtree(base)
+            with open(base, "wb") as fh:
+                fh.write(merged)
+            return report
         if change.op == "D":
             if os.path.islink(base) or os.path.isfile(base):
                 os.unlink(base)
@@ -603,6 +797,7 @@ class Controller(object):
             elif os.path.isdir(base):
                 shutil.rmtree(base)
             shutil.copy2(delta, base, follow_symlinks=False)
+        return report
 
     def _changes(self, session, include_ignored=False):
         out = []
@@ -742,13 +937,25 @@ class Controller(object):
 
         config = PolicyConfig.from_dict(session.policy)
         changes = []
+        potential_conflicts = []
         for _name, root in sorted(session.protected_roots.items()):
-            changes.extend(self._live_status(session, root,
-                                            action="check-before-final"))
+            root_changes = self._live_status(session, root,
+                                             action="check-before-final")
+            changes.extend(root_changes)
+            for change in root_changes:
+                rel, delta, base = self._store_paths(root, change)
+                report, _merged = self._commit_report_for_change(root, change,
+                                                                  rel, delta,
+                                                                  base)
+                if report and report.get("kind") == "conflict":
+                    potential_conflicts.append(report)
         changes = filter_ignored(changes, config, self.alias_map)
+        allowed_paths = set(change.path for change in changes)
+        potential_conflicts = [report for report in potential_conflicts
+                               if report.get("path") in allowed_paths]
         out_of_scope, deny_matches = classify(changes, config, self.alias_map)
 
-        if not out_of_scope and not deny_matches:
+        if not out_of_scope and not deny_matches and not potential_conflicts:
             session.add_event("check-clean",
                               "%d change(s), all in scope" % len(changes))
             self.store.save(session)
@@ -772,12 +979,12 @@ class Controller(object):
         session.repair_attempts += 1
         session.add_event(
             "repair-requested",
-            "attempt %d/%d: %d out-of-scope, %d deny match(es)"
+            "attempt %d/%d: %d out-of-scope, %d deny match(es), %d conflict(s)"
             % (session.repair_attempts, config.max_policy_repair_attempts,
-               len(out_of_scope), len(deny_matches)))
+               len(out_of_scope), len(deny_matches), len(potential_conflicts)))
         self.store.save(session)
 
-        out.write("policy violations; revert these before finishing "
+        out.write("policy/conflict issues; fix these before finishing "
                   "(attempt %d/%d):\n"
                   % (session.repair_attempts,
                      config.max_policy_repair_attempts))
@@ -785,6 +992,8 @@ class Controller(object):
             out.write("  out-of-scope: %s\n" % path)
         for match in deny_matches:
             out.write("  deny-pattern %s: %s\n" % (match.pattern, match.path))
-        out.write("undo the listed changes (restore original content, or "
-                  "delete files you created), then finish again.\n")
+        for conflict in potential_conflicts:
+            out.write("  potential-conflict: %s (%s; latest session would win unless reconciled)\n"
+                      % (conflict.get("path"), conflict.get("session_action")))
+        out.write("undo, revert, or reconcile the listed changes, then finish again.\n")
         return CHECK_REPAIR

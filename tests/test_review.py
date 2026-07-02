@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import unittest
 
+import ccc_agent.ctl as ctl_module
 from ccc_agent.branchfs import FakeBranchFS
 from ccc_agent.ctl import Controller
 from ccc_agent.paths import AliasMap
@@ -48,6 +49,28 @@ class ReviewHarness(object):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w") as fh:
             fh.write(content)
+
+    def write_base(self, rel, content):
+        p = os.path.join(self.base, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            fh.write(content)
+        return p
+
+    def record_first_touch(self, rel, base_path, base_content):
+        branch_dir = os.path.join(self.root.store, "branches", self.root.branch)
+        os.makedirs(os.path.join(branch_dir, "touch-content"), exist_ok=True)
+        key = ctl_module._touch_content_key("/" + rel)
+        with open(os.path.join(branch_dir, "touch-content", key), "wb") as fh:
+            fh.write(base_content.encode("utf-8"))
+        with open(os.path.join(branch_dir, "touches.json"), "w") as fh:
+            ctl_module.json.dump({
+                "/" + rel: {
+                    "path": "/" + rel,
+                    "base_at_first_touch": ctl_module._path_identity(base_path),
+                    "base_content_key": key,
+                }
+            }, fh)
 
     def pending(self):
         self.session.state = "pending-review"
@@ -90,6 +113,47 @@ class TestReview(unittest.TestCase):
         self.assertEqual(session.state, "committed")
         self.assertTrue(self.h.base_has("keep.txt"))
         self.assertFalse(self.h.base_has("drop.txt"))
+
+    def test_accept_auto_merges_clean_same_file_text_changes(self):
+        rel = "Projects/proj-a/merge.txt"
+        base_path = self.h.write_base(rel, "one\ntwo\nthree\n")
+        self.h.record_first_touch(rel, base_path, "one\ntwo\nthree\n")
+        self.h.write_base(rel, "ONE current\ntwo\nthree\n")
+        self.h.write(rel, "one\ntwo\nTHREE session\n")
+        self.h.pending()
+
+        session = self.h.ctl.review(self.h.session.session_id, accept=True)
+
+        self.assertEqual(session.state, "committed")
+        with open(os.path.join(self.h.base, rel)) as fh:
+            self.assertEqual(fh.read(), "ONE current\ntwo\nTHREE session\n")
+        report_path = os.path.join(self.h.store.review_dir(session.session_id),
+                                   "commit-conflicts.json")
+        with open(report_path) as fh:
+            report = ctl_module.json.load(fh)
+        self.assertEqual(len(report["auto_merges"]), 1)
+        self.assertEqual(report["conflicts"], [])
+
+    def test_accept_reports_overlapping_same_file_conflict_latest_session_wins(self):
+        rel = "Projects/proj-a/conflict.txt"
+        base_path = self.h.write_base(rel, "alpha\nbeta\n")
+        self.h.record_first_touch(rel, base_path, "alpha\nbeta\n")
+        self.h.write_base(rel, "alpha current\nbeta\n")
+        self.h.write(rel, "alpha session\nbeta\n")
+        self.h.pending()
+
+        session = self.h.ctl.review(self.h.session.session_id, accept=True)
+
+        self.assertEqual(session.state, "committed")
+        with open(os.path.join(self.h.base, rel)) as fh:
+            self.assertEqual(fh.read(), "alpha session\nbeta\n")
+        report_path = os.path.join(self.h.store.review_dir(session.session_id),
+                                   "commit-conflicts.json")
+        with open(report_path) as fh:
+            report = ctl_module.json.load(fh)
+        self.assertEqual(report["auto_merges"], [])
+        self.assertEqual(len(report["conflicts"]), 1)
+        self.assertEqual(report["conflicts"][0]["resolution"], "session_won")
 
     def test_emit_patch_shows_unified_diff(self):
         # seed a base file, modify it in the view -> patch should show the hunk
