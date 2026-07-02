@@ -60,6 +60,13 @@ created -> mounting -> running -> finalizing -> frozen
   re-ensures it from session metadata (`branchfs start-daemon --base ... --storage ...`).
 - Commit failures never abort: the branch is preserved and the session is
   marked `failed` for manual recovery.
+- BranchFS branches use lazy live-base inheritance: a running session keeps its
+  own deltas/tombstones, while untouched inherited paths may reflect commits
+  from other sessions. Same-path parent changes are handled at commit/review
+  time. Clean text 3-way merges are treated like disjoint changes; unclean
+  overlaps/binary/type/delete conflicts are recorded but do not make low-level
+  commit fail by default. ccc-agent must surface those records to both blocking
+  LLM repair hooks and human review artifacts.
 - Nested agents: a shim or `ccc-agent run` invoked with `CCC_AGENT_SESSION`
   already set reuses the outer session — one review unit per task, no branch
   explosion.

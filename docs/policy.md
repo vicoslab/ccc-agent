@@ -30,6 +30,30 @@ mode=workspace-auto | training-run:
 via either alias (`/home/...` or `/storage/user/...`); canonicalization makes
 them equivalent.
 
+## Multi-session conflicts and LLM/human handling
+
+BranchFS provides lazy live-base views, not frozen snapshots. A session keeps its
+own branch deltas/tombstones, but inherited paths it never touched may reflect
+newer commits from other sessions.
+
+When a parent/base path changed after this session first touched the same path,
+BranchFS/ccc-agent should first try a git-style 3-way merge for regular text
+files. Clean non-overlapping merges are committed as merged content and treated
+like disjoint-path changes for policy. Unclean overlaps, binary files,
+delete-vs-modify, type changes, symlinks/directories, or missing merge-base
+content become conflict records.
+
+Conflict records are **review signals**, not generic commit failures. Normal
+latest-session-wins policy lets commit proceed while recording the conflict. The
+same records must be usable in two paths:
+
+- **LLM-handled:** `check-before-final` / turn hooks print concise conflict
+  summaries so the agent can reconcile in the still-running branch before
+  finalization.
+- **Human-handled:** review artifacts and CLI output list conflicts separately
+  from ordinary changes and ignored paths, so a human can inspect or request
+  follow-up repair.
+
 ## Pattern semantics (`ccc_agent.policy.path_matches`)
 
 - pattern without `/` — matches any single path component:
