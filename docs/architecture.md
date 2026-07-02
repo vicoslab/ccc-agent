@@ -90,7 +90,9 @@ agent process. Layout the agent sees:
 /ccc-agent/plugins/…              CCC agent plugin root (ro) when supported
 ~/.codex/plugins/ccc-agent       Codex plugin scan path (ro bind on top of
                                   shared ~/.codex when Codex requires it)
-/run/ccc-agent/control.sock       per-turn control socket (per-turn mode)
+/tmp/ccc-agent/control.sock       per-turn control socket (per-turn mode;
+                                  under private /tmp so it does not depend on
+                                  permissions in the bound container /run)
 ```
 
 The CCC agent plugin is a **read-only** bind of root-owned package assets,

@@ -33,9 +33,12 @@ ENV_STATE_DIR = "CCC_AGENT_STATE_DIR"
 ENV_CONTROL_SOCK = "CCC_AGENT_CONTROL_SOCK"
 ENV_CONTROL_TOKEN = "CCC_AGENT_CONTROL_TOKEN"
 
-# Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox
-# (the host-side socket lives under the state dir, outside the sandbox).
-SANDBOX_CONTROL_SOCK = "/run/ccc-agent/control.sock"
+# Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox.
+# The host-side socket lives under the state dir, outside the sandbox.  Keep the
+# in-sandbox path under private /tmp rather than /run: default container /run is
+# now bound into the sandbox and may be root-owned, so bwrap cannot create
+# /run/ccc-agent as an unprivileged user.
+SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 
 
 class ResumeError(Exception):

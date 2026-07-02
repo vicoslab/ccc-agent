@@ -1039,11 +1039,14 @@ class TestBwrapConfinement(unittest.TestCase):
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
             session = run_session(self._bwrap_config(["my-agent"]))
         argv = seen["argv"]
-        sock = "/run/ccc-agent/control.sock"
-        # the host socket is bind-mounted to the fixed in-sandbox path
+        sock = "/tmp/ccc-agent/control.sock"
+        # the host socket is bind-mounted to a fixed in-sandbox path under
+        # private /tmp, not under /run.  The default container /run bind may be
+        # root-owned, so bwrap cannot mkdir /run/ccc-agent there.
         bind_dests = [argv[k + 2] for k in range(len(argv) - 2)
                       if argv[k] == "--bind"]
         self.assertIn(sock, bind_dests)
+        self.assertNotIn("/run/ccc-agent/control.sock", bind_dests)
         # the in-sandbox env points the hook at that socket + a token
         env = {argv[k + 1]: argv[k + 2] for k in range(len(argv) - 2)
                if argv[k] == "--setenv"}
