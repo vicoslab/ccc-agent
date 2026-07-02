@@ -7,6 +7,7 @@ agent (and even the node it ran on) is gone.
 
 import json
 import os
+from collections import Counter
 
 
 def _write_json(path, data):
@@ -17,9 +18,11 @@ def _write_json(path, data):
     os.replace(tmp, path)
 
 
-def write_review(store, session, changes_by_root, decision, warnings_by_root=None):
-    """Write session.json, per-root status/warning JSON, policy decision, summary.md."""
+def write_review(store, session, changes_by_root, decision,
+                 warnings_by_root=None, ignored_by_root=None):
+    """Write session, status, ignored, warning, and decision artifacts."""
     warnings_by_root = warnings_by_root or {}
+    ignored_by_root = ignored_by_root or {}
     review = store.review_dir(session.session_id)
     os.makedirs(review, exist_ok=True)
 
@@ -27,6 +30,10 @@ def write_review(store, session, changes_by_root, decision, warnings_by_root=Non
     for root_name, changes in changes_by_root.items():
         _write_json(os.path.join(review, "status.%s.json" % root_name),
                     [c.to_dict() for c in changes])
+    for root_name in changes_by_root:
+        ignored = ignored_by_root.get(root_name, [])
+        _write_json(os.path.join(review, "ignored.%s.json" % root_name),
+                    [c.to_dict() for c in ignored])
     for root_name, warnings in warnings_by_root.items():
         _write_json(os.path.join(review, "warnings.%s.json" % root_name),
                     [w.to_dict() for w in warnings])
@@ -35,12 +42,23 @@ def write_review(store, session, changes_by_root, decision, warnings_by_root=Non
 
     with open(os.path.join(review, "summary.md"), "w") as fh:
         fh.write(render_summary(session, changes_by_root, decision,
-                                warnings_by_root=warnings_by_root))
+                                warnings_by_root=warnings_by_root,
+                                ignored_by_root=ignored_by_root))
     return review
 
 
-def render_summary(session, changes_by_root, decision, warnings_by_root=None):
+def _ignored_pattern_counts(ignored_by_root):
+    counts = Counter()
+    for ignored in ignored_by_root.values():
+        for item in ignored:
+            counts[item.pattern] += 1
+    return counts
+
+
+def render_summary(session, changes_by_root, decision, warnings_by_root=None,
+                   ignored_by_root=None):
     warnings_by_root = warnings_by_root or {}
+    ignored_by_root = ignored_by_root or {}
     lines = []
     out = lines.append
     out("# Agent session %s" % session.session_id)
@@ -63,8 +81,10 @@ def render_summary(session, changes_by_root, decision, warnings_by_root=None):
     out("")
     for name, root in sorted(session.protected_roots.items()):
         changes = changes_by_root.get(name, [])
-        out("- `%s`: branch `%s` over `%s` (%d change(s))"
-            % (name, root.branch, root.base, len(changes)))
+        ignored = ignored_by_root.get(name, [])
+        ignored_detail = (", %d ignored" % len(ignored)) if ignored else ""
+        out("- `%s`: branch `%s` over `%s` (%d change(s)%s)"
+            % (name, root.branch, root.base, len(changes), ignored_detail))
     out("")
     if decision.reasons:
         out("## Decision reasons")
@@ -107,6 +127,25 @@ def render_summary(session, changes_by_root, decision, warnings_by_root=None):
     if not total:
         out("(none)")
     out("")
+    ignored_counts = _ignored_pattern_counts(ignored_by_root)
+    ignored_total = sum(ignored_counts.values())
+    if ignored_total:
+        out("## Ignored by policy (not committed)")
+        out("")
+        out("These changes are excluded from ordinary `diff`, "
+            "`review --accept`, and `commit` decisions and will be "
+            "discarded unless explicitly included.")
+        out("")
+        for pattern, count in sorted(ignored_counts.items()):
+            noun = "change" if count == 1 else "changes"
+            out("- `%s`: %d %s" % (pattern, count, noun))
+        out("")
+        out("To inspect them, run `ccc-agent diff %s --show-ignored` or "
+            "`ccc-agent review %s --show-ignored`."
+            % (session.session_id, session.session_id))
+        out("To accept them too, run `ccc-agent review %s --accept "
+            "--include-ignored`." % session.session_id)
+        out("")
     out("## Next steps")
     out("")
     out("```bash")

@@ -776,11 +776,18 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
         p = sub.add_parser(name)
         _add_session_id_arg(p, multiple=name in _BATCH_SESSION_ID_CTL_OPS)
     dp = sub.add_parser("diff", help="show changed paths, or a unified diff for one file")
+    dp.add_argument("--show-ignored", action="store_true",
+                    help="also list policy-ignored/cache/runtime changes")
     _add_session_id_arg(dp)
     dp.add_argument("path", nargs="?", help="optional changed file to diff")
     rv = sub.add_parser("review", help="post-session change review")
     _add_session_id_arg(rv)
     rv.add_argument("--accept", action="store_true", help="commit everything")
+    rv.add_argument("--include-ignored", action="store_true",
+                    help="with --accept/--commit/--emit-patch, include "
+                         "policy-ignored cache/runtime changes too")
+    rv.add_argument("--show-ignored", action="store_true",
+                    help="show full policy-ignored/cache/runtime change list")
     rv.add_argument("--reject", action="store_true",
                     help="discard everything (revert)")
     rv.add_argument("--commit", dest="commit_paths",
@@ -821,14 +828,16 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
         elif args.cmd == "status":
             controller.status(args.session_id)
         elif args.cmd == "diff":
-            controller.diff(args.session_id, path=args.path)
+            controller.diff(args.session_id, path=args.path,
+                            show_ignored=args.show_ignored)
         elif args.cmd == "review":
             commit_paths = ([p for p in args.commit_paths.split(",") if p]
                             if args.commit_paths else None)
             session = controller.review(
                 args.session_id, accept=args.accept, reject=args.reject,
                 commit_paths=commit_paths, emit_patch=args.emit_patch,
-                apply_patch=args.apply_patch)
+                apply_patch=args.apply_patch, show_ignored=args.show_ignored,
+                include_ignored=args.include_ignored)
             if session.state in ("committed", "aborted"):
                 sys.stderr.write("session %s now %s\n"
                                  % (session.session_id, session.state))
@@ -882,9 +891,10 @@ _RUN_OPTIONS = (
     "--config", "--help",
 )
 _CLEANUP_OPTIONS = ("--older-than", "--dry-run", "--config", "--help")
+_DIFF_OPTIONS = ("--show-ignored", "--config", "--help")
 _REVIEW_OPTIONS = (
     "--accept", "--reject", "--commit", "--emit-patch", "--apply-patch",
-    "--config", "--help",
+    "--show-ignored", "--include-ignored", "--config", "--help",
 )
 _RESUME_OPTIONS = (
     "--agent", "--force", "--full-isolation", "--protect-agent-state",
@@ -999,6 +1009,8 @@ def _positionals_before_completion_token(tokens, cmd_idx, cword, op):
 def _options_for_completion(op):
     if op == "cleanup":
         return _CLEANUP_OPTIONS
+    if op == "diff":
+        return _DIFF_OPTIONS
     if op == "review":
         return _REVIEW_OPTIONS
     if op == "resume":

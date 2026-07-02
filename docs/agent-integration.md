@@ -130,9 +130,11 @@ A session that exits with un-committed deltas stays as a reviewable branch:
 
 ```bash
 ccc-agent list                       # sessions + states
-ccc-agent review <session>           # browse the diff
-ccc-agent review <session> --accept  # commit all
-ccc-agent review <session> --reject  # discard all
+ccc-agent review <session>           # browse commit-set + ignored-change summary
+ccc-agent diff <session> --show-ignored    # include full ignored/cache/runtime list
+ccc-agent review <session> --accept  # commit policy-visible changes
+ccc-agent review <session> --accept --include-ignored  # also commit ignored changes
+ccc-agent review <session> --reject  # discard all branch deltas
 ccc-agent review <session> --commit a,b   # commit only a,b (rest discarded)
 ccc-agent review <session> --emit-patch > c.patch   # line-level: prune hunks…
 ccc-agent review <session> --apply-patch c.patch    # …then apply

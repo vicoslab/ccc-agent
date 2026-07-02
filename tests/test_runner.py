@@ -252,6 +252,32 @@ class TestRunSession(unittest.TestCase):
         self.assertIn(session.session_id, summary)
         self.assertIn("ccc-agent commit", summary)
 
+    def test_review_artifacts_record_ignored_policy_changes(self):
+        session = run_session(self.h.config([
+            "sh", "-c",
+            "echo keep > result.txt; mkdir -p ../../.cache/pip; "
+            "echo wheel > ../../.cache/pip/wheel.txt",
+        ], mode="manual"))
+        self.assertEqual(session.state, "pending-review")
+
+        review = self.h.store.review_dir(session.session_id)
+        with open(os.path.join(review, "status.storage_user.json")) as fh:
+            visible = json.load(fh)
+        with open(os.path.join(review, "ignored.storage_user.json")) as fh:
+            ignored = json.load(fh)
+
+        self.assertEqual([c["path"] for c in visible],
+                         ["/storage/user/Projects/proj-a/result.txt"])
+        self.assertEqual([c["path"] for c in ignored],
+                         ["/storage/user/.cache/pip/wheel.txt"])
+        self.assertEqual(ignored[0]["ignore_pattern"], ".cache")
+
+        with open(os.path.join(review, "summary.md")) as fh:
+            summary = fh.read()
+        self.assertIn("## Ignored by policy (not committed)", summary)
+        self.assertIn(".cache", summary)
+        self.assertIn("--include-ignored", summary)
+
     def test_mounts_and_reviews_live_under_session_bundle(self):
         session = run_session(self.h.config(
             ["sh", "-c", "echo x > ../../outside.txt"]))
