@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from ccc_agent import ctl
 from ccc_agent.branchfs import (BranchfsError, FakeBranchFS, StatusReport,
@@ -472,6 +473,25 @@ class TestController(unittest.TestCase):
                       text)
         self.assertNotIn("D /storage/user/domen-cuda10/.gitconfig (tombstone",
                          text)
+
+    def test_normalized_change_view_does_not_scan_deletes_pairwise(self):
+        changes = [
+            Change("D", "/storage/user/bulk/file-%04d.txt" % idx,
+                   "tombstone", 0, "storage")
+            for idx in range(1200)
+        ]
+        calls = []
+        original = ctl._is_descendant_path
+
+        def counted(child, parent):
+            calls.append((child, parent))
+            return original(child, parent)
+
+        with mock.patch("ccc_agent.ctl._is_descendant_path", side_effect=counted):
+            normalized = ctl._normalized_change_view(changes)
+
+        self.assertEqual(len(normalized), len(changes))
+        self.assertLess(len(calls), len(changes) * 10)
 
     def test_commit_pending_session(self):
         session = self.pending_session()

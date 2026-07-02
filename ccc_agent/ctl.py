@@ -88,50 +88,46 @@ def _normalized_change_view(changes):
     """
     normalized = [Change(c.op, c.path, c.kind, c.bytes, c.root,
                          summary=getattr(c, "summary", ""))
-                  for c in changes]
-    non_delete_by_key = {}
+                  for c in net_final_changes(changes)]
+    visible_delete_paths = {}
     for change in normalized:
-        if change.op != "D":
-            key = (change.root, os.path.normpath(change.path))
-            non_delete_by_key.setdefault(key, []).append(change)
-
-    def shadowed_by_non_dir_delta(change):
-        key = (change.root, os.path.normpath(change.path))
-        return any(candidate.kind != "dir"
-                   for candidate in non_delete_by_key.get(key, ()))
-
-    visible_deletes = [change for change in normalized
-                       if change.op == "D" and not
-                       shadowed_by_non_dir_delta(change)]
-    collapsed = set()
-    nested_counts = {id(change): 0 for change in visible_deletes}
+        if change.op == "D":
+            visible_delete_paths.setdefault(change.root, set()).add(
+                os.path.normpath(change.path))
 
     def outermost_visible_delete_ancestor(change):
-        path = os.path.normpath(change.path)
-        ancestors = [candidate for candidate in visible_deletes
-                     if candidate.root == change.root and
-                     _is_descendant_path(path,
-                                         os.path.normpath(candidate.path))]
-        if not ancestors:
-            return None
-        return min(ancestors, key=lambda item: len(os.path.normpath(item.path)))
+        visible = visible_delete_paths.get(change.root, set())
+        current = os.path.normpath(change.path).rstrip(os.sep)
+        ancestor = None
+        parent = os.path.dirname(current)
+        while parent and parent != current:
+            if parent in visible:
+                ancestor = parent
+            if parent == os.sep:
+                break
+            current = parent
+            parent = os.path.dirname(current)
+        return ancestor
 
+    collapsed = set()
+    nested_counts = {(change.root, os.path.normpath(change.path)): 0
+                     for change in normalized if change.op == "D"}
     for change in normalized:
         if change.op != "D":
             continue
         ancestor = outermost_visible_delete_ancestor(change)
         if ancestor is not None:
-            collapsed.add(id(change))
-            nested_counts[id(ancestor)] += 1
+            key = (change.root, os.path.normpath(change.path))
+            collapsed.add(key)
+            nested_counts[(change.root, ancestor)] += 1
 
     out = []
     for change in normalized:
         if change.op == "D":
-            if shadowed_by_non_dir_delta(change):
+            key = (change.root, os.path.normpath(change.path))
+            if key in collapsed:
                 continue
-            if id(change) in collapsed:
-                continue
-            summary = _nested_delete_summary(nested_counts.get(id(change), 0))
+            summary = _nested_delete_summary(nested_counts.get(key, 0))
             if summary and not change.summary:
                 change.summary = summary
         out.append(change)

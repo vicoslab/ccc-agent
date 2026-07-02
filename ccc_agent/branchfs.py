@@ -153,9 +153,17 @@ def _changes_from_status(data, root):
     """
     entries = list(data.get("diff", ()))
     relpaths = [e.get("path", "").lstrip("/") for e in entries]
+    rels_with_changed_descendants = set()
+    for relpath in relpaths:
+        current = relpath.rstrip("/")
+        parent = os.path.dirname(current)
+        while parent and parent != current:
+            rels_with_changed_descendants.add(parent)
+            current = parent
+            parent = os.path.dirname(current)
 
     def has_changed_descendant(relpath):
-        return any(_is_descendant_path(other, relpath) for other in relpaths)
+        return relpath.rstrip("/") in rels_with_changed_descendants
 
     non_delete_by_rel = {}
     for entry in entries:
@@ -168,24 +176,31 @@ def _changes_from_status(data, root):
                    for entry in non_delete_by_rel.get(relpath, ()))
 
     visible_delete_rels = []
+    visible_delete_set = set()
     for entry in entries:
         relpath = entry.get("path", "").lstrip("/")
         kind = entry.get("kind", "file")
         if kind == "dir" and has_changed_descendant(relpath):
             continue
-        if entry.get("op") == "delete" and not \
-                tombstone_shadowed_by_non_dir_delta(relpath):
+        if (entry.get("op") == "delete" and
+                not tombstone_shadowed_by_non_dir_delta(relpath) and
+                relpath not in visible_delete_set):
             visible_delete_rels.append(relpath)
+            visible_delete_set.add(relpath)
 
     collapsed_deletes = set()
     nested_delete_counts = {relpath: 0 for relpath in visible_delete_rels}
 
     def outermost_visible_delete_ancestor(relpath):
-        ancestors = [candidate for candidate in visible_delete_rels
-                     if _is_descendant_path(relpath, candidate)]
-        if not ancestors:
-            return None
-        return min(ancestors, key=len)
+        current = relpath.rstrip("/")
+        ancestor = None
+        parent = os.path.dirname(current)
+        while parent and parent != current:
+            if parent in visible_delete_set:
+                ancestor = parent
+            current = parent
+            parent = os.path.dirname(current)
+        return ancestor
 
     for entry in entries:
         if entry.get("op") != "delete":

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import ccc_agent.branchfs as branchfs_module
 from ccc_agent.branchfs import BranchfsCli, BranchfsError, FakeBranchFS
 from ccc_agent.session import ProtectedRoot
 
@@ -230,6 +231,29 @@ class TestBranchfsCli(unittest.TestCase):
                          "/storage/user/Projects/proj-a/settings.json")
         self.assertEqual(changes[0].op, "M")
         self.assertEqual(changes[0].kind, "file")
+
+    def test_status_parsing_does_not_scan_entries_pairwise(self):
+        status = dict(STATUS_JSON)
+        status["diff"] = [
+            {"op": "delete", "path": "bulk/file-%04d.txt" % idx,
+             "kind": "tombstone", "bytes": 0}
+            for idx in range(1200)
+        ]
+        runner = RecordingRunner(outputs={"status": json.dumps(status)})
+        cli = BranchfsCli(run=runner)
+        calls = []
+        original = branchfs_module._is_descendant_path
+
+        def counted(child, parent):
+            calls.append((child, parent))
+            return original(child, parent)
+
+        with mock.patch("ccc_agent.branchfs._is_descendant_path",
+                        side_effect=counted):
+            changes = cli.status(self.root)
+
+        self.assertEqual(len(changes), 1200)
+        self.assertLess(len(calls), len(changes) * 10)
 
     def test_status_collapses_descendant_tombstones_under_tree_delete(self):
         status = dict(STATUS_JSON)
