@@ -534,7 +534,8 @@ def _print_failure_details(store, session, verbose=False):
 def main_resume(argv=None, env=None, prog="ccc-agent resume"):
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Resume a running BranchFS session after a crash/reboot.")
+        description="Resume a running BranchFS session after a crash/reboot, "
+                    "or retry a failed session with --allow-failed.")
     parser.add_argument("--config", help="path to config.json")
     parser.add_argument("--agent", default=None,
                         help="agent kind label for the resumed command")
@@ -542,6 +543,11 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
                         help="resume even if the old session mount still "
                              "appears active (use only after verifying no old "
                              "agent process is using it)")
+    parser.add_argument("--allow-failed", action="store_true",
+                        help="allow retrying a session currently in failed "
+                             "state; use only after inspecting the failure and "
+                             "confirming the preserved branch should be "
+                             "reopened")
     parser.add_argument("--protect-agent-state", action="store_true",
                         help="keep Codex/Hermes state and Claude Code runtime "
                              "paths inside BranchFS review instead of the "
@@ -601,7 +607,8 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
             session, alias_map, confinement))
     try:
         session = resume_session(args.session_id, runner_config, env=env,
-                                 force=args.force)
+                                 force=args.force,
+                                 allow_failed=args.allow_failed)
     except ResumeError as exc:
         sys.stderr.write("ccc-agent: %s\n" % exc)
         return 1
@@ -897,8 +904,8 @@ _REVIEW_OPTIONS = (
     "--show-ignored", "--include-ignored", "--config", "--help",
 )
 _RESUME_OPTIONS = (
-    "--agent", "--force", "--full-isolation", "--protect-agent-state",
-    "--verbose", "-v", "--config", "--help",
+    "--agent", "--allow-failed", "--force", "--full-isolation",
+    "--protect-agent-state", "--verbose", "-v", "--config", "--help",
 )
 
 

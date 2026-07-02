@@ -556,7 +556,15 @@ def _agent_state_symlink_target_dir(path):
 
 
 def _shared_agent_state_symlink_target_binds(config):
-    """Extra same-path rw binds for absolute symlink targets in agent homes."""
+    """Extra same-path rw binds for top-level symlink targets in agent homes.
+
+    Keep this shallow on purpose.  Agent state directories can contain large
+    caches/history trees, and bwrap setup runs on every contained session.  The
+    compatibility case this protects is a top-level config symlink such as
+    ``~/.codex/config.toml -> /storage/user/.codex/config.toml``; recursively
+    walking all runtime/cache contents would make unit tests and launches scale
+    with unrelated agent history size.
+    """
     if config.protect_agent_state:
         return []
     binds = []
@@ -568,15 +576,21 @@ def _shared_agent_state_symlink_target_binds(config):
         root = os.path.realpath(src)
         if not os.path.isdir(root):
             continue
-        for dirpath, dirnames, filenames in os.walk(root):
-            for name in list(dirnames) + list(filenames):
-                candidate = os.path.join(dirpath, name)
-                if not os.path.islink(candidate):
-                    continue
-                target_dir = _agent_state_symlink_target_dir(candidate)
-                if target_dir and target_dir != root and target_dir not in seen:
-                    seen.add(target_dir)
-                    binds.append((target_dir, target_dir))
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for dir_entry in entries:
+            try:
+                is_link = dir_entry.is_symlink()
+            except OSError:
+                continue
+            if not is_link:
+                continue
+            target_dir = _agent_state_symlink_target_dir(dir_entry.path)
+            if target_dir and target_dir != root and target_dir not in seen:
+                seen.add(target_dir)
+                binds.append((target_dir, target_dir))
     return binds
 
 
@@ -1058,14 +1072,16 @@ def run_session(config, env=None, before_finalize=None):
 
 
 def resume_session(session_id, config, env=None, before_finalize=None,
-                   force=False):
-    """Re-mount and continue an existing running session branch.
+                   force=False, allow_failed=False):
+    """Re-mount and continue an existing session branch.
 
-    This is for crash/reboot recovery: the durable session + BranchFS branch
-    already exist, but the process tree and FUSE mounts disappeared.  Resume
-    deliberately does *not* create a new branch and it preserves the original
-    stored `agent_command`; `config.agent_command` is the command for this
-    invocation only (defaulted by the CLI to the stored command).
+    By default this is for crash/reboot recovery of sessions still marked
+    ``running``.  ``allow_failed`` is an explicit operator opt-in for retrying a
+    session whose branch was preserved after a failed mount/finalize/commit.
+
+    Resume deliberately does *not* create a new branch and it preserves the
+    original stored `agent_command`; `config.agent_command` is the command for
+    this invocation only (defaulted by the CLI to the stored command).
     """
     env = dict(os.environ if env is None else env)
     if env.get(ENV_SESSION):
@@ -1075,7 +1091,14 @@ def resume_session(session_id, config, env=None, before_finalize=None,
         session = config.store.load(session_id)
     except KeyError:
         raise ResumeError("no such session: %s" % session_id)
-    if session.state != "running":
+    was_failed = session.state == "failed"
+    if session.state != "running" and not (allow_failed and was_failed):
+        if was_failed:
+            raise ResumeError(
+                "cannot resume session %s in state failed without "
+                "--allow-failed (inspect the failure first, then retry with "
+                "--allow-failed if the preserved branch should be reopened)"
+                % session.session_id)
         raise ResumeError(
             "cannot resume session %s in state %s (resume expects a running "
             "session left behind by a crash/reboot)"
@@ -1090,6 +1113,8 @@ def resume_session(session_id, config, env=None, before_finalize=None,
             % (session.session_id, ", ".join(active)))
 
     session.add_event("resume-command", _command_detail(config.agent_command))
+    if was_failed:
+        session.add_event("resume-from-failed")
     if config.agent_kind != session.agent_kind:
         session.add_event("resume-agent", config.agent_kind)
     config.store.save(session)
@@ -1098,7 +1123,11 @@ def resume_session(session_id, config, env=None, before_finalize=None,
         _ensure_shared_agent_state_dirs(config)
         for root in session.protected_roots.values():
             config.backend.start_daemon(root)
+            if was_failed:
+                config.backend.thaw(root)
             config.backend.mount(root, agent=True)
+        if was_failed:
+            session.transition("running")
         session.add_event("resumed-bundle")
         config.store.save(session)
     except Exception as exc:

@@ -39,7 +39,10 @@ _TRANSITIONS = {
     "auto-committed": (),
     "committed": (),
     "aborted": (),
-    "failed": (),
+    # Explicit recovery path: ccc-agent resume --allow-failed may reopen a
+    # failed session branch for another agent command. Other closed states stay
+    # terminal because their branches have been committed/discarded.
+    "failed": ("running",),
 }
 
 
@@ -121,7 +124,10 @@ class Session(object):
         if new_state not in allowed:
             raise StateError("illegal transition %s -> %s"
                              % (self.state, new_state))
+        was_terminal = self.state in TERMINAL_STATES
         self.state = new_state
+        if was_terminal and new_state not in TERMINAL_STATES:
+            self.finished_at = None
         if new_state in TERMINAL_STATES and not self.finished_at:
             self.finished_at = utc_now()
         self.add_event("state:%s" % new_state)

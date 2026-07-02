@@ -584,6 +584,45 @@ class TestMainRun(unittest.TestCase):
             session.session_id)
         self.assertEqual(persisted.agent_command, original)
 
+    def test_resume_failed_session_requires_allow_failed_flag(self):
+        session = self.make_running_session(
+            session_id="agent-resume-failed-cli",
+            command=["sh", "-c", "echo recovered > recovered.txt"])
+        session.transition("failed")
+        SessionStore(os.path.join(self.h.tmp, "state")).save(session)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = main(["resume", "--config", self.h.config_path,
+                         session.session_id], env={})
+
+        self.assertEqual(code, 1)
+        self.assertIn("--allow-failed", stderr.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(
+            self.h.base, self.h.workspace_rel, "recovered.txt")))
+
+    def test_resume_allow_failed_flag_retries_failed_session(self):
+        store = SessionStore(os.path.join(self.h.tmp, "state"))
+        session = self.make_running_session(
+            session_id="agent-resume-allowed-failed-cli",
+            command=["sh", "-c", "echo recovered > recovered.txt"])
+        session.transition("failed")
+        session.finished_at = "2000-01-01T00:00:00Z"
+        store.save(session)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = main(["resume", "--config", self.h.config_path,
+                         "--allow-failed", session.session_id], env={})
+
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, self.h.workspace_rel, "recovered.txt")))
+        persisted = store.load(session.session_id)
+        self.assertEqual(persisted.state, "auto-committed")
+        self.assertNotEqual(persisted.finished_at, "2000-01-01T00:00:00Z")
+        self.assertIn("resumed", stderr.getvalue())
+
     def test_agent_option_sets_explicit_agent_kind(self):
         seen = {}
 
@@ -1009,6 +1048,7 @@ class TestShellCompletion(unittest.TestCase):
             ["agent-alpha"])
         matches = self.complete(["ccc-agent", "resume", "--"])
         self.assertIn("--force", matches)
+        self.assertIn("--allow-failed", matches)
         self.assertIn("--agent", matches)
         self.assertIn("--full-isolation", matches)
 

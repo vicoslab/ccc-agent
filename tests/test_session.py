@@ -87,6 +87,17 @@ class TestStateMachine(unittest.TestCase):
         self.session.transition("failed")
         self.assertEqual(self.session.state, "failed")
 
+    def test_failed_can_reopen_to_running_for_explicit_resume(self):
+        self.session.transition("mounting")
+        self.session.transition("running")
+        self.session.transition("failed")
+        self.session.finished_at = "2000-01-01T00:00:00Z"
+
+        self.session.transition("running")
+
+        self.assertEqual(self.session.state, "running")
+        self.assertIsNone(self.session.finished_at)
+
     def test_transition_records_event(self):
         self.session.transition("mounting")
         events = [e["event"] for e in self.session.events]

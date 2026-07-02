@@ -16,7 +16,8 @@ from unittest import mock
 
 from ccc_agent.branchfs import FakeBranchFS, StatusReport, StatusWarning
 from ccc_agent.paths import AliasMap
-from ccc_agent.runner import RootSpec, RunnerConfig, resume_session, run_session
+from ccc_agent.runner import (ResumeError, RootSpec, RunnerConfig,
+                              resume_session, run_session)
 from ccc_agent.session import SessionStore
 
 
@@ -83,6 +84,15 @@ class TestRunSession(unittest.TestCase):
             session_id=session_id)
         session.transition("mounting")
         session.transition("running")
+        self.h.store.save(session)
+        return session
+
+    def failed_session(self, session_id="agent-resume-failed", command=None,
+                       mode="workspace-auto"):
+        session = self.running_session(session_id=session_id, command=command,
+                                       mode=mode)
+        session.transition("failed")
+        session.finished_at = "2000-01-01T00:00:00Z"
         self.h.store.save(session)
         return session
 
@@ -213,6 +223,50 @@ class TestRunSession(unittest.TestCase):
         committed = os.path.join(self.h.base, "Projects", "proj-a",
                                  "resumed.txt")
         self.assertTrue(os.path.isfile(committed))
+
+    def test_resume_failed_session_requires_explicit_allow_failed(self):
+        session = self.failed_session(
+            command=["sh", "-c", "echo recovered > recovered.txt"])
+
+        with self.assertRaisesRegex(ResumeError, "--allow-failed"):
+            resume_session(session.session_id,
+                           self.h.config(session.agent_command))
+
+    def test_resume_failed_session_when_allowed_reopens_and_finalizes(self):
+        class ThawBeforeMountFake(FakeBranchFS):
+            def __init__(self):
+                super(ThawBeforeMountFake, self).__init__()
+                self.thaw_calls = 0
+
+            def thaw(self, root):
+                self.thaw_calls += 1
+                return super(ThawBeforeMountFake, self).thaw(root)
+
+            def mount(self, root, agent=True, allow_other=False):
+                if self.branch_state(root) != "open":
+                    raise AssertionError("failed resume must thaw before mount")
+                return super(ThawBeforeMountFake, self).mount(
+                    root, agent=agent, allow_other=allow_other)
+
+        self.h.backend = ThawBeforeMountFake()
+        session = self.failed_session(
+            command=["sh", "-c", "echo recovered > recovered.txt"])
+        root = session.protected_roots["storage_user"]
+        self.h.backend.freeze(root)
+
+        resumed = resume_session(session.session_id,
+                                 self.h.config(session.agent_command),
+                                 allow_failed=True)
+
+        self.assertEqual(resumed.state, "auto-committed")
+        self.assertEqual(self.h.backend.thaw_calls, 1)
+        self.assertNotEqual(resumed.finished_at, "2000-01-01T00:00:00Z")
+        committed = os.path.join(self.h.base, "Projects", "proj-a",
+                                 "recovered.txt")
+        self.assertTrue(os.path.isfile(committed))
+        persisted = self.h.store.load(session.session_id)
+        self.assertTrue(any(e["event"] == "resume-from-failed"
+                            for e in persisted.events))
 
     def test_resume_custom_command_is_one_shot_and_preserves_original_exec(self):
         original = ["sh", "-c", "echo original > original.txt"]
@@ -822,6 +876,29 @@ class TestBwrapConfinement(unittest.TestCase):
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
         self.assertIn(("--bind", codex_home, "/home/domen/.codex"), triples)
+        self.assertIn(("--bind", target_dir, target_dir), triples)
+
+    def test_shared_agent_state_symlink_detection_is_shallow(self):
+        # Unit tests must not recursively walk the developer's live
+        # ~/.codex/~/.claude caches. The known compatibility case is a top-level
+        # config symlink such as ~/.codex/config.toml.
+        codex_home = os.path.join(self._tmp.name, "real-agent-state", "codex")
+        os.makedirs(codex_home)
+        target_dir = os.path.join(self._tmp.name, "storage", "user", ".codex")
+        os.makedirs(target_dir)
+        target = os.path.join(target_dir, "config.toml")
+        with open(target, "w") as fh:
+            fh.write("model = 'test'\n")
+        os.symlink(target, os.path.join(codex_home, "config.toml"))
+
+        with mock.patch("ccc_agent.runner.os.walk",
+                        side_effect=AssertionError("must not recurse")):
+            argv = self._capture_argv(["codex"], "codex", {},
+                                      agent_state_binds=[codex_home +
+                                                         ":/home/domen/.codex"])
+
+        triples = [(argv[k], argv[k + 1], argv[k + 2])
+                   for k in range(len(argv) - 2)]
         self.assertIn(("--bind", target_dir, target_dir), triples)
 
     def test_bwrap_shared_agent_state_does_not_bind_arbitrary_symlink_target(self):
