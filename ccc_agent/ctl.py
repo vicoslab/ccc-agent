@@ -16,7 +16,8 @@ import sys
 import time
 
 from .branchfs import StatusReport
-from .policy import PolicyConfig, classify, filter_ignored
+from .policy import (Change, IgnoredChange, PolicyConfig, classify,
+                     filter_ignored, split_ignored)
 from .runner import finalize_session
 from .paths import is_within
 from .session import TERMINAL_STATES
@@ -42,6 +43,23 @@ def _utc_seconds(stamp):
 
 class ControlError(Exception):
     pass
+
+
+def _change_line(change):
+    return "%s %s (%s, %d bytes)" % (
+        change.op, change.path, change.kind, change.bytes)
+
+
+def _ignored_line(ignored):
+    return "%s (ignored by %s)" % (_change_line(ignored.change),
+                                    ignored.pattern)
+
+
+def _ignored_pattern_counts(ignored):
+    counts = {}
+    for item in ignored:
+        counts[item.pattern] = counts.get(item.pattern, 0) + 1
+    return counts
 
 
 class Controller(object):
@@ -89,6 +107,52 @@ class Controller(object):
     def _write_status_warnings(self, out, warnings):
         for warning in warnings:
             out.write("WARNING %s: %s\n" % (warning.path, warning.message))
+
+    def _write_change_sections(self, out, changes, ignored, show_ignored,
+                               session_id):
+        """Render a git-status-like split of commit vs ignored changes."""
+        if not changes and not ignored:
+            return False
+        out.write("Changes to be committed:\n")
+        if changes:
+            for change in changes:
+                out.write("  %s\n" % _change_line(change))
+        else:
+            out.write("  (none)\n")
+        if ignored:
+            out.write("\nIgnored by policy (not committed):\n")
+            if show_ignored:
+                for item in ignored:
+                    out.write("  %s\n" % _ignored_line(item))
+            else:
+                total = len(ignored)
+                out.write("  %d change(s) hidden; use `ccc-agent diff %s "
+                          "--show-ignored` or `ccc-agent review %s "
+                          "--show-ignored` to list them.\n"
+                          % (total, session_id, session_id))
+                for pattern, count in sorted(
+                        _ignored_pattern_counts(ignored).items()):
+                    out.write("  %s: %d change(s)\n" % (pattern, count))
+            out.write("  To accept ignored changes too: `ccc-agent review %s "
+                      "--accept --include-ignored`.\n" % session_id)
+        return True
+
+    def _stored_review_changes(self, review):
+        changes = []
+        ignored = []
+        saw_status = False
+        for name in sorted(os.listdir(review)):
+            path = os.path.join(review, name)
+            if name.startswith("status.") and name.endswith(".json"):
+                saw_status = True
+                with open(path) as fh:
+                    changes.extend(Change.from_dict(entry)
+                                   for entry in json.load(fh))
+            elif name.startswith("ignored.") and name.endswith(".json"):
+                with open(path) as fh:
+                    ignored.extend(IgnoredChange.from_dict(entry)
+                                   for entry in json.load(fh))
+        return saw_status, changes, ignored
 
     def _mount_still_active(self, root):
         try:
@@ -211,31 +275,34 @@ class Controller(object):
                              change.bytes))
         return session
 
-    def diff(self, session_id, path=None, out=None):
+    def diff(self, session_id, path=None, out=None, show_ignored=False):
         """Stored review diff; falls back to live status when absent."""
         out = out or sys.stdout
         session = self._load(session_id)
         if path is not None:
-            return self._diff_path(session, path, out)
+            return self._diff_path(session, path, out,
+                                   include_ignored=show_ignored)
         review = self.store.review_dir(session_id)
-        wrote = False
-        saw_status = False
         if os.path.isdir(review):
-            for name in sorted(os.listdir(review)):
-                if not (name.startswith("status.") and name.endswith(".json")):
-                    continue
-                saw_status = True
-                with open(os.path.join(review, name)) as fh:
-                    for entry in json.load(fh):
-                        out.write("%s %s (%s, %d bytes)\n"
-                                  % (entry["op"], entry["path"],
-                                     entry.get("kind", "file"),
-                                     entry.get("bytes", 0)))
-                        wrote = True
-        if saw_status:
-            return session
-        if not wrote:
-            return self.status(session_id, out=out)
+            saw_status, changes, ignored = self._stored_review_changes(review)
+            if saw_status:
+                self._write_change_sections(out, changes, ignored,
+                                            show_ignored, session_id)
+                return session
+
+        config = PolicyConfig.from_dict(session.policy)
+        all_changes = []
+        ignored = []
+        for name, root in sorted(session.protected_roots.items()):
+            out.write("# root %s (branch %s)\n" % (name, root.branch))
+            report = self._live_status_report(session, root, action="diff")
+            self._write_status_warnings(out, report.warnings)
+            changes, root_ignored = split_ignored(report.changes, config,
+                                                  self.alias_map)
+            all_changes.extend(changes)
+            ignored.extend(root_ignored)
+        self._write_change_sections(out, all_changes, ignored, show_ignored,
+                                    session_id)
         return session
 
     def _path_candidates(self, session, root, path):
@@ -258,11 +325,12 @@ class Controller(object):
             candidates.add(os.path.relpath(workspace_path, visible))
         return candidates
 
-    def _matching_change(self, session, path):
+    def _matching_change(self, session, path, include_ignored=False):
         matches = []
         absolute = path.startswith("/")
         canonical_path = self.alias_map.canonicalize(path) if absolute else None
-        for root, change in self._changes(session):
+        for root, change in self._changes(session,
+                                          include_ignored=include_ignored):
             rel, _delta, _base = self._store_paths(root, change)
             if absolute:
                 if self.alias_map.canonicalize(change.path) == canonical_path:
@@ -285,8 +353,9 @@ class Controller(object):
             raise ControlError("cannot diff binary file: %s" % label)
         return data.decode("utf-8", errors="replace").splitlines(True)
 
-    def _diff_path(self, session, path, out):
-        root, change = self._matching_change(session, path)
+    def _diff_path(self, session, path, out, include_ignored=False):
+        root, change = self._matching_change(
+            session, path, include_ignored=include_ignored)
         if change.kind != "file" and change.op != "D":
             raise ControlError("cannot diff non-file path: %s" % change.path)
         rel, delta, base = self._store_paths(root, change)
@@ -303,13 +372,14 @@ class Controller(object):
         return session
 
     # -- mutating ------------------------------------------------------------
-    def commit(self, session_id):
+    def commit(self, session_id, include_ignored=False):
         session = self._load(session_id)
         self._require_state(session, ("pending-review", "frozen"), "commit")
-        # Commit only the policy-visible changes.  Ignored launcher/runtime
-        # noise (plugin mountpoints, agent state, caches/history, .nfs files)
-        # stays in the branch and is discarded, matching auto-commit behavior.
-        changes = self._changes(session)
+        # Commit only the policy-visible changes by default. Ignored launcher/
+        # runtime noise (plugin mountpoints, agent state, caches/history, .nfs
+        # files) stays in the branch and is discarded unless an operator
+        # explicitly opts in with include_ignored.
+        changes = self._changes(session, include_ignored=include_ignored)
         try:
             for root, change in changes:
                 self._apply_change_from_store(root, change)
@@ -368,7 +438,7 @@ class Controller(object):
         for _name, root in sorted(session.protected_roots.items()):
             changes = self._live_status(session, root, action="review")
             if not include_ignored:
-                changes = filter_ignored(changes, config, self.alias_map)
+                changes, _ignored = split_ignored(changes, config, self.alias_map)
             for change in changes:
                 out.append((root, change))
         return out
@@ -392,10 +462,12 @@ class Controller(object):
                 out.write(line if line.endswith("\n") else line + "\n")
 
     def review(self, session_id, accept=False, reject=False, commit_paths=None,
-               emit_patch=False, apply_patch=None, out=None):
+               emit_patch=False, apply_patch=None, out=None,
+               show_ignored=False, include_ignored=False):
         """Post-session review of a pending/frozen session's change set.
 
-        Default browses the diff.  ``accept`` commits everything, ``reject``
+        Default browses the diff.  ``accept`` commits policy-visible changes by
+        default, or all changes when ``include_ignored`` is true; ``reject``
         discards everything, ``commit_paths`` commits a file-level subset (the
         rest are discarded), ``emit_patch`` prints a base-vs-view unified diff,
         and ``apply_patch`` applies a (possibly pruned) patch to base for
@@ -403,12 +475,12 @@ class Controller(object):
         """
         out = out or sys.stdout
         if accept:
-            return self.commit(session_id)
+            return self.commit(session_id, include_ignored=include_ignored)
         if reject:
             return self.abort(session_id)
         session = self._load(session_id)
         self._require_state(session, ("pending-review", "frozen"), "review")
-        changes = self._changes(session)
+        changes = self._changes(session, include_ignored=include_ignored)
 
         if emit_patch:
             self._emit_patch(changes, out)
@@ -439,7 +511,7 @@ class Controller(object):
                       % len(applied))
             return self._finish_selective(session, "file-level commit")
 
-        return self.diff(session_id, out=out)
+        return self.diff(session_id, out=out, show_ignored=show_ignored)
 
     def _finish_selective(self, session, detail):
         """After a selective/patch apply to base, discard the branch deltas and

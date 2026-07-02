@@ -121,6 +121,25 @@ class Change(object):
                    root=data.get("root", ""))
 
 
+class IgnoredChange(object):
+    """One change excluded from commit/review by an ignore pattern."""
+
+    __slots__ = ("change", "pattern")
+
+    def __init__(self, change, pattern):
+        self.change = change
+        self.pattern = pattern
+
+    def to_dict(self):
+        data = self.change.to_dict()
+        data["ignore_pattern"] = self.pattern
+        return data
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(Change.from_dict(data), data.get("ignore_pattern", ""))
+
+
 class DenyMatch(object):
     __slots__ = ("path", "pattern")
 
@@ -174,26 +193,44 @@ class PolicyConfig(object):
         }
 
 
-def filter_ignored(changes, config, alias_map):
-    """Drop changes whose canonical path matches an ignore pattern.  A pattern
-    may be a glob (e.g. ``*/.nfs*``) matched against the path, or an absolute
-    path matched as an exact path OR a subtree prefix.  These are sandbox
-    plumbing, never the agent's work."""
+def ignore_pattern_for_path(path, config, alias_map):
+    """Return the first ignore pattern matching ``path``, or ``None``.
+
+    A pattern may be a glob (e.g. ``*/.nfs*``) matched against the path, or an
+    absolute path matched as an exact path OR a subtree prefix.  These are
+    sandbox/cache/runtime plumbing, not policy-visible authored work by default.
+    """
     patterns = list(getattr(config, "ignore_patterns", ()) or ())
     if not patterns:
-        return list(changes)
+        return None
 
-    def matched(canonical):
-        for pattern in patterns:
-            if path_matches(pattern, canonical):
-                return True
-            # subtree match only for real absolute paths (not globs)
-            if pattern.startswith("/") and not any(c in pattern for c in "*?["):
-                if is_within(canonical, pattern):
-                    return True
-        return False
+    canonical = alias_map.canonicalize(path)
+    for pattern in patterns:
+        if path_matches(pattern, canonical):
+            return pattern
+        # subtree match only for real absolute paths (not globs)
+        if pattern.startswith("/") and not any(c in pattern for c in "*?["):
+            if is_within(canonical, pattern):
+                return pattern
+    return None
 
-    return [c for c in changes if not matched(alias_map.canonicalize(c.path))]
+
+def split_ignored(changes, config, alias_map):
+    """Return ``(policy_visible, ignored)`` for a change sequence."""
+    visible = []
+    ignored = []
+    for change in changes:
+        pattern = ignore_pattern_for_path(change.path, config, alias_map)
+        if pattern is None:
+            visible.append(change)
+        else:
+            ignored.append(IgnoredChange(change, pattern))
+    return visible, ignored
+
+
+def filter_ignored(changes, config, alias_map):
+    """Drop changes whose canonical path matches an ignore pattern."""
+    return split_ignored(changes, config, alias_map)[0]
 
 
 class PolicyDecision(object):

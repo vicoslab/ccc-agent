@@ -719,6 +719,20 @@ class TestMainCtl(unittest.TestCase):
         self.assertEqual(len(created), 1)
         return created[0]
 
+    def make_pending_cache_session(self):
+        before = set(self.h.sessions())
+        self.assertEqual(main_run([
+            "--config", self.h.config_path,
+            "--workspace", "/storage/user/Projects/proj-a",
+            "--policy", "manual",
+            "--", "sh", "-c",
+            "printf 'keep\\n' > result.txt; mkdir -p ../../.cache/pip; "
+            "printf 'wheel\\n' > ../../.cache/pip/wheel.txt",
+        ], env={}), 0)
+        created = sorted(set(self.h.sessions()) - before)
+        self.assertEqual(len(created), 1)
+        return created[0]
+
     def make_running_session(self, session_id, dirty_rel=None):
         store = self.store()
         branch_store = os.path.join(self.h.tmp, "stores", "storage_user")
@@ -795,6 +809,33 @@ class TestMainCtl(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("--- a/Projects/proj-a/cli.txt", out.getvalue())
         self.assertIn("+new", out.getvalue())
+
+    def test_diff_show_ignored_cli_flag_lists_ignored_policy_changes(self):
+        sid = self.make_pending_cache_session()
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main_ctl(["--config", self.h.config_path, "diff",
+                             "--show-ignored", sid], env={})
+
+        self.assertEqual(code, 0)
+        self.assertIn("/storage/user/Projects/proj-a/result.txt", out.getvalue())
+        self.assertIn("/storage/user/.cache/pip/wheel.txt", out.getvalue())
+
+    def test_review_accept_include_ignored_cli_flag_commits_ignored_changes(self):
+        sid = self.make_pending_cache_session()
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = main_ctl(["--config", self.h.config_path, "review", sid,
+                             "--accept", "--include-ignored"], env={})
+
+        self.assertEqual(code, 0)
+        self.assertIn("now committed", err.getvalue())
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, self.h.workspace_rel, "result.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, ".cache", "pip", "wheel.txt")))
 
     def test_abort_accepts_multiple_session_ids_and_reports_each_ok(self):
         sid1 = self.make_pending_session("abort-one.txt")
@@ -975,6 +1016,11 @@ class TestShellCompletion(unittest.TestCase):
         matches = self.complete(["ccc-agent", "run", "--"])
         self.assertIn("--full-isolation", matches)
         self.assertIn("--protect-agent-state", matches)
+
+    def test_review_completion_lists_ignored_policy_options(self):
+        matches = self.complete(["ccc-agent", "review", "--"])
+        self.assertIn("--show-ignored", matches)
+        self.assertIn("--include-ignored", matches)
 
     def test_session_completion_uses_config_flag_after_op(self):
         self.assertEqual(

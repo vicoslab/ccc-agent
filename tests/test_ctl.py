@@ -80,6 +80,13 @@ class TestController(unittest.TestCase):
         # out-of-scope write => pending-review with frozen branch
         return self.h.run_agent(["sh", "-c", "echo x > ../../outside.txt"])
 
+    def cache_review_session(self):
+        return self.h.run_agent([
+            "sh", "-c",
+            "echo keep > result.txt; mkdir -p ../../.cache/pip; "
+            "echo wheel > ../../.cache/pip/wheel.txt",
+        ], mode="manual")
+
     def test_list_renders_sessions(self):
         session = self.pending_session()
         out = io.StringIO()
@@ -100,6 +107,62 @@ class TestController(unittest.TestCase):
         out = io.StringIO()
         self.h.controller().diff(session.session_id, out=out)
         self.assertIn("/storage/user/outside.txt", out.getvalue())
+
+    def test_diff_summarizes_ignored_policy_changes_without_full_listing(self):
+        session = self.cache_review_session()
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, out=out)
+
+        text = out.getvalue()
+        self.assertIn("Changes to be committed", text)
+        self.assertIn("/storage/user/Projects/proj-a/result.txt", text)
+        self.assertIn("Ignored by policy (not committed)", text)
+        self.assertIn("1 change(s)", text)
+        self.assertIn(".cache", text)
+        self.assertIn("--show-ignored", text)
+        self.assertIn("--include-ignored", text)
+        self.assertNotIn("/storage/user/.cache/pip/wheel.txt", text)
+
+    def test_diff_show_ignored_lists_ignored_policy_changes(self):
+        session = self.cache_review_session()
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, show_ignored=True, out=out)
+
+        text = out.getvalue()
+        self.assertIn("/storage/user/Projects/proj-a/result.txt", text)
+        self.assertIn("/storage/user/.cache/pip/wheel.txt", text)
+        self.assertIn("ignored by .cache", text)
+
+    def test_review_default_summarizes_ignored_policy_changes(self):
+        session = self.cache_review_session()
+        out = io.StringIO()
+        self.h.controller().review(session.session_id, out=out)
+
+        text = out.getvalue()
+        self.assertIn("Ignored by policy (not committed)", text)
+        self.assertIn("--show-ignored", text)
+        self.assertNotIn("/storage/user/.cache/pip/wheel.txt", text)
+
+    def test_review_accept_keeps_ignored_policy_changes_discarded_by_default(self):
+        session = self.cache_review_session()
+        updated = self.h.controller().review(session.session_id, accept=True)
+
+        self.assertEqual(updated.state, "committed")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, "Projects", "proj-a", "result.txt")))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.h.base, ".cache", "pip", "wheel.txt")))
+
+    def test_review_accept_include_ignored_commits_ignored_policy_changes(self):
+        session = self.cache_review_session()
+        updated = self.h.controller().review(
+            session.session_id, accept=True, include_ignored=True)
+
+        self.assertEqual(updated.state, "committed")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, "Projects", "proj-a", "result.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, ".cache", "pip", "wheel.txt")))
 
     def test_diff_with_empty_review_status_does_not_fallback_to_live_branch(self):
         session = self.h.run_agent(["true"])
