@@ -14,6 +14,7 @@ import os
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import time
 
@@ -177,6 +178,132 @@ def _warnings_from_status(data, root):
     return warnings
 
 
+def _status_warning(root, relpath, message):
+    return StatusWarning(path=_visible_warning_path(root, relpath),
+                         message=str(message), root=root.name)
+
+
+def _branch_files_dir(root):
+    return os.path.join(_branch_dir(root), "files")
+
+
+def _branch_tombstones_path(root):
+    return os.path.join(_branch_dir(root), "tombstones")
+
+
+def _join_rel(parent, child):
+    return child if not parent else parent.rstrip("/") + "/" + child
+
+
+def _entry_kind_from_mode(mode):
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "file"
+
+
+def _warn_if_unreadable_regular_file(path, relpath, root, warnings, mode):
+    if not stat.S_ISREG(mode):
+        return
+    try:
+        with open(path, "rb"):
+            pass
+    except PermissionError as exc:
+        warnings.append(_status_warning(
+            root, relpath,
+            "unreadable delta file: %s; commit may fail" % exc))
+    except OSError:
+        # Status should stay read-only and best-effort here. Other file races are
+        # already represented by the changed path; do not turn them into fatal
+        # operator-facing errors.
+        pass
+
+
+def _collect_store_delta(files_dir, relpath, root, diff, warnings):
+    directory = files_dir if not relpath else os.path.join(files_dir, relpath)
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return
+    except PermissionError as exc:
+        warnings.append(_status_warning(
+            root, relpath,
+            "unreadable delta directory: %s; status may be incomplete; "
+            "commit may fail" % exc))
+        return
+    except OSError as exc:
+        warnings.append(_status_warning(
+            root, relpath,
+            "could not scan delta directory: %s; status may be incomplete" % exc))
+        return
+
+    for entry in sorted(entries, key=lambda item: item.name):
+        child_rel = _join_rel(relpath, entry.name)
+        child_path = os.path.join(files_dir, child_rel)
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except PermissionError as exc:
+            warnings.append(_status_warning(
+                root, child_rel,
+                "unreadable delta entry metadata: %s; status may be "
+                "incomplete; commit may fail" % exc))
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            warnings.append(_status_warning(
+                root, child_rel,
+                "could not stat delta entry: %s; status may be incomplete" % exc))
+            continue
+
+        kind = _entry_kind_from_mode(metadata.st_mode)
+        diff.append({"op": "delta", "path": child_rel, "kind": kind,
+                     "bytes": metadata.st_size if kind != "dir" else 0})
+        if kind == "dir":
+            _collect_store_delta(files_dir, child_rel, root, diff, warnings)
+        else:
+            _warn_if_unreadable_regular_file(
+                child_path, child_rel, root, warnings, metadata.st_mode)
+
+
+def _collect_store_tombstones(root, diff, warnings):
+    path = _branch_tombstones_path(root)
+    try:
+        with open(path) as fh:
+            relpaths = [line.strip() for line in fh if line.strip()]
+    except FileNotFoundError:
+        return
+    except PermissionError as exc:
+        warnings.append(_status_warning(
+            root, "", "unreadable tombstone list: %s; deletions may be missing"
+            % exc))
+        return
+    except OSError as exc:
+        warnings.append(_status_warning(
+            root, "", "could not read tombstone list: %s; deletions may be "
+            "missing" % exc))
+        return
+
+    for relpath in sorted(set(relpaths)):
+        diff.append({"op": "delete", "path": relpath.lstrip("/"),
+                     "kind": "tombstone", "bytes": 0})
+
+
+def _fallback_status_report_from_store(root, reason):
+    branch_dir = _branch_dir(root)
+    if not os.path.isdir(branch_dir):
+        raise reason
+    diff = []
+    warnings = [_status_warning(
+        root, "",
+        "branchfs status failed; using direct store fallback: %s" % reason)]
+    _collect_store_delta(_branch_files_dir(root), "", root, diff, warnings)
+    _collect_store_tombstones(root, diff, warnings)
+    return StatusReport(changes=_changes_from_status({"diff": diff}, root),
+                        warnings=warnings)
+
+
 class BranchfsCli(object):
     """Drives the branchfs CLI; one daemon per protected root (per store)."""
 
@@ -270,9 +397,12 @@ class BranchfsCli(object):
         self._invoke("thaw", root.branch, "--storage", root.store)
 
     def status_report(self, root):
-        self.start_daemon(root)
-        out = self._invoke("status", root.branch, "--storage", root.store,
-                           "--json")
+        try:
+            self.start_daemon(root)
+            out = self._invoke("status", root.branch, "--storage", root.store,
+                               "--json")
+        except (BranchfsError, OSError) as exc:
+            return _fallback_status_report_from_store(root, exc)
         try:
             data = json.loads(out)
         except ValueError as exc:

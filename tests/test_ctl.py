@@ -7,7 +7,8 @@ import tempfile
 import unittest
 
 from ccc_agent import ctl
-from ccc_agent.branchfs import BranchfsError, FakeBranchFS
+from ccc_agent.branchfs import (BranchfsError, FakeBranchFS, StatusReport,
+                                StatusWarning)
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import RootSpec, RunnerConfig, run_session
 from ccc_agent.session import ProtectedRoot, SessionStore
@@ -119,7 +120,7 @@ class TestController(unittest.TestCase):
         session, _root = self.h.running_session(branch="agent-stale-running")
 
         class BrokenStatus(FakeBranchFS):
-            def status(self, root):
+            def status_report(self, root):
                 raise BranchfsError(
                     "/usr/local/bin/branchfs start-daemon failed (1): "
                     "Error: Daemon failed to start")
@@ -135,6 +136,44 @@ class TestController(unittest.TestCase):
         self.assertIn("could not read live BranchFS status", message)
         self.assertIn("ccc-agent resume %s" % session.session_id, message)
         self.assertIn("Daemon failed to start", message)
+
+    def test_diff_live_status_prints_branchfs_warnings(self):
+        session, root = self.h.running_session(branch="agent-live-warning")
+        os.makedirs(os.path.join(root.mount, "Projects", "proj-a"), exist_ok=True)
+        with open(os.path.join(root.mount, "Projects", "proj-a", "result.txt"), "w") as fh:
+            fh.write("ok\n")
+
+        class WarningStatus(FakeBranchFS):
+            def status_report(self, root):
+                base = FakeBranchFS.status_report(self, root)
+                return StatusReport(
+                    changes=base.changes,
+                    warnings=[StatusWarning(
+                        path="/storage/user/Projects/proj-a/unreadable",
+                        message="branchfs status failed; using direct store fallback",
+                        root=root.name,
+                    )],
+                )
+
+        controller = ctl.Controller(store=self.h.store,
+                                    backend=WarningStatus(),
+                                    alias_map=self.h.alias_map)
+        # Reuse the already-created branch/mount from the harness with the new
+        # backend by copying FakeBranchFS' simulated state.
+        controller.backend._state = self.h.backend._state
+        controller.backend._deletes = self.h.backend._deletes
+        controller.backend._mounted = self.h.backend._mounted
+
+        out = io.StringIO()
+        controller.diff(session.session_id, out=out)
+
+        text = out.getvalue()
+        self.assertIn("/storage/user/Projects/proj-a/result.txt", text)
+        self.assertIn("WARNING", text)
+        self.assertLess(text.index("WARNING"),
+                        text.index("/storage/user/Projects/proj-a/result.txt"))
+        self.assertIn("/storage/user/Projects/proj-a/unreadable", text)
+        self.assertIn("direct store fallback", text)
 
     def test_diff_path_prints_unified_base_delta_diff(self):
         base_path = os.path.join(self.h.base, "Projects", "proj-a",

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 
+from .branchfs import StatusReport
 from .policy import PolicyConfig, classify, filter_ignored
 from .runner import finalize_session
 from .paths import is_within
@@ -63,9 +64,11 @@ class Controller(object):
                 % (action, session.session_id, session.state,
                    ", ".join(allowed)))
 
-    def _live_status(self, session, root, action="status"):
+    def _live_status_report(self, session, root, action="status"):
         try:
-            return self.backend.status(root)
+            if hasattr(self.backend, "status_report"):
+                return self.backend.status_report(root)
+            return StatusReport(changes=self.backend.status(root), warnings=[])
         except Exception as exc:
             hint = ""
             if session.state in ("mounting", "running", "finalizing"):
@@ -79,6 +82,13 @@ class Controller(object):
                 "could not read live BranchFS status for session %s root %s "
                 "while running %s: %s%s"
                 % (session.session_id, root.name, action, exc, hint))
+
+    def _live_status(self, session, root, action="status"):
+        return self._live_status_report(session, root, action).changes
+
+    def _write_status_warnings(self, out, warnings):
+        for warning in warnings:
+            out.write("WARNING %s: %s\n" % (warning.path, warning.message))
 
     def _mount_still_active(self, root):
         try:
@@ -193,7 +203,9 @@ class Controller(object):
         session = self._load(session_id)
         for name, root in sorted(session.protected_roots.items()):
             out.write("# root %s (branch %s)\n" % (name, root.branch))
-            for change in self._live_status(session, root, action="status"):
+            report = self._live_status_report(session, root, action="status")
+            self._write_status_warnings(out, report.warnings)
+            for change in report.changes:
                 out.write("%s %s (%s, %d bytes)\n"
                           % (change.op, change.path, change.kind,
                              change.bytes))
