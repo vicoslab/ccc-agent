@@ -32,9 +32,12 @@ ENV_STATE_DIR = "CCC_AGENT_STATE_DIR"
 ENV_CONTROL_SOCK = "CCC_AGENT_CONTROL_SOCK"
 ENV_CONTROL_TOKEN = "CCC_AGENT_CONTROL_TOKEN"
 
-# Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox
-# (the host-side socket lives under the state dir, outside the sandbox).
-SANDBOX_CONTROL_SOCK = "/run/ccc-agent/control.sock"
+# Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox.
+# The host-side socket lives under the state dir, outside the sandbox.  Keep the
+# in-sandbox path under private /tmp rather than /run: default container /run is
+# now bound into the sandbox and may be root-owned, so bwrap cannot create
+# /run/ccc-agent as an unprivileged user.
+SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 
 
 class ResumeError(Exception):
@@ -82,6 +85,7 @@ class RunnerConfig(object):
                  completion="process-exit", confinement="none",
                  bwrap_bin="bwrap", bwrap_proc_mode="bind",
                  bwrap_ro_binds=(), bwrap_setenv=None, per_turn=None,
+                 container_run_access=True,
                  cred_mounts=(), cred_mask=(), cred_env=None,
                  bwrap_uid=None, bwrap_gid=None, agent_plugins=None,
                  agent_state_binds=None, protect_agent_state=False,
@@ -114,6 +118,11 @@ class RunnerConfig(object):
         # config/API-key env into the otherwise --clearenv'd sandbox.
         self.bwrap_ro_binds = list(bwrap_ro_binds)
         self.bwrap_setenv = dict(bwrap_setenv or {})
+        # By default the sandbox inherits the existing CCC container's /run
+        # namespace.  That may include Docker or other runtime sockets only when
+        # the container deployment already exposed them; use --full-isolation /
+        # container_run_access=false to omit this ambient container runtime view.
+        self.container_run_access = bool(container_run_access)
         # bwrap needs no extra container privilege and no uid/gid: it mints
         # namespace-scoped CAP_SYS_ADMIN from an unprivileged user namespace
         # and runs the agent as the same host uid (mapped to 0 inside).
@@ -173,9 +182,10 @@ def _primary_root(session, alias_map):
 
 
 # System paths exposed read-only inside the bwrap sandbox.  The agent sees the
-# OS read-only and its BranchFS view read-write, and nothing else (no real
-# underlay, no other /storage mounts, no daemon/docker sockets).  On merged-/usr
-# systems /bin,/sbin,/lib,/lib64 are symlinks into /usr and must be recreated as
+# OS read-only, its BranchFS view read-write, and (by default) the CCC
+# container's existing /run runtime namespace.  It still does not see the real
+# underlay, BranchFS store, or supervisor state. On merged-/usr systems
+# /bin,/sbin,/lib,/lib64 are symlinks into /usr and must be recreated as
 # symlinks, not bound as dirs.
 BWRAP_RO_DIRS = ("/usr", "/etc", "/opt")
 BWRAP_USRMERGE_DIRS = ("/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32")
@@ -559,6 +569,14 @@ def _bwrap_command(session, config, control=None):
         argv += ["--bind", "/proc", "/proc"]
     argv += ["--dev", "/dev", "--tmpfs", "/tmp"]
 
+    # Expose the existing CCC/container runtime namespace by default.  This is
+    # not a host /run bind unless the outer container already has that access;
+    # it intentionally preserves access to container-provided Docker/runtime
+    # sockets.  --full-isolation / container_run_access=false omits this bind
+    # and restores the older no-ambient-/run behavior.
+    if config.container_run_access and os.path.isdir("/run"):
+        argv += ["--bind", "/run", "/run"]
+
     # the BranchFS view, read-write, at its visible path and at $HOME; the
     # --bind overlays (and thus hides) the real underlay at the same path.
     argv += ["--bind", primary.mount, alias_map.canonicalize(primary.visible)]
@@ -836,6 +854,9 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             # workspace inside the sandbox, so no host-side cwd is set here.
             argv = _bwrap_command(session, config, control=control)
             session.add_event("bwrap-launch", argv[0])
+            session.add_event("container-run-access",
+                              "enabled" if config.container_run_access
+                              else "disabled")
             proc = subprocess.run(argv, env=run_env)
         else:
             proc = subprocess.run(config.agent_command, cwd=cwd, env=run_env)

@@ -232,7 +232,7 @@ class TestStopHookControlSocket(unittest.TestCase):
         env = {"PATH": "/usr/bin:/bin",
                "CCC_AGENT_SESSION": "agent-x",
                "CCC_AGENT_CLI": self.ctl,
-               "CCC_AGENT_CONTROL_SOCK": "/run/ccc-agent/control.sock"}
+               "CCC_AGENT_CONTROL_SOCK": "/tmp/ccc-agent/control.sock"}
         return subprocess.run(["sh", hook], env=env,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)

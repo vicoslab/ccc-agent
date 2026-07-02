@@ -79,6 +79,9 @@ agent process. Layout the agent sees:
                                   bind|ro; "fresh" needs systempaths=unconfined)
 /dev                              bwrap minimal nodes
 /tmp                              fresh tmpfs (session-scoped)
+/run                              existing container runtime namespace (rw bind
+                                  by default; omitted with --full-isolation or
+                                  container_run_access=false)
 /storage/user                     BranchFS agent view (rw) — overlays + hides
                                   the real underlay at the same path
 /home/<user>                      same view or its home_subdir (rw)
@@ -87,7 +90,9 @@ agent process. Layout the agent sees:
 /ccc-agent/plugins/…              CCC agent plugin root (ro) when supported
 ~/.codex/plugins/ccc-agent       Codex plugin scan path (ro bind on top of
                                   shared ~/.codex when Codex requires it)
-/run/ccc-agent/control.sock       per-turn control socket (per-turn mode)
+/tmp/ccc-agent/control.sock       per-turn control socket (per-turn mode;
+                                  under private /tmp so it does not depend on
+                                  permissions in the bound container /run)
 ```
 
 The CCC agent plugin is a **read-only** bind of root-owned package assets,
@@ -102,13 +107,27 @@ process-exit review — it never grants commit authority. See
 `docs/agent-integration.md`.
 
 Deliberately absent: real `/storage/*` underlays (the view `--bind` overlays
-the visible path), the BranchFS store, `daemon.sock`, `/var/run/docker.sock`,
-the supervisor state dir, and any other `/storage` mount. `/home/$USER` and
-`/storage/user` bind the **same** view (alias rule), never two branches.
+the visible path), the BranchFS store, `daemon.sock`, the supervisor state dir,
+and any other `/storage` mount. `/home/$USER` and `/storage/user` bind the
+**same** view (alias rule), never two branches.
+
+The container's existing `/run` is **not** treated as data that ccc-agent must
+hide by default. CCC containers already isolate `/run` from the host unless the
+container deployment intentionally exposes a socket. Therefore bwrap mode binds
+container `/run` into the sandbox by default so agents can use container-provided
+runtime services such as Docker, ssh-agent, or other sockets when that container
+has them. This is an intentional escape-capability tradeoff: a powerful socket
+such as Docker or the FUSE sidecar may let an agent reach data paths outside the
+BranchFS view. That risk is considered deployment-authorized system access, not
+a violation of ccc-agent's primary goal (protect and review normal writes to
+`/home`/`/storage`). For stricter containment, run `ccc-agent run
+--full-isolation` or set `container_run_access: false`; that restores the older
+no-ambient-`/run` behavior aside from ccc-agent's own control socket.
 
 The agent gets a scrubbed environment (`--clearenv` + an explicit `--setenv`
 allowlist). No network or proc isolation is enforced by design; the boundary
-is filesystem confinement plus PID-namespace process isolation.
+is filesystem confinement plus PID-namespace process isolation, not a full
+container-escape prevention boundary.
 
 In **`none` mode** (debug only) the agent runs with its cwd inside the mounted
 view but nothing else isolated — **not a security boundary**: absolute-path

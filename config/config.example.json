@@ -14,6 +14,8 @@
   "confinement": "bwrap",
   "bwrap_bin": "/usr/bin/bwrap",
   "bwrap_proc_mode": "bind",
+  "_run_access_comment": "Default true: bind the existing CCC/container /run runtime namespace into bwrap so agents can use container-provided sockets (Docker, ssh-agent, etc.). Set false, or run ccc-agent run --full-isolation, for the older no-ambient-/run mode. This protects normal /home and /storage writes, not full escape prevention from a container that already exposes powerful sockets.",
+  "container_run_access": true,
 
   "_runtime_comment": "The agent binary + deps live under the real $HOME / storage that the view hides; re-expose them read-only here. Prefer dests OUTSIDE the views (e.g. install agents at /opt) to avoid bwrap mkdir'ing mountpoints into the FUSE view. 'src' or 'src:dest'.",
   "bwrap_ro_binds": ["/home/domen/.local:/opt/agent/.local"],

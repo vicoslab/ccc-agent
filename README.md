@@ -159,7 +159,12 @@ Confinement modes (`confinement` in config.json):
 
 - **`bwrap`** (default, the real boundary): runs the agent in a rootless
   bubblewrap user+mount+pid namespace — OS read-only, the BranchFS view
-  read-write at its visible path, the real underlay/store hidden. No container
+  read-write at its visible path, the real underlay/store hidden. By default it
+  also binds the existing CCC/container `/run` runtime namespace so the agent can
+  use sockets that the container deployment already exposes (Docker, ssh-agent,
+  etc.). This is intentionally not a full container-escape-prevention boundary;
+  use `ccc-agent run --full-isolation` or config `container_run_access: false`
+  to omit ambient `/run` access and restore the older stricter mode. No container
   `CAP_SYS_ADMIN` needed (just unprivileged user namespaces). `bwrap_bin` and
   `bwrap_proc_mode` (`bind`|`ro`|`fresh`) are configurable.
 - **`none`** (debug only — *not* a security boundary): runs the agent with its

@@ -376,6 +376,36 @@ class TestBwrapConfinement(unittest.TestCase):
                             or e.get("event") == "bwrap-launch"
                             for e in session.events))
 
+    def test_bwrap_binds_container_run_by_default(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["true"]))
+
+        argv = seen["argv"]
+        triples = [(argv[k], argv[k + 1], argv[k + 2])
+                   for k in range(len(argv) - 2)]
+        self.assertIn(("--bind", "/run", "/run"), triples)
+
+    def test_bwrap_full_isolation_omits_container_run_bind(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["true"], container_run_access=False))
+
+        argv = seen["argv"]
+        triples = [(argv[k], argv[k + 1], argv[k + 2])
+                   for k in range(len(argv) - 2)]
+        self.assertNotIn(("--bind", "/run", "/run"), triples)
+
     def test_bwrap_ro_binds_and_setenv_after_view(self):
         seen = {}
 
@@ -826,11 +856,14 @@ class TestBwrapConfinement(unittest.TestCase):
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
             session = run_session(self._bwrap_config(["my-agent"]))
         argv = seen["argv"]
-        sock = "/run/ccc-agent/control.sock"
-        # the host socket is bind-mounted to the fixed in-sandbox path
+        sock = "/tmp/ccc-agent/control.sock"
+        # the host socket is bind-mounted to a fixed in-sandbox path under
+        # private /tmp, not under /run.  The default container /run bind may be
+        # root-owned, so bwrap cannot mkdir /run/ccc-agent there.
         bind_dests = [argv[k + 2] for k in range(len(argv) - 2)
                       if argv[k] == "--bind"]
         self.assertIn(sock, bind_dests)
+        self.assertNotIn("/run/ccc-agent/control.sock", bind_dests)
         # the in-sandbox env points the hook at that socket + a token
         env = {argv[k + 1]: argv[k + 2] for k in range(len(argv) - 2)
                if argv[k] == "--setenv"}

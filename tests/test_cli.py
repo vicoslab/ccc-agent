@@ -652,6 +652,38 @@ class TestMainRun(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(seen["config"].protect_agent_state)
 
+    def test_container_run_access_defaults_on(self):
+        seen = {}
+
+        def fake_run_session(config, env=None):
+            seen["config"] = config
+            return SimpleNamespace(session_id="agent-test", state="aborted",
+                                   events=[], exit_status=0)
+
+        with mock.patch("ccc_agent.cli.run_session",
+                        side_effect=fake_run_session):
+            code = main_run(["--config", self.h.config_path, "--", "true"],
+                            env={})
+
+        self.assertEqual(code, 0)
+        self.assertTrue(seen["config"].container_run_access)
+
+    def test_full_isolation_flag_disables_container_run_access(self):
+        seen = {}
+
+        def fake_run_session(config, env=None):
+            seen["config"] = config
+            return SimpleNamespace(session_id="agent-test", state="aborted",
+                                   events=[], exit_status=0)
+
+        with mock.patch("ccc_agent.cli.run_session",
+                        side_effect=fake_run_session):
+            code = main_run(["--config", self.h.config_path,
+                             "--full-isolation", "--", "true"], env={})
+
+        self.assertEqual(code, 0)
+        self.assertFalse(seen["config"].container_run_access)
+
     def test_shortcut_agent_flags_are_not_supported(self):
         for flag in ("--codex", "--claude", "--hermes"):
             with self.subTest(flag=flag):
@@ -937,6 +969,12 @@ class TestShellCompletion(unittest.TestCase):
         matches = self.complete(["ccc-agent", "resume", "--"])
         self.assertIn("--force", matches)
         self.assertIn("--agent", matches)
+        self.assertIn("--full-isolation", matches)
+
+    def test_run_completion_lists_full_isolation_option(self):
+        matches = self.complete(["ccc-agent", "run", "--"])
+        self.assertIn("--full-isolation", matches)
+        self.assertIn("--protect-agent-state", matches)
 
     def test_session_completion_uses_config_flag_after_op(self):
         self.assertEqual(

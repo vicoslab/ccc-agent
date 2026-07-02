@@ -150,6 +150,11 @@ def build_runtime(config):
     return store, backend, alias_map, user, roots
 
 
+def _container_run_access(config, full_isolation=False):
+    """Whether bwrap should inherit the existing container /run namespace."""
+    return bool(config.get("container_run_access", True)) and not full_isolation
+
+
 def _write_session_start_banner(session, alias_map, confinement, stream=None):
     """Print the human-facing handoff banner before the agent command starts."""
     stream = sys.stderr if stream is None else stream
@@ -380,6 +385,10 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
                         help="keep ~/.codex, ~/.claude, and ~/.hermes inside "
                              "BranchFS review instead of the default shared "
                              "direct runtime bind")
+    parser.add_argument("--full-isolation", action="store_true",
+                        help="do not bind the existing container /run into "
+                             "the bwrap sandbox; restores the stricter "
+                             "no-ambient-runtime-sockets behavior")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print the full session event log (always shows "
                              "the error detail on failure)")
@@ -434,6 +443,7 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
         bwrap_proc_mode=config.get("bwrap_proc_mode", "bind"),
         bwrap_ro_binds=config.get("bwrap_ro_binds", ()),
         bwrap_setenv=config.get("bwrap_setenv"),
+        container_run_access=_container_run_access(config, args.full_isolation),
         cred_mounts=config.get("cred_mounts", ()),
         cred_mask=config.get("cred_mask", ()),
         cred_env=config.get("cred_env"),
@@ -536,6 +546,10 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
                         help="keep ~/.codex, ~/.claude, and ~/.hermes inside "
                              "BranchFS review instead of the default shared "
                              "direct runtime bind")
+    parser.add_argument("--full-isolation", action="store_true",
+                        help="do not bind the existing container /run into "
+                             "the bwrap sandbox; restores the stricter "
+                             "no-ambient-runtime-sockets behavior")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print the full session event log")
     parser.add_argument("session_id", metavar="session-id")
@@ -571,6 +585,7 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
         bwrap_proc_mode=config.get("bwrap_proc_mode", "bind"),
         bwrap_ro_binds=config.get("bwrap_ro_binds", ()),
         bwrap_setenv=config.get("bwrap_setenv"),
+        container_run_access=_container_run_access(config, args.full_isolation),
         cred_mounts=config.get("cred_mounts", ()),
         cred_mask=config.get("cred_mask", ()),
         cred_env=config.get("cred_env"),
@@ -861,14 +876,19 @@ _GLOBAL_VALUE_OPTIONS = frozenset(("--config",))
 _CLEANUP_VALUE_OPTIONS = frozenset(("--older-than",))
 _REVIEW_VALUE_OPTIONS = frozenset(("--commit", "--apply-patch"))
 _RESUME_VALUE_OPTIONS = frozenset(("--agent",))
+_RUN_OPTIONS = (
+    "--agent", "--full-isolation", "--hide", "--policy",
+    "--protect-agent-state", "--scope", "--verbose", "--workspace", "-v",
+    "--config", "--help",
+)
 _CLEANUP_OPTIONS = ("--older-than", "--dry-run", "--config", "--help")
 _REVIEW_OPTIONS = (
     "--accept", "--reject", "--commit", "--emit-patch", "--apply-patch",
     "--config", "--help",
 )
 _RESUME_OPTIONS = (
-    "--agent", "--force", "--protect-agent-state", "--verbose", "-v",
-    "--config", "--help",
+    "--agent", "--force", "--full-isolation", "--protect-agent-state",
+    "--verbose", "-v", "--config", "--help",
 )
 
 
@@ -983,7 +1003,9 @@ def _options_for_completion(op):
         return _REVIEW_OPTIONS
     if op == "resume":
         return _RESUME_OPTIONS
-    if op in _CTL_OPS or op in ("run", "launch", "setup", "softsandbox",
+    if op == "run":
+        return _RUN_OPTIONS
+    if op in _CTL_OPS or op in ("launch", "setup", "softsandbox",
                                 "completion"):
         return ("--config", "--help")
     return _TOP_LEVEL_OPTIONS
