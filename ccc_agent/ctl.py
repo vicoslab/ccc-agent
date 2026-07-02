@@ -258,22 +258,100 @@ class Controller(object):
             candidates.add(os.path.relpath(workspace_path, visible))
         return candidates
 
+    def _root_qualified_path(self, session, path):
+        """Split an optional ``<root-name>:<path>`` selector.
+
+        Ambiguous diffs can involve distinct protected roots that expose the
+        same visible path.  A root-qualified path gives operators a stable way
+        to select one without changing ordinary POSIX path handling; it is only
+        recognized when the prefix is the name of a protected root.
+        """
+        prefix, sep, rest = path.partition(":")
+        if sep and rest and prefix in session.protected_roots:
+            return prefix, rest
+        return None, path
+
+    def _existing_file_identity(self, path):
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            return None
+        return ("inode", stat_result.st_dev, stat_result.st_ino)
+
+    def _match_file_identity(self, root, change):
+        """Best-effort identity for the underlying file a match would diff.
+
+        Prefer real filesystem identity (following symlinks) so alias/symlink
+        spellings of the same branch delta collapse to one match.  Fall back to
+        the computed store/base paths when the file is missing, which still
+        collapses duplicate status entries for the same relpath without merging
+        distinct roots or distinct files.
+        """
+        _rel, delta, base = self._store_paths(root, change)
+        paths = []
+        if change.op != "D":
+            paths.append(delta)
+        paths.append(base)
+        for candidate in paths:
+            identity = self._existing_file_identity(candidate)
+            if identity is not None:
+                return identity
+        return ("paths", os.path.realpath(delta), os.path.realpath(base))
+
+    def _all_matches_same_file(self, matches):
+        identities = {self._match_file_identity(root, change)
+                      for root, change in matches}
+        return len(identities) == 1
+
+    def _exact_visible_matches(self, path, matches):
+        normalized = os.path.normpath(path)
+        return [(root, change) for root, change in matches
+                if os.path.normpath(change.path) == normalized]
+
+    def _ambiguous_match_message(self, path, matches):
+        lines = ["path %s is ambiguous (%d matches); choose one of:"
+                 % (path, len(matches))]
+        for root, change in matches:
+            rel, _delta, _base = self._store_paths(root, change)
+            lines.append("  - %s:%s (root %s, rel %s)"
+                         % (root.name, change.path, root.name, rel))
+        return "\n".join(lines)
+
+    def _preferred_diff_match(self, matches):
+        for match in matches:
+            _root, change = match
+            if change.kind == "file" or change.op == "D":
+                return match
+        return matches[0]
+
     def _matching_change(self, session, path):
         matches = []
-        absolute = path.startswith("/")
-        canonical_path = self.alias_map.canonicalize(path) if absolute else None
+        root_filter, match_path = self._root_qualified_path(session, path)
+        absolute = match_path.startswith("/")
+        canonical_path = (self.alias_map.canonicalize(match_path)
+                          if absolute else None)
         for root, change in self._changes(session):
+            if root_filter and root.name != root_filter:
+                continue
             rel, _delta, _base = self._store_paths(root, change)
             if absolute:
                 if self.alias_map.canonicalize(change.path) == canonical_path:
                     matches.append((root, change))
-            elif os.path.normpath(rel) in self._path_candidates(session, root, path):
+            elif os.path.normpath(rel) in self._path_candidates(
+                    session, root, match_path):
                 matches.append((root, change))
         if not matches:
             raise ControlError("no changed file matching %s" % path)
         if len(matches) > 1:
-            raise ControlError("path %s is ambiguous (%d matches)"
-                               % (path, len(matches)))
+            if self._all_matches_same_file(matches):
+                return self._preferred_diff_match(matches)
+            if absolute:
+                exact = self._exact_visible_matches(match_path, matches)
+                if len(exact) == 1:
+                    return exact[0]
+                if exact and self._all_matches_same_file(exact):
+                    return self._preferred_diff_match(exact)
+            raise ControlError(self._ambiguous_match_message(path, matches))
         return matches[0]
 
     def _read_text_lines(self, path, label):

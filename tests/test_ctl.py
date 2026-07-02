@@ -10,6 +10,7 @@ from ccc_agent import ctl
 from ccc_agent.branchfs import (BranchfsError, FakeBranchFS, StatusReport,
                                 StatusWarning)
 from ccc_agent.paths import AliasMap
+from ccc_agent.policy import Change
 from ccc_agent.runner import RootSpec, RunnerConfig, run_session
 from ccc_agent.session import ProtectedRoot, SessionStore
 
@@ -193,6 +194,115 @@ class TestController(unittest.TestCase):
         self.assertIn("+++ b/Projects/proj-a/notes.txt", text)
         self.assertIn("+new", text)
         self.assertNotIn("/storage/user/outside.txt", text)
+
+    def test_diff_path_uses_one_match_when_aliases_are_same_store_file(self):
+        # On CCC, /home/domen can be a symlink/alias to a subdirectory under
+        # /storage/user.  BranchFS/status can surface both spellings for the
+        # same changed file; a file-specific diff should not force the operator
+        # through an ambiguity that has only one underlying store/base file.
+        self.h.alias_map = AliasMap.for_home("domen", home_subdir="domen-cuda10")
+        root = ProtectedRoot(
+            name="storage_user", base=self.h.base,
+            store=os.path.join(self._tmp.name, "stores", "storage_user"),
+            branch="agent-alias", mount=os.path.join(self._tmp.name, "mount"),
+            visible="/storage/user", home_subdir="domen-cuda10")
+        session = self.h.store.create(
+            owner="domen", agent_kind="fake", agent_command=["true"],
+            workspace="/home/domen",
+            policy={"mode": "manual", "allowed_scopes": ["/home/domen"]},
+            protected_roots={"storage_user": root})
+        session.state = "pending-review"
+        self.h.store.save(session)
+
+        rel = os.path.join("domen-cuda10", ".gitconfig")
+        base_path = os.path.join(root.base, rel)
+        delta_path = os.path.join(root.store, "branches", root.branch,
+                                  "files", rel)
+        os.makedirs(os.path.dirname(base_path), exist_ok=True)
+        os.makedirs(os.path.dirname(delta_path), exist_ok=True)
+        with open(base_path, "w") as fh:
+            fh.write("[user]\n")
+        with open(delta_path, "w") as fh:
+            fh.write("[user]\n\tname = Domen\n")
+
+        class DuplicateAliasStatus(FakeBranchFS):
+            def status_report(self, status_root):
+                return StatusReport(changes=[
+                    Change("M", "/home/domen/.gitconfig", "file", 23,
+                           status_root.name),
+                    Change("M", "/storage/user/domen-cuda10/.gitconfig",
+                           "file", 23, status_root.name),
+                ], warnings=[])
+
+        controller = ctl.Controller(store=self.h.store,
+                                    backend=DuplicateAliasStatus(),
+                                    alias_map=self.h.alias_map)
+        out = io.StringIO()
+        controller.diff(session.session_id,
+                        "/storage/user/domen-cuda10/.gitconfig", out=out)
+
+        text = out.getvalue()
+        self.assertIn("--- a/domen-cuda10/.gitconfig", text)
+        self.assertIn("+++ b/domen-cuda10/.gitconfig", text)
+        self.assertIn("+\tname = Domen", text)
+
+    def test_diff_path_lists_choices_for_distinct_ambiguous_matches(self):
+        root_a = ProtectedRoot(
+            name="storage_a", base=os.path.join(self._tmp.name, "real-a"),
+            store=os.path.join(self._tmp.name, "stores", "a"),
+            branch="agent-a", mount=os.path.join(self._tmp.name, "mount-a"),
+            visible="/storage/user")
+        root_b = ProtectedRoot(
+            name="storage_b", base=os.path.join(self._tmp.name, "real-b"),
+            store=os.path.join(self._tmp.name, "stores", "b"),
+            branch="agent-b", mount=os.path.join(self._tmp.name, "mount-b"),
+            visible="/storage/user")
+        session = self.h.store.create(
+            owner="domen", agent_kind="fake", agent_command=["true"],
+            workspace="/storage/user",
+            policy={"mode": "manual", "allowed_scopes": ["/storage/user"]},
+            protected_roots={"storage_a": root_a, "storage_b": root_b})
+        session.state = "pending-review"
+        self.h.store.save(session)
+
+        for root, text in ((root_a, "a\n"), (root_b, "b\n")):
+            base_path = os.path.join(root.base, ".gitconfig")
+            delta_path = os.path.join(root.store, "branches", root.branch,
+                                      "files", ".gitconfig")
+            os.makedirs(os.path.dirname(base_path), exist_ok=True)
+            os.makedirs(os.path.dirname(delta_path), exist_ok=True)
+            with open(base_path, "w") as fh:
+                fh.write("old\n")
+            with open(delta_path, "w") as fh:
+                fh.write(text)
+
+        class TwoRootStatus(FakeBranchFS):
+            def status_report(self, status_root):
+                return StatusReport(changes=[
+                    Change("M", "/storage/user/.gitconfig", "file", 2,
+                           status_root.name),
+                ], warnings=[])
+
+        controller = ctl.Controller(store=self.h.store, backend=TwoRootStatus(),
+                                    alias_map=self.h.alias_map)
+        with self.assertRaises(ctl.ControlError) as cm:
+            controller.diff(session.session_id, "/storage/user/.gitconfig",
+                            out=io.StringIO())
+
+        message = str(cm.exception)
+        self.assertIn("path /storage/user/.gitconfig is ambiguous (2 matches)",
+                      message)
+        self.assertIn("choose one of", message)
+        self.assertIn("storage_a:/storage/user/.gitconfig", message)
+        self.assertIn("storage_b:/storage/user/.gitconfig", message)
+        self.assertIn("root storage_a", message)
+        self.assertIn("root storage_b", message)
+
+        out = io.StringIO()
+        controller.diff(session.session_id, "storage_a:/storage/user/.gitconfig",
+                        out=out)
+        self.assertIn("--- a/.gitconfig", out.getvalue())
+        self.assertIn("+a", out.getvalue())
 
     def test_commit_pending_session(self):
         session = self.pending_session()
