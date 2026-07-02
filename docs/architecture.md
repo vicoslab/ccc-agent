@@ -84,7 +84,9 @@ agent process. Layout the agent sees:
 /bin /sbin /lib /lib64            recreated as the host's usrmerge symlinks
 /proc                             bound from the container (bwrap_proc_mode:
                                   bind|ro; "fresh" needs systempaths=unconfined)
-/dev                              bwrap minimal nodes
+/dev                              existing container device namespace (rw bind by
+                                  default, including container-visible /dev/fuse;
+                                  bwrap minimal dev with --full-isolation)
 /tmp                              fresh tmpfs (session-scoped)
 /run                              existing container runtime namespace (rw bind
                                   by default; omitted with --full-isolation or
@@ -118,18 +120,20 @@ the visible path), the BranchFS store, `daemon.sock`, the supervisor state dir,
 and any other `/storage` mount. `/home/$USER` and `/storage/user` bind the
 **same** view (alias rule), never two branches.
 
-The container's existing `/run` is **not** treated as data that ccc-agent must
-hide by default. CCC containers already isolate `/run` from the host unless the
-container deployment intentionally exposes a socket. Therefore bwrap mode binds
-container `/run` into the sandbox by default so agents can use container-provided
-runtime services such as Docker, ssh-agent, or other sockets when that container
-has them. This is an intentional escape-capability tradeoff: a powerful socket
-such as Docker or the FUSE sidecar may let an agent reach data paths outside the
+The container's existing `/run` and `/dev` are **not** treated as data that
+ccc-agent must hide by default. CCC containers already isolate those namespaces
+from the host unless the container deployment intentionally exposes a socket or
+device. Therefore bwrap mode binds container `/run` and `/dev` into the sandbox
+by default so agents can use container-provided runtime services such as Docker,
+ssh-agent, the FUSE sidecar socket, or `/dev/fuse` when that container has them.
+This is an intentional escape-capability tradeoff: a powerful socket/device such
+as Docker or the FUSE sidecar may let an agent reach data paths outside the
 BranchFS view. That risk is considered deployment-authorized system access, not
 a violation of ccc-agent's primary goal (protect and review normal writes to
 `/home`/`/storage`). For stricter containment, run `ccc-agent run
 --full-isolation` or set `container_run_access: false`; that restores the older
-no-ambient-`/run` behavior aside from ccc-agent's own control socket.
+no-ambient-`/run` behavior aside from ccc-agent's own control socket and uses
+bwrap's isolated minimal `/dev` instead of binding the container device tree.
 
 The agent gets a scrubbed environment (`--clearenv` + an explicit `--setenv`
 allowlist). No network or proc isolation is enforced by design; the boundary

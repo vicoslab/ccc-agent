@@ -119,10 +119,12 @@ class RunnerConfig(object):
         # config/API-key env into the otherwise --clearenv'd sandbox.
         self.bwrap_ro_binds = list(bwrap_ro_binds)
         self.bwrap_setenv = dict(bwrap_setenv or {})
-        # By default the sandbox inherits the existing CCC container's /run
-        # namespace.  That may include Docker or other runtime sockets only when
-        # the container deployment already exposed them; use --full-isolation /
-        # container_run_access=false to omit this ambient container runtime view.
+        # By default the sandbox inherits selected runtime namespaces from the
+        # existing CCC container: /run for deployment-provided sockets and /dev
+        # for container-visible devices such as /dev/fuse. These are still the
+        # outer container's namespaced resources, not raw host views. Use
+        # --full-isolation / container_run_access=false to omit this ambient
+        # container runtime view and fall back to bwrap's isolated /dev.
         self.container_run_access = bool(container_run_access)
         # bwrap needs no extra container privilege and no uid/gid: it mints
         # namespace-scoped CAP_SYS_ADMIN from an unprivileged user namespace
@@ -653,13 +655,18 @@ def _bwrap_command(session, config, control=None):
         argv += ["--ro-bind", "/proc", "/proc"]
     else:
         argv += ["--bind", "/proc", "/proc"]
-    argv += ["--dev", "/dev", "--tmpfs", "/tmp"]
 
-    # Expose the existing CCC/container runtime namespace by default.  This is
-    # not a host /run bind unless the outer container already has that access;
-    # it intentionally preserves access to container-provided Docker/runtime
-    # sockets.  --full-isolation / container_run_access=false omits this bind
-    # and restores the older no-ambient-/run behavior.
+    # Expose the existing CCC/container runtime namespace by default.  These are
+    # not raw host binds unless the outer container already has that access; they
+    # intentionally preserve access to container-provided sockets and devices
+    # such as Docker, ssh-agent, the FUSE sidecar socket, and /dev/fuse.  Use
+    # --full-isolation / container_run_access=false to omit these ambient views
+    # and restore the older no-ambient-/run plus isolated bwrap-/dev behavior.
+    if config.container_run_access and os.path.isdir("/dev"):
+        argv += ["--bind", "/dev", "/dev"]
+    else:
+        argv += ["--dev", "/dev"]
+    argv += ["--tmpfs", "/tmp"]
     if config.container_run_access and os.path.isdir("/run"):
         argv += ["--bind", "/run", "/run"]
 

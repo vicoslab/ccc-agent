@@ -151,7 +151,7 @@ def build_runtime(config):
 
 
 def _container_run_access(config, full_isolation=False):
-    """Whether bwrap should inherit the existing container /run namespace."""
+    """Whether bwrap should inherit container runtime /run and /dev views."""
     return bool(config.get("container_run_access", True)) and not full_isolation
 
 
