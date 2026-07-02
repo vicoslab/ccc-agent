@@ -932,6 +932,12 @@ def _unmount_all(session, backend):
             pass  # unmount is cleanup; never mask the session outcome
 
 
+def _cleanup_stale_mount(root, backend):
+    cleanup = getattr(backend, "cleanup_stale_mount", None)
+    if cleanup is not None:
+        cleanup(root)
+
+
 def _command_detail(command):
     return " ".join(str(part) for part in command)
 
@@ -1132,6 +1138,7 @@ def resume_session(session_id, config, env=None, before_finalize=None,
             config.backend.start_daemon(root)
             if was_failed:
                 config.backend.thaw(root)
+            _cleanup_stale_mount(root, config.backend)
             config.backend.mount(root, agent=True)
         if was_failed:
             session.transition("running")

@@ -224,6 +224,38 @@ class TestRunSession(unittest.TestCase):
                                  "resumed.txt")
         self.assertTrue(os.path.isfile(committed))
 
+    def test_resume_clears_stale_mount_before_remounting(self):
+        class RequiresStaleCleanup(FakeBranchFS):
+            def __init__(self):
+                super(RequiresStaleCleanup, self).__init__()
+                self.cleanup_calls = []
+                self.cleaned = False
+
+            def cleanup_stale_mount(self, root):
+                self.cleanup_calls.append(root.mount)
+                self.cleaned = True
+
+            def mount(self, root, agent=True, allow_other=False):
+                if not self.cleaned:
+                    raise RuntimeError("File exists (os error 17)")
+                return super(RequiresStaleCleanup, self).mount(
+                    root, agent=agent, allow_other=allow_other)
+
+        self.h.backend = RequiresStaleCleanup()
+        session = self.running_session(
+            session_id="agent-resume-stale-mount",
+            command=["sh", "-c", "echo resumed > resumed.txt"])
+        root = session.protected_roots["storage_user"]
+
+        resumed = resume_session(session.session_id,
+                                 self.h.config(session.agent_command))
+
+        self.assertEqual(resumed.state, "auto-committed")
+        self.assertEqual(self.h.backend.cleanup_calls, [root.mount])
+        committed = os.path.join(self.h.base, "Projects", "proj-a",
+                                 "resumed.txt")
+        self.assertTrue(os.path.isfile(committed))
+
     def test_resume_failed_session_requires_explicit_allow_failed(self):
         session = self.failed_session(
             command=["sh", "-c", "echo recovered > recovered.txt"])
