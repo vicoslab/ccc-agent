@@ -387,13 +387,19 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertIn(self.root.store, message)
 
     def test_commit_and_abort_use_trusted_branch_commands(self):
-        runner = RecordingRunner()
+        runner = RecordingRunner(outputs={
+            "commit-branch": json.dumps({
+                "parent": "main", "auto_merges": [], "conflicts": []
+            })
+        })
         cli = BranchfsCli(run=runner)
-        cli.commit(self.root)
+        outcome = cli.commit(self.root)
         cli.abort(self.root)
         subcommands = [c[1] for c in runner.calls]
         self.assertEqual(subcommands, ["start-daemon", "commit-branch",
                                        "start-daemon", "abort-branch"])
+        self.assertIn("--json", runner.calls[1])
+        self.assertEqual(outcome["parent"], "main")
 
     def test_abort_treats_missing_branch_with_no_store_dir_as_idempotent(self):
         class MissingBranchRunner(object):

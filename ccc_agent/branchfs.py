@@ -492,7 +492,12 @@ class BranchfsCli(object):
 
     def commit(self, root):
         self.start_daemon(root)
-        self._invoke("commit-branch", root.branch, "--storage", root.store)
+        out = self._invoke("commit-branch", root.branch, "--storage", root.store,
+                           "--json")
+        try:
+            return json.loads(out)
+        except ValueError as exc:
+            raise BranchfsError("unparseable commit outcome: %s" % exc)
 
     def abort(self, root):
         self.start_daemon(root)
@@ -603,6 +608,7 @@ class FakeBranchFS(object):
     def commit(self, root):
         self._apply_to_base(root)
         self._cleanup(root)
+        return {"parent": "main", "auto_merges": [], "conflicts": []}
 
     def abort(self, root):
         self._cleanup(root)
