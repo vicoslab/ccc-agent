@@ -229,6 +229,67 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertEqual([c.path for c in cli.status(self.root)],
                          [c.path for c in report.changes])
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "mode-000 permission checks are bypassed by root")
+    def test_status_report_falls_back_to_store_when_branchfs_status_denied(self):
+        class StatusDeniedRunner(object):
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, argv):
+                self.calls.append(list(argv))
+                if argv[1] == "status":
+                    return 1, "", "Error: io error: Permission denied (os error 13)"
+                return 0, "", ""
+
+        branch_dir = os.path.join(self.root.store, "branches", self.root.branch)
+        files = os.path.join(branch_dir, "files")
+        os.makedirs(os.path.join(files, "Projects", "proj-a"), exist_ok=True)
+        with open(os.path.join(files, "Projects", "proj-a", "result.txt"), "w") as fh:
+            fh.write("ok\n")
+        unreadable = os.path.join(files, "Projects", "proj-a", "scratch", "work", "work")
+        os.makedirs(unreadable)
+        with open(os.path.join(unreadable, "hidden.txt"), "w") as fh:
+            fh.write("hidden\n")
+        with open(os.path.join(branch_dir, "tombstones"), "w") as fh:
+            fh.write("/Projects/proj-a/deleted.txt\n")
+        os.chmod(unreadable, 0)
+        try:
+            cli = BranchfsCli(run=StatusDeniedRunner())
+            report = cli.status_report(self.root)
+        finally:
+            os.chmod(unreadable, 0o700)
+
+        by_path = {change.path: change for change in report.changes}
+        self.assertIn("/storage/user/Projects/proj-a/result.txt", by_path)
+        self.assertIn("/storage/user/Projects/proj-a/scratch/work/work", by_path)
+        self.assertNotIn("/storage/user/Projects/proj-a/scratch/work/work/hidden.txt", by_path)
+        self.assertEqual(by_path["/storage/user/Projects/proj-a/deleted.txt"].op, "D")
+        warning_text = "\n".join(w.message for w in report.warnings)
+        self.assertIn("branchfs status failed", warning_text)
+        self.assertIn("using direct store fallback", warning_text)
+        self.assertIn("unreadable delta directory", warning_text)
+        self.assertTrue(all(w.root == "storage_user" for w in report.warnings))
+
+    def test_status_report_falls_back_to_store_when_branchfs_unavailable(self):
+        class MissingBinaryRunner(object):
+            def __call__(self, argv):
+                raise FileNotFoundError(argv[0])
+
+        files = os.path.join(self.root.store, "branches", self.root.branch,
+                             "files")
+        os.makedirs(os.path.join(files, "Projects", "proj-a"), exist_ok=True)
+        with open(os.path.join(files, "Projects", "proj-a", "result.txt"), "w") as fh:
+            fh.write("ok\n")
+
+        cli = BranchfsCli(binary="/missing/branchfs", run=MissingBinaryRunner())
+        report = cli.status_report(self.root)
+
+        self.assertEqual([change.path for change in report.changes],
+                         ["/storage/user/Projects/proj-a/result.txt"])
+        self.assertIn("direct store fallback", report.warnings[0].message)
+        self.assertIn("/missing/branchfs", report.warnings[0].message)
+
     def test_failure_raises_with_stderr(self):
         runner = RecordingRunner(fail_on={"freeze"})
         cli = BranchfsCli(run=runner)
