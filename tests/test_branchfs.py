@@ -207,6 +207,55 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertEqual(leaf.op, "A")
         self.assertNotIn("/storage/user/Projects/proj-a/sub", by_path)
 
+    def test_status_nets_delete_then_rewrite_to_final_file_change(self):
+        os.makedirs(os.path.join(self.root.base, "Projects", "proj-a"),
+                    exist_ok=True)
+        with open(os.path.join(self.root.base, "Projects", "proj-a",
+                               "settings.json"), "w") as fh:
+            fh.write("old\n")
+        status = dict(STATUS_JSON)
+        status["diff"] = [
+            {"op": "delete", "path": "Projects/proj-a/settings.json",
+             "kind": "tombstone", "bytes": 0},
+            {"op": "delta", "path": "Projects/proj-a/settings.json",
+             "kind": "file", "bytes": 9},
+        ]
+        runner = RecordingRunner(outputs={"status": json.dumps(status)})
+        cli = BranchfsCli(run=runner)
+
+        changes = cli.status(self.root)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].path,
+                         "/storage/user/Projects/proj-a/settings.json")
+        self.assertEqual(changes[0].op, "M")
+        self.assertEqual(changes[0].kind, "file")
+
+    def test_status_collapses_descendant_tombstones_under_tree_delete(self):
+        status = dict(STATUS_JSON)
+        status["diff"] = [
+            {"op": "delete", "path": "Projects/proj-a/.ccc-storage",
+             "kind": "tombstone", "bytes": 0},
+            {"op": "delete", "path": "Projects/proj-a/.ccc-storage/locks",
+             "kind": "tombstone", "bytes": 0},
+            {"op": "delete",
+             "path": "Projects/proj-a/.ccc-storage/locks/foo.lock",
+             "kind": "tombstone", "bytes": 0},
+            {"op": "delete", "path": "Projects/proj-a/.ccc-storage/packs",
+             "kind": "tombstone", "bytes": 0},
+        ]
+        runner = RecordingRunner(outputs={"status": json.dumps(status)})
+        cli = BranchfsCli(run=runner)
+
+        changes = cli.status(self.root)
+
+        self.assertEqual(len(changes), 1)
+        change = changes[0]
+        self.assertEqual(change.op, "D")
+        self.assertEqual(change.path,
+                         "/storage/user/Projects/proj-a/.ccc-storage")
+        self.assertEqual(change.summary, "3 nested deletions hidden")
+
     def test_status_report_preserves_branchfs_warnings(self):
         status = dict(STATUS_JSON)
         status["warnings"] = [

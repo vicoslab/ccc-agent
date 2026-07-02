@@ -802,11 +802,19 @@ def apply_change_from_store(root, change, alias_map):
             shutil.rmtree(base)
     elif change.kind == "dir":
         os.makedirs(base, exist_ok=True)
-    elif os.path.exists(delta):
+    elif os.path.lexists(delta):
         parent = os.path.dirname(base)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        shutil.copy2(delta, base)
+        # A normalized file/symlink delta may replace a base directory or
+        # symlink after its same-path tombstone was hidden from review.  Make
+        # the final path match the delta instead of copying through/into the
+        # old object.
+        if os.path.islink(base):
+            os.unlink(base)
+        elif os.path.isdir(base):
+            shutil.rmtree(base)
+        shutil.copy2(delta, base, follow_symlinks=False)
 
 
 def finalize_session(session, store, backend, alias_map):

@@ -121,8 +121,10 @@ def render_summary(session, changes_by_root, decision, warnings_by_root=None,
     total = 0
     for name, changes in sorted(changes_by_root.items()):
         for change in changes:
-            out("- `%s` `%s` (%s, %d bytes)"
-                % (change.op, change.path, change.kind, change.bytes))
+            summary = getattr(change, "summary", "")
+            suffix = "; %s" % summary if summary else ""
+            out("- `%s` `%s` (%s, %d bytes%s)"
+                % (change.op, change.path, change.kind, change.bytes, suffix))
             total += 1
     if not total:
         out("(none)")

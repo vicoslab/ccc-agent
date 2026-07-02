@@ -17,7 +17,8 @@ import time
 
 from .branchfs import StatusReport
 from .policy import (Change, IgnoredChange, PolicyConfig, classify,
-                     filter_ignored, split_ignored)
+                     filter_ignored, net_final_changes,
+                     net_final_ignored_changes, split_ignored)
 from .runner import finalize_session
 from .paths import is_within
 from .session import TERMINAL_STATES
@@ -46,8 +47,10 @@ class ControlError(Exception):
 
 
 def _change_line(change):
-    return "%s %s (%s, %d bytes)" % (
-        change.op, change.path, change.kind, change.bytes)
+    summary = getattr(change, "summary", "")
+    suffix = "; " + summary if summary else ""
+    return "%s %s (%s, %d bytes%s)" % (
+        change.op, change.path, change.kind, change.bytes, suffix)
 
 
 def _ignored_line(ignored):
@@ -60,6 +63,79 @@ def _ignored_pattern_counts(ignored):
     for item in ignored:
         counts[item.pattern] = counts.get(item.pattern, 0) + 1
     return counts
+
+
+def _is_descendant_path(child, parent):
+    prefix = parent.rstrip("/") + "/"
+    return child != parent and child.startswith(prefix)
+
+
+def _nested_delete_summary(count):
+    if count <= 0:
+        return ""
+    noun = "deletion" if count == 1 else "deletions"
+    return "%d nested %s hidden" % (count, noun)
+
+
+def _normalized_change_view(changes):
+    """Display-only effective view of a raw BranchFS change list.
+
+    The underlying branch can temporarily contain both a tombstone and a delta
+    for the same path (delete followed by rewrite).  BranchFS resolves the delta
+    first, so the review listing should show the final file change, not both.
+    Recursive tree deletes are also collapsed to the ancestor tombstone with a
+    child count to keep large `rm -rf` diffs readable.
+    """
+    normalized = [Change(c.op, c.path, c.kind, c.bytes, c.root,
+                         summary=getattr(c, "summary", ""))
+                  for c in changes]
+    non_delete_by_key = {}
+    for change in normalized:
+        if change.op != "D":
+            key = (change.root, os.path.normpath(change.path))
+            non_delete_by_key.setdefault(key, []).append(change)
+
+    def shadowed_by_non_dir_delta(change):
+        key = (change.root, os.path.normpath(change.path))
+        return any(candidate.kind != "dir"
+                   for candidate in non_delete_by_key.get(key, ()))
+
+    visible_deletes = [change for change in normalized
+                       if change.op == "D" and not
+                       shadowed_by_non_dir_delta(change)]
+    collapsed = set()
+    nested_counts = {id(change): 0 for change in visible_deletes}
+
+    def outermost_visible_delete_ancestor(change):
+        path = os.path.normpath(change.path)
+        ancestors = [candidate for candidate in visible_deletes
+                     if candidate.root == change.root and
+                     _is_descendant_path(path,
+                                         os.path.normpath(candidate.path))]
+        if not ancestors:
+            return None
+        return min(ancestors, key=lambda item: len(os.path.normpath(item.path)))
+
+    for change in normalized:
+        if change.op != "D":
+            continue
+        ancestor = outermost_visible_delete_ancestor(change)
+        if ancestor is not None:
+            collapsed.add(id(change))
+            nested_counts[id(ancestor)] += 1
+
+    out = []
+    for change in normalized:
+        if change.op == "D":
+            if shadowed_by_non_dir_delta(change):
+                continue
+            if id(change) in collapsed:
+                continue
+            summary = _nested_delete_summary(nested_counts.get(id(change), 0))
+            if summary and not change.summary:
+                change.summary = summary
+        out.append(change)
+    return out
 
 
 class Controller(object):
@@ -115,7 +191,7 @@ class Controller(object):
             return False
         out.write("Changes to be committed:\n")
         if changes:
-            for change in changes:
+            for change in _normalized_change_view(changes):
                 out.write("  %s\n" % _change_line(change))
         else:
             out.write("  (none)\n")
@@ -152,7 +228,9 @@ class Controller(object):
                 with open(path) as fh:
                     ignored.extend(IgnoredChange.from_dict(entry)
                                    for entry in json.load(fh))
-        return saw_status, changes, ignored
+        return (saw_status,
+                net_final_changes(changes, self.alias_map),
+                net_final_ignored_changes(ignored, self.alias_map))
 
     def _mount_still_active(self, root):
         try:
@@ -269,10 +347,8 @@ class Controller(object):
             out.write("# root %s (branch %s)\n" % (name, root.branch))
             report = self._live_status_report(session, root, action="status")
             self._write_status_warnings(out, report.warnings)
-            for change in report.changes:
-                out.write("%s %s (%s, %d bytes)\n"
-                          % (change.op, change.path, change.kind,
-                             change.bytes))
+            for change in _normalized_change_view(report.changes):
+                out.write("%s\n" % _change_line(change))
         return session
 
     def diff(self, session_id, path=None, out=None, show_ignored=False):
@@ -370,6 +446,14 @@ class Controller(object):
                       for root, change in matches}
         return len(identities) == 1
 
+    def _match_store_key(self, root, change):
+        rel, _delta, _base = self._store_paths(root, change)
+        return (root.name, os.path.normpath(rel))
+
+    def _all_matches_same_store_path(self, matches):
+        return len({self._match_store_key(root, change)
+                    for root, change in matches}) == 1
+
     def _exact_visible_matches(self, path, matches):
         normalized = os.path.normpath(path)
         return [(root, change) for root, change in matches
@@ -387,7 +471,11 @@ class Controller(object):
     def _preferred_diff_match(self, matches):
         for match in matches:
             _root, change = match
-            if change.kind == "file" or change.op == "D":
+            if change.op != "D" and change.kind == "file":
+                return match
+        for match in matches:
+            _root, change = match
+            if change.op == "D":
                 return match
         return matches[0]
 
@@ -411,13 +499,15 @@ class Controller(object):
         if not matches:
             raise ControlError("no changed file matching %s" % path)
         if len(matches) > 1:
-            if self._all_matches_same_file(matches):
+            if (self._all_matches_same_store_path(matches) or
+                    self._all_matches_same_file(matches)):
                 return self._preferred_diff_match(matches)
             if absolute:
                 exact = self._exact_visible_matches(match_path, matches)
                 if len(exact) == 1:
                     return exact[0]
-                if exact and self._all_matches_same_file(exact):
+                if exact and (self._all_matches_same_store_path(exact) or
+                              self._all_matches_same_file(exact)):
                     return self._preferred_diff_match(exact)
             raise ControlError(self._ambiguous_match_message(path, matches))
         return matches[0]
@@ -504,18 +594,28 @@ class Controller(object):
                 shutil.rmtree(base)
         elif change.kind == "dir":
             os.makedirs(base, exist_ok=True)
-        elif os.path.exists(delta):
+        elif os.path.lexists(delta):
             parent = os.path.dirname(base)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            shutil.copy2(delta, base)
+            # A normalized file/symlink delta may replace a base directory or
+            # symlink after its same-path tombstone was hidden from review.  Make
+            # the final path match the delta instead of copying through/into the
+            # old object.
+            if os.path.islink(base):
+                os.unlink(base)
+            elif os.path.isdir(base):
+                shutil.rmtree(base)
+            shutil.copy2(delta, base, follow_symlinks=False)
 
     def _changes(self, session, include_ignored=False):
         out = []
         config = PolicyConfig.from_dict(session.policy)
         for _name, root in sorted(session.protected_roots.items()):
             changes = self._live_status(session, root, action="review")
-            if not include_ignored:
+            if include_ignored:
+                changes = net_final_changes(changes, self.alias_map)
+            else:
                 changes, _ignored = split_ignored(changes, config, self.alias_map)
             for change in changes:
                 out.append((root, change))

@@ -12,6 +12,7 @@ from ccc_agent.policy import (
     PolicyConfig,
     evaluate,
     filter_ignored,
+    net_final_changes,
     path_matches,
 )
 
@@ -188,6 +189,34 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual([c.path for c in filtered], ["/storage/user/.bashrc"])
         d = evaluate(filtered, cfg(), AMAP)
         self.assertEqual(d.decision, PENDING_REVIEW)
+
+    def test_net_final_changes_prefers_rewritten_file_over_tombstone(self):
+        changes = [
+            Change(op="D", path=f"{WORKSPACE}/settings.json",
+                   kind="tombstone", root="storage_user"),
+            Change(op="M", path=f"{WORKSPACE}/settings.json",
+                   kind="file", bytes=42, root="storage_user"),
+        ]
+
+        net = net_final_changes(changes, AMAP)
+
+        self.assertEqual(len(net), 1)
+        self.assertEqual(net[0].op, "M")
+        self.assertEqual(net[0].kind, "file")
+        self.assertEqual(net[0].bytes, 42)
+
+    def test_evaluate_counts_delete_rewrite_as_one_final_change(self):
+        changes = [
+            Change(op="D", path=f"{WORKSPACE}/settings.json",
+                   kind="tombstone", root="storage_user"),
+            Change(op="M", path=f"{WORKSPACE}/settings.json",
+                   kind="file", root="storage_user"),
+        ]
+
+        d = evaluate(changes, cfg(), AMAP)
+
+        self.assertEqual(d.decision, AUTO_COMMIT)
+        self.assertEqual(d.total_changes, 1)
 
 
 if __name__ == "__main__":

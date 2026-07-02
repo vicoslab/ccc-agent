@@ -109,6 +109,21 @@ class TestController(unittest.TestCase):
         self.h.controller().diff(session.session_id, out=out)
         self.assertIn("/storage/user/outside.txt", out.getvalue())
 
+    def test_diff_prints_collapsed_delete_summary(self):
+        session = self.pending_session()
+        review = self.h.store.review_dir(session.session_id)
+        status_path = os.path.join(review, "status.storage_user.json")
+        change = Change("D", "/storage/user/tree", "tombstone", 0,
+                        "storage_user", summary="3 nested deletions hidden")
+        with open(status_path, "w") as fh:
+            json.dump([change.to_dict()], fh)
+
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, out=out)
+
+        self.assertIn("D /storage/user/tree", out.getvalue())
+        self.assertIn("3 nested deletions hidden", out.getvalue())
+
     def test_diff_summarizes_ignored_policy_changes_without_full_listing(self):
         session = self.cache_review_session()
         out = io.StringIO()
@@ -366,6 +381,97 @@ class TestController(unittest.TestCase):
                         out=out)
         self.assertIn("--- a/.gitconfig", out.getvalue())
         self.assertIn("+a", out.getvalue())
+
+    def test_diff_path_prefers_file_delta_over_tombstone_for_same_relpath(self):
+        root = ProtectedRoot(
+            name="storage", base=os.path.join(self._tmp.name, "real-storage"),
+            store=os.path.join(self._tmp.name, "stores", "storage"),
+            branch="agent-delete-rewrite",
+            mount=os.path.join(self._tmp.name, "mount-storage"),
+            visible="/storage")
+        session = self.h.store.create(
+            owner="domen", agent_kind="fake", agent_command=["true"],
+            workspace="/storage/user/domen-cuda10",
+            policy={"mode": "manual",
+                    "allowed_scopes": ["/storage/user/domen-cuda10"]},
+            protected_roots={"storage": root})
+        session.state = "pending-review"
+        self.h.store.save(session)
+
+        rel = os.path.join("user", "domen-cuda10", ".gitconfig")
+        base_path = os.path.join(root.base, rel)
+        delta_path = os.path.join(root.store, "branches", root.branch,
+                                  "files", rel)
+        os.makedirs(os.path.dirname(base_path), exist_ok=True)
+        os.makedirs(os.path.dirname(delta_path), exist_ok=True)
+        with open(base_path, "w") as fh:
+            fh.write("[user]\n")
+        with open(delta_path, "w") as fh:
+            fh.write("[user]\n\tname = Domen\n")
+
+        class DeleteThenRewriteStatus(FakeBranchFS):
+            def status_report(self, status_root):
+                path = "/storage/user/domen-cuda10/.gitconfig"
+                return StatusReport(changes=[
+                    Change("D", path, "tombstone", 0, status_root.name),
+                    Change("M", path, "file", 23, status_root.name),
+                ], warnings=[])
+
+        controller = ctl.Controller(store=self.h.store,
+                                    backend=DeleteThenRewriteStatus(),
+                                    alias_map=self.h.alias_map)
+        listing = io.StringIO()
+        controller.diff(session.session_id, out=listing)
+        listing_text = listing.getvalue()
+        self.assertIn(
+            "M /storage/user/domen-cuda10/.gitconfig (file, 23 bytes)",
+            listing_text)
+        self.assertNotIn(
+            "D /storage/user/domen-cuda10/.gitconfig (tombstone",
+            listing_text)
+
+        out = io.StringIO()
+        controller.diff(session.session_id,
+                        "/storage/user/domen-cuda10/.gitconfig", out=out)
+
+        text = out.getvalue()
+        self.assertIn("--- a/user/domen-cuda10/.gitconfig", text)
+        self.assertIn("+++ b/user/domen-cuda10/.gitconfig", text)
+        self.assertIn("+\tname = Domen", text)
+
+    def test_diff_stored_review_nets_delete_rewrite_artifacts(self):
+        root = ProtectedRoot(
+            name="storage", base=os.path.join(self._tmp.name, "real-storage"),
+            store=os.path.join(self._tmp.name, "stores", "storage"),
+            branch="agent-stored-delete-rewrite",
+            mount=os.path.join(self._tmp.name, "mount-storage"),
+            visible="/storage")
+        session = self.h.store.create(
+            owner="domen", agent_kind="fake", agent_command=["true"],
+            workspace="/storage/user/domen-cuda10",
+            policy={"mode": "manual",
+                    "allowed_scopes": ["/storage/user/domen-cuda10"]},
+            protected_roots={"storage": root})
+        session.state = "pending-review"
+        self.h.store.save(session)
+
+        review = self.h.store.review_dir(session.session_id)
+        os.makedirs(review, exist_ok=True)
+        path = "/storage/user/domen-cuda10/.gitconfig"
+        with open(os.path.join(review, "status.storage.json"), "w") as fh:
+            json.dump([
+                Change("D", path, "tombstone", 0, "storage").to_dict(),
+                Change("M", path, "file", 23, "storage").to_dict(),
+            ], fh)
+
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, out=out)
+
+        text = out.getvalue()
+        self.assertIn("M /storage/user/domen-cuda10/.gitconfig (file, 23 bytes)",
+                      text)
+        self.assertNotIn("D /storage/user/domen-cuda10/.gitconfig (tombstone",
+                         text)
 
     def test_commit_pending_session(self):
         session = self.pending_session()

@@ -101,24 +101,29 @@ def path_matches(pattern, path):
 class Change(object):
     """One changed path from BranchFS status, in agent-visible terms."""
 
-    __slots__ = ("op", "path", "kind", "bytes", "root")
+    __slots__ = ("op", "path", "kind", "bytes", "root", "summary")
 
-    def __init__(self, op, path, kind="file", bytes=0, root=""):
+    def __init__(self, op, path, kind="file", bytes=0, root="", summary=""):
         self.op = op        # "A" added | "M" modified | "D" deleted
         self.path = path    # absolute agent-visible path
         self.kind = kind    # file | dir | symlink
         self.bytes = bytes
         self.root = root    # protected-root name, e.g. "storage_user"
+        self.summary = summary  # optional display note, e.g. collapsed children
 
     def to_dict(self):
-        return {"op": self.op, "path": self.path, "kind": self.kind,
+        data = {"op": self.op, "path": self.path, "kind": self.kind,
                 "bytes": self.bytes, "root": self.root}
+        if self.summary:
+            data["summary"] = self.summary
+        return data
 
     @classmethod
     def from_dict(cls, data):
         return cls(op=data["op"], path=data["path"],
                    kind=data.get("kind", "file"), bytes=data.get("bytes", 0),
-                   root=data.get("root", ""))
+                   root=data.get("root", ""),
+                   summary=data.get("summary", ""))
 
 
 class IgnoredChange(object):
@@ -140,7 +145,60 @@ class IgnoredChange(object):
         return cls(Change.from_dict(data), data.get("ignore_pattern", ""))
 
 
+def _change_key(change, alias_map=None):
+    if alias_map is not None:
+        path = alias_map.canonicalize(change.path)
+    else:
+        path = posixpath.normpath(change.path)
+    return (change.root, path)
+
+
+def _prefer_final_change(current, candidate):
+    """Choose the effective final filesystem state for one root/path.
+
+    A same-path tombstone plus a non-delete delta is delete-then-rewrite
+    bookkeeping: after commit the path exists with the delta contents.  Show and
+    commit that final file/dir/symlink change, not the intermediate tombstone.
+    """
+    if current.op == "D" and candidate.op != "D":
+        return candidate
+    if current.op != "D" and candidate.op == "D":
+        return current
+    return current
+
+
+def net_final_changes(changes, alias_map=None):
+    """Collapse raw status entries to one final-state change per root/path."""
+    selected = {}
+    order = []
+    for change in changes:
+        key = _change_key(change, alias_map)
+        if key not in selected:
+            selected[key] = change
+            order.append(key)
+        else:
+            selected[key] = _prefer_final_change(selected[key], change)
+    return [selected[key] for key in order]
+
+
+def net_final_ignored_changes(ignored, alias_map=None):
+    """Collapse ignored changes while preserving the ignore pattern selected."""
+    selected = {}
+    order = []
+    for item in ignored:
+        key = _change_key(item.change, alias_map)
+        if key not in selected:
+            selected[key] = item
+            order.append(key)
+        else:
+            preferred = _prefer_final_change(selected[key].change, item.change)
+            if preferred is item.change:
+                selected[key] = item
+    return [selected[key] for key in order]
+
+
 class DenyMatch(object):
+
     __slots__ = ("path", "pattern")
 
     def __init__(self, path, pattern):
@@ -219,7 +277,7 @@ def split_ignored(changes, config, alias_map):
     """Return ``(policy_visible, ignored)`` for a change sequence."""
     visible = []
     ignored = []
-    for change in changes:
+    for change in net_final_changes(changes, alias_map):
         pattern = ignore_pattern_for_path(change.path, config, alias_map)
         if pattern is None:
             visible.append(change)
@@ -254,6 +312,7 @@ class PolicyDecision(object):
 
 def classify(changes, config, alias_map):
     """Return (out_of_scope, deny_matches) for the change set, canonicalized."""
+    changes = net_final_changes(changes, alias_map)
     scopes = [alias_map.canonicalize(s) for s in config.allowed_scopes]
     deny = list(config.deny_patterns) + list(config.hide_patterns)
     out_of_scope = []
@@ -280,6 +339,7 @@ def classify(changes, config, alias_map):
 
 def evaluate(changes, config, alias_map):
     """Decide what to do with a frozen session's change set."""
+    changes = net_final_changes(changes, alias_map)
     if not changes:
         return PolicyDecision(NO_CHANGES, 0, [], [],
                               ["branch contains no changes"])

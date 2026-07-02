@@ -122,6 +122,18 @@ def _run_subprocess(argv, timeout=DEFAULT_BRANCHFS_TIMEOUT_SECONDS):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _is_descendant_path(child, parent):
+    prefix = parent.rstrip("/") + "/"
+    return child != parent and child.startswith(prefix)
+
+
+def _nested_delete_summary(count):
+    if count <= 0:
+        return ""
+    noun = "deletion" if count == 1 else "deletions"
+    return "%d nested %s hidden" % (count, noun)
+
+
 def _changes_from_status(data, root):
     """Map a `branchfs status --json` document to Change objects in the
     agent-visible namespace.
@@ -132,14 +144,57 @@ def _changes_from_status(data, root):
     changes, so the ccc-agent review surface keeps only leaf paths (files,
     symlinks, tombstones, and standalone directory entries with no changed
     descendants).
+
+    BranchFS also resolves `delta > tombstone > parent/base`: if a file/symlink
+    delta and a tombstone share the same relpath, the delta is the effective
+    final state and the tombstone is just delete-then-rewrite bookkeeping.  For
+    directory/tree deletes, keep the ancestor tombstone but collapse descendant
+    tombstones into a count so a recursive delete is shown once.
     """
     entries = list(data.get("diff", ()))
     relpaths = [e.get("path", "").lstrip("/") for e in entries]
 
     def has_changed_descendant(relpath):
-        prefix = relpath.rstrip("/") + "/"
-        return any(other != relpath and other.startswith(prefix)
-                   for other in relpaths)
+        return any(_is_descendant_path(other, relpath) for other in relpaths)
+
+    non_delete_by_rel = {}
+    for entry in entries:
+        if entry.get("op") != "delete":
+            relpath = entry.get("path", "").lstrip("/")
+            non_delete_by_rel.setdefault(relpath, []).append(entry)
+
+    def tombstone_shadowed_by_non_dir_delta(relpath):
+        return any(entry.get("kind", "file") != "dir"
+                   for entry in non_delete_by_rel.get(relpath, ()))
+
+    visible_delete_rels = []
+    for entry in entries:
+        relpath = entry.get("path", "").lstrip("/")
+        kind = entry.get("kind", "file")
+        if kind == "dir" and has_changed_descendant(relpath):
+            continue
+        if entry.get("op") == "delete" and not \
+                tombstone_shadowed_by_non_dir_delta(relpath):
+            visible_delete_rels.append(relpath)
+
+    collapsed_deletes = set()
+    nested_delete_counts = {relpath: 0 for relpath in visible_delete_rels}
+
+    def outermost_visible_delete_ancestor(relpath):
+        ancestors = [candidate for candidate in visible_delete_rels
+                     if _is_descendant_path(relpath, candidate)]
+        if not ancestors:
+            return None
+        return min(ancestors, key=len)
+
+    for entry in entries:
+        if entry.get("op") != "delete":
+            continue
+        relpath = entry.get("path", "").lstrip("/")
+        ancestor = outermost_visible_delete_ancestor(relpath)
+        if ancestor is not None:
+            collapsed_deletes.add(relpath)
+            nested_delete_counts[ancestor] += 1
 
     changes = []
     for entry in entries:
@@ -147,14 +202,21 @@ def _changes_from_status(data, root):
         kind = entry.get("kind", "file")
         if kind == "dir" and has_changed_descendant(relpath):
             continue
-        visible = root.visible.rstrip("/") + "/" + relpath
         if entry.get("op") == "delete":
+            if tombstone_shadowed_by_non_dir_delta(relpath):
+                continue
+            if relpath in collapsed_deletes:
+                continue
             op = "D"
+            summary = _nested_delete_summary(nested_delete_counts.get(relpath, 0))
         else:
             base_path = os.path.join(root.base, relpath)
             op = "M" if os.path.lexists(base_path) else "A"
+            summary = ""
+        visible = root.visible.rstrip("/") + "/" + relpath
         changes.append(Change(op=op, path=visible, kind=kind,
-                              bytes=entry.get("bytes", 0), root=root.name))
+                              bytes=entry.get("bytes", 0), root=root.name,
+                              summary=summary))
     return changes
 
 
