@@ -494,7 +494,7 @@ class TestBwrapConfinement(unittest.TestCase):
                             or e.get("event") == "bwrap-launch"
                             for e in session.events))
 
-    def test_bwrap_binds_container_runtime_and_dev_by_default(self):
+    def test_bwrap_uses_device_capable_container_dev_by_default(self):
         seen = {}
 
         def fake_run(argv, **kwargs):
@@ -508,7 +508,8 @@ class TestBwrapConfinement(unittest.TestCase):
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
         self.assertIn(("--bind", "/run", "/run"), triples)
-        self.assertIn(("--bind", "/dev", "/dev"), triples)
+        self.assertIn(("--dev-bind", "/dev", "/dev"), triples)
+        self.assertNotIn(("--bind", "/dev", "/dev"), triples)
         self.assertNotIn("--dev", argv)
 
     def test_bwrap_full_isolation_omits_container_run_and_uses_minimal_dev(self):

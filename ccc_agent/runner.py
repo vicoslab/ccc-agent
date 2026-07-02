@@ -120,11 +120,12 @@ class RunnerConfig(object):
         self.bwrap_ro_binds = list(bwrap_ro_binds)
         self.bwrap_setenv = dict(bwrap_setenv or {})
         # By default the sandbox inherits selected runtime namespaces from the
-        # existing CCC container: /run for deployment-provided sockets and /dev
-        # for container-visible devices such as /dev/fuse. These are still the
-        # outer container's namespaced resources, not raw host views. Use
-        # --full-isolation / container_run_access=false to omit this ambient
-        # container runtime view and fall back to bwrap's isolated /dev.
+        # existing CCC container: /run for deployment-provided sockets and a
+        # device-capable /dev bind for container-visible devices such as
+        # /dev/fuse. These are still the outer container's namespaced resources,
+        # not raw host views. Use --full-isolation / container_run_access=false
+        # to omit this ambient container runtime view and fall back to bwrap's
+        # isolated /dev.
         self.container_run_access = bool(container_run_access)
         # bwrap needs no extra container privilege and no uid/gid: it mints
         # namespace-scoped CAP_SYS_ADMIN from an unprivileged user namespace
@@ -660,10 +661,11 @@ def _bwrap_command(session, config, control=None):
     # not raw host binds unless the outer container already has that access; they
     # intentionally preserve access to container-provided sockets and devices
     # such as Docker, ssh-agent, the FUSE sidecar socket, and /dev/fuse.  Use
-    # --full-isolation / container_run_access=false to omit these ambient views
-    # and restore the older no-ambient-/run plus isolated bwrap-/dev behavior.
+    # --dev-bind for /dev: ordinary --bind makes device nodes appear under a
+    # nodev mount inside bwrap, so /dev/urandom cannot be opened and Python dies
+    # during hash-randomization startup.
     if config.container_run_access and os.path.isdir("/dev"):
-        argv += ["--bind", "/dev", "/dev"]
+        argv += ["--dev-bind", "/dev", "/dev"]
     else:
         argv += ["--dev", "/dev"]
     argv += ["--tmpfs", "/tmp"]
