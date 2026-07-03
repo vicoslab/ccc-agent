@@ -257,6 +257,30 @@ class TestRunSession(unittest.TestCase):
                                  "resumed.txt")
         self.assertTrue(os.path.isfile(committed))
 
+    def test_resume_stale_cleanup_does_not_stat_mountpoint_first(self):
+        class RecordsStaleCleanup(FakeBranchFS):
+            def __init__(self):
+                super(RecordsStaleCleanup, self).__init__()
+                self.cleanup_calls = []
+
+            def cleanup_stale_mount(self, root):
+                self.cleanup_calls.append(root.mount)
+
+        self.h.backend = RecordsStaleCleanup()
+        session = self.running_session(
+            session_id="agent-resume-no-mountpoint-probe",
+            command=["sh", "-c", "echo resumed > resumed.txt"])
+        root = session.protected_roots["storage_user"]
+
+        with mock.patch("ccc_agent.runner.os.path.ismount",
+                        side_effect=AssertionError(
+                            "resume must not stat stale FUSE mountpoints")):
+            resumed = resume_session(session.session_id,
+                                     self.h.config(session.agent_command))
+
+        self.assertEqual(resumed.state, "auto-committed")
+        self.assertEqual(self.h.backend.cleanup_calls, [root.mount])
+
     def test_resume_failed_session_requires_explicit_allow_failed(self):
         session = self.failed_session(
             command=["sh", "-c", "echo recovered > recovered.txt"])

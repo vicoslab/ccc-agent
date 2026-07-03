@@ -21,7 +21,7 @@ import stat
 import subprocess
 
 from . import artifacts
-from .branchfs import StatusReport
+from .branchfs import StatusReport, _mountinfo_entry
 from .control import ControlServer
 from .paths import is_within, normalize
 from .policy import (ABORT, AUTO_COMMIT, NO_CHANGES, PENDING_REVIEW,
@@ -1000,14 +1000,12 @@ def _command_detail(command):
     return " ".join(str(part) for part in command)
 
 
-def _active_mounts(session):
+def _active_mounts(session, backend=None):
+    mountinfo_path = getattr(backend, "_mountinfo_path", "/proc/self/mountinfo")
     active = []
     for root in session.protected_roots.values():
-        try:
-            if os.path.ismount(root.mount):
-                active.append(root.mount)
-        except OSError:
-            pass
+        if _mountinfo_entry(root.mount, mountinfo_path) is not None:
+            active.append(root.mount)
     return active
 
 
@@ -1181,14 +1179,6 @@ def resume_session(session_id, config, env=None, before_finalize=None,
             "pending-review, aborted, or failed with --allow-failed)"
             % (session.session_id, session.state))
 
-    active = _active_mounts(session)
-    if active and not force:
-        raise ResumeError(
-            "refusing to resume session %s because its mount(s) still appear "
-            "active: %s; use --force only after verifying no old agent process "
-            "is still using the session"
-            % (session.session_id, ", ".join(active)))
-
     session.add_event("resume-command", _command_detail(config.agent_command))
     if was_failed:
         session.add_event("resume-from-failed")
@@ -1203,12 +1193,23 @@ def resume_session(session_id, config, env=None, before_finalize=None,
     try:
         _ensure_shared_agent_state_dirs(config)
         for root in session.protected_roots.values():
+            _cleanup_stale_mount(root, config.backend)
+
+        active = _active_mounts(session, config.backend)
+        if active and not force:
+            raise ResumeError(
+                "refusing to resume session %s because its mount(s) still "
+                "appear active after stale BranchFS cleanup: %s; use --force "
+                "only after verifying no old agent process is still using the "
+                "session"
+                % (session.session_id, ", ".join(active)))
+
+        for root in session.protected_roots.values():
             config.backend.start_daemon(root)
             if was_aborted:
                 config.backend.create_branch(root)
             elif was_failed or was_pending_review:
                 config.backend.thaw(root)
-            _cleanup_stale_mount(root, config.backend)
             config.backend.mount(root, agent=True)
         if was_failed or was_pending_review or was_aborted:
             session.transition("running")

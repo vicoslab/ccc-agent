@@ -194,7 +194,7 @@ class TestBranchfsCli(unittest.TestCase):
 
         self.assertEqual(unmounted, [self.root.mount])
 
-    def test_cleanup_stale_mount_ignores_active_branchfs_fuse(self):
+    def test_cleanup_stale_mount_lazy_unmounts_branchfs_fuse_from_mountinfo(self):
         mountinfo = os.path.join(self.tmp.name, "mountinfo")
         with open(mountinfo, "w") as fh:
             fh.write("42 1 0:99 / %s rw - fuse branchfs rw\n" % self.root.mount)
@@ -208,7 +208,7 @@ class TestBranchfsCli(unittest.TestCase):
 
         cli.cleanup_stale_mount(self.root)
 
-        self.assertEqual(unmounted, [])
+        self.assertEqual(unmounted, [self.root.mount])
 
     def test_cleanup_stale_mount_ignores_non_branchfs_mount(self):
         mountinfo = os.path.join(self.tmp.name, "mountinfo")
@@ -225,6 +225,48 @@ class TestBranchfsCli(unittest.TestCase):
         cli.cleanup_stale_mount(self.root)
 
         self.assertEqual(unmounted, [])
+
+    def test_cleanup_stale_mount_does_not_probe_branchfs_mountpoint(self):
+        mountinfo = os.path.join(self.tmp.name, "mountinfo")
+        with open(mountinfo, "w") as fh:
+            fh.write("42 1 0:99 / %s rw - fuse branchfs rw\n" % self.root.mount)
+        unmounted = []
+
+        def forbidden_probe(path):
+            raise AssertionError("cleanup must not stat/list a stale FUSE mountpoint")
+
+        cli = BranchfsCli(
+            run=RecordingRunner(),
+            mountinfo_path=mountinfo,
+            disconnected_mount_probe=forbidden_probe,
+            lazy_unmount=lambda path: unmounted.append(path),
+        )
+
+        cli.cleanup_stale_mount(self.root)
+
+        self.assertEqual(unmounted, [self.root.mount])
+
+    def test_unmount_falls_back_to_lazy_unmount_when_branchfs_unmount_fails(self):
+        class FailingUnmountRunner(RecordingRunner):
+            def __call__(self, argv):
+                self.calls.append(list(argv))
+                if argv[1] == "unmount":
+                    return 1, "", "Transport endpoint is not connected"
+                return 0, "", ""
+
+        mountinfo = os.path.join(self.tmp.name, "mountinfo")
+        with open(mountinfo, "w") as fh:
+            fh.write("42 1 0:99 / %s rw - fuse branchfs rw\n" % self.root.mount)
+        unmounted = []
+        cli = BranchfsCli(
+            run=FailingUnmountRunner(),
+            mountinfo_path=mountinfo,
+            lazy_unmount=lambda path: unmounted.append(path),
+        )
+
+        cli.unmount(self.root)
+
+        self.assertEqual(unmounted, [self.root.mount])
 
     def test_mount_omits_allow_other_by_default(self):
         runner = RecordingRunner()

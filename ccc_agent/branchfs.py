@@ -79,7 +79,7 @@ def _decode_mountinfo_field(value):
                  .replace("\\134", "\\"))
 
 
-def _branchfs_mountinfo_entry(path, mountinfo_path="/proc/self/mountinfo"):
+def _mountinfo_entry(path, mountinfo_path="/proc/self/mountinfo"):
     target = os.path.abspath(path)
     try:
         with open(mountinfo_path) as fh:
@@ -101,10 +101,20 @@ def _branchfs_mountinfo_entry(path, mountinfo_path="/proc/self/mountinfo"):
             continue
         fstype = fields[separator + 1]
         source = fields[separator + 2]
-        if (fstype == "fuse" or fstype.startswith("fuse.")) and (
-                source == "branchfs" or fstype == "fuse.branchfs"):
-            return {"mountpoint": mountpoint, "fstype": fstype,
-                    "source": source}
+        return {"mountpoint": mountpoint, "fstype": fstype,
+                "source": source}
+    return None
+
+
+def _branchfs_mountinfo_entry(path, mountinfo_path="/proc/self/mountinfo"):
+    entry = _mountinfo_entry(path, mountinfo_path)
+    if entry is None:
+        return None
+    fstype = entry["fstype"]
+    source = entry["source"]
+    if (fstype == "fuse" or fstype.startswith("fuse.")) and (
+            source == "branchfs" or fstype == "fuse.branchfs"):
+        return entry
     return None
 
 
@@ -116,24 +126,29 @@ def _disconnected_mount(path):
         return exc.errno == errno.ENOTCONN
 
 
-def _run_lazy_unmount_command(argv):
+def _run_lazy_unmount_command(argv, timeout=DEFAULT_BRANCHFS_TIMEOUT_SECONDS):
     try:
         proc = subprocess.run(argv, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+                              stderr=subprocess.PIPE, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return 124, _coerce_output(exc.stdout), _coerce_output(exc.stderr)
     except FileNotFoundError as exc:
         return 127, "", str(exc)
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _lazy_unmount_path(path):
+def _lazy_unmount_path(path, timeout=DEFAULT_BRANCHFS_TIMEOUT_SECONDS):
     attempts = []
     for argv in (["fusermount3", "-uz", path],
                  ["fusermount", "-uz", path],
                  ["umount", "-l", path]):
-        code, out, err = _run_lazy_unmount_command(argv)
+        code, out, err = _run_lazy_unmount_command(argv, timeout=timeout)
         if code == 0:
             return
         detail = (err or out or "exit %d" % code).strip()
+        if "not mounted" in detail.lower() or "not found in" in detail.lower():
+            return
         attempts.append("%s: %s" % (" ".join(argv), detail))
     raise BranchfsError("lazy unmount failed for %s: %s"
                         % (path, "; ".join(attempts)))
@@ -463,7 +478,9 @@ class BranchfsCli(object):
         self._mountinfo_path = mountinfo_path or "/proc/self/mountinfo"
         self._disconnected_mount_probe = (disconnected_mount_probe or
                                           _disconnected_mount)
-        self._lazy_unmount = lazy_unmount or _lazy_unmount_path
+        self._lazy_unmount = (lazy_unmount or
+                              (lambda path: _lazy_unmount_path(
+                                  path, timeout=self.timeout_seconds)))
         if run is None:
             self._run = lambda argv: _run_subprocess(
                 argv, timeout=self.timeout_seconds)
@@ -538,12 +555,18 @@ class BranchfsCli(object):
     def cleanup_stale_mount(self, root):
         if _branchfs_mountinfo_entry(root.mount, self._mountinfo_path) is None:
             return
-        if not self._disconnected_mount_probe(root.mount):
-            return
+        # Do not stat/list the mountpoint here.  A stale FUSE mount can block
+        # filesystem probes indefinitely (including df/statfs), so mountinfo is
+        # the authority for cleanup and lazy unmount is the non-blocking escape.
         self._lazy_unmount(root.mount)
 
     def unmount(self, root):
-        self._invoke("unmount", root.mount, "--storage", root.store)
+        try:
+            self._invoke("unmount", root.mount, "--storage", root.store)
+        except BranchfsError:
+            if _branchfs_mountinfo_entry(root.mount, self._mountinfo_path) is None:
+                raise
+            self._lazy_unmount(root.mount)
 
     def freeze(self, root):
         self.start_daemon(root)
