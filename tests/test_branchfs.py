@@ -280,6 +280,9 @@ class TestBranchfsCli(unittest.TestCase):
         with open(os.path.join(self.root.base, "Projects", "proj-a",
                                "existing.py"), "w") as fh:
             fh.write("old contents\n")
+        with open(os.path.join(self.root.base, "Projects", "proj-a",
+                               "old.txt"), "w") as fh:
+            fh.write("old contents\n")
         runner = RecordingRunner(outputs={"status": json.dumps(STATUS_JSON)})
         cli = BranchfsCli(run=runner)
         changes = cli.status(self.root)
@@ -322,7 +325,26 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertEqual(changes[0].op, "M")
         self.assertEqual(changes[0].kind, "file")
 
+    def test_status_omits_tombstone_when_underlying_path_is_missing(self):
+        status = dict(STATUS_JSON)
+        status["diff"] = [
+            {"op": "delete", "path": "Projects/proj-a/session-only.tmp",
+             "kind": "tombstone", "bytes": 0},
+        ]
+        runner = RecordingRunner(outputs={"status": json.dumps(status)})
+        cli = BranchfsCli(run=runner)
+
+        changes = cli.status(self.root)
+
+        self.assertEqual(changes, [])
+
     def test_status_parsing_does_not_scan_entries_pairwise(self):
+        base_bulk = os.path.join(self.root.base, "bulk")
+        os.makedirs(base_bulk, exist_ok=True)
+        for idx in range(1200):
+            with open(os.path.join(base_bulk, "file-%04d.txt" % idx), "w") as fh:
+                fh.write("old\n")
+
         status = dict(STATUS_JSON)
         status["diff"] = [
             {"op": "delete", "path": "bulk/file-%04d.txt" % idx,
@@ -346,6 +368,13 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertLess(len(calls), len(changes) * 10)
 
     def test_status_collapses_descendant_tombstones_under_tree_delete(self):
+        base_tree = os.path.join(self.root.base, "Projects", "proj-a",
+                                 ".ccc-storage")
+        os.makedirs(os.path.join(base_tree, "locks"), exist_ok=True)
+        os.makedirs(os.path.join(base_tree, "packs"), exist_ok=True)
+        with open(os.path.join(base_tree, "locks", "foo.lock"), "w") as fh:
+            fh.write("old\n")
+
         status = dict(STATUS_JSON)
         status["diff"] = [
             {"op": "delete", "path": "Projects/proj-a/.ccc-storage",
@@ -371,6 +400,12 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertEqual(change.summary, "3 nested deletions hidden")
 
     def test_status_report_preserves_branchfs_warnings(self):
+        os.makedirs(os.path.join(self.root.base, "Projects", "proj-a"),
+                    exist_ok=True)
+        with open(os.path.join(self.root.base, "Projects", "proj-a",
+                               "old.txt"), "w") as fh:
+            fh.write("old contents\n")
+
         status = dict(STATUS_JSON)
         status["warnings"] = [
             {"path": "/Projects/proj-a/unreadable",
@@ -414,6 +449,11 @@ class TestBranchfsCli(unittest.TestCase):
         os.makedirs(unreadable)
         with open(os.path.join(unreadable, "hidden.txt"), "w") as fh:
             fh.write("hidden\n")
+        base_deleted = os.path.join(self.root.base, "Projects", "proj-a",
+                                    "deleted.txt")
+        os.makedirs(os.path.dirname(base_deleted), exist_ok=True)
+        with open(base_deleted, "w") as fh:
+            fh.write("old\n")
         with open(os.path.join(branch_dir, "tombstones"), "w") as fh:
             fh.write("/Projects/proj-a/deleted.txt\n")
         os.chmod(unreadable, 0)

@@ -234,7 +234,14 @@ def _changes_from_status(data, root):
     directory/tree deletes, keep the ancestor tombstone but collapse descendant
     tombstones into a count so a recursive delete is shown once.
     """
-    entries = list(data.get("diff", ()))
+    def delete_has_underlying_target(entry):
+        if entry.get("op") != "delete":
+            return True
+        relpath = entry.get("path", "").lstrip("/")
+        return os.path.lexists(os.path.join(root.base, relpath))
+
+    entries = [entry for entry in data.get("diff", ())
+               if delete_has_underlying_target(entry)]
     relpaths = [e.get("path", "").lstrip("/") for e in entries]
     rels_with_changed_descendants = set()
     for relpath in relpaths:
