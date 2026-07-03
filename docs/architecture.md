@@ -48,9 +48,12 @@ created -> mounting -> running -> finalizing -> frozen
 - If a node/container reboots while a session is `running`, `ccc-agent resume
   <session>` reuses the existing branch bundle, re-mounts the saved roots, runs
   the stored `agent_command` by default (or a custom command after `--`), and
-  then follows the same process-exit finalization path. Resume does not create a
-  new branch and custom resume commands do not overwrite the stored original
-  exec.
+  then follows the same process-exit finalization path. Resume also supports
+  `pending-review` follow-up work by thawing the preserved branch before
+  mounting. `aborted` sessions are restartable under the same session id, but
+  because abort has already discarded the branch delta, resume recreates an
+  empty branch from the current base. Custom resume commands do not overwrite the
+  stored original exec.
 - Freeze happens **after** completion — and, for harnesses with blocking
   Stop hooks, after the bounded self-repair loop (`check-before-final`) has
   allowed the stop — then `branchfs status --json` per root feeds the policy

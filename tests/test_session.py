@@ -76,11 +76,23 @@ class TestStateMachine(unittest.TestCase):
         with self.assertRaises(StateError):
             self.session.transition("frozen")  # created -> frozen is illegal
 
-    def test_terminal_states_are_terminal(self):
-        for state in ("mounting", "running", "aborted"):
+    def test_committed_terminal_state_does_not_reopen(self):
+        for state in ("mounting", "running", "finalizing", "frozen",
+                      "auto-committed"):
             self.session.transition(state)
         with self.assertRaises(StateError):
             self.session.transition("running")
+
+    def test_aborted_can_reopen_to_running_for_resume(self):
+        self.session.transition("mounting")
+        self.session.transition("running")
+        self.session.transition("aborted")
+        self.session.finished_at = "2000-01-01T00:00:00Z"
+
+        self.session.transition("running")
+
+        self.assertEqual(self.session.state, "running")
+        self.assertIsNone(self.session.finished_at)
 
     def test_failed_reachable_from_nonterminal(self):
         self.session.transition("mounting")

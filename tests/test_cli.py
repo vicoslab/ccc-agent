@@ -623,6 +623,48 @@ class TestMainRun(unittest.TestCase):
         self.assertNotEqual(persisted.finished_at, "2000-01-01T00:00:00Z")
         self.assertIn("resumed", stderr.getvalue())
 
+    def test_resume_pending_review_session_runs_without_extra_flag(self):
+        store = SessionStore(os.path.join(self.h.tmp, "state"))
+        session = self.make_running_session(
+            session_id="agent-resume-pending-cli",
+            command=["sh", "-c", "echo pending > pending.txt"])
+        session.transition("finalizing")
+        session.transition("frozen")
+        session.transition("pending-review")
+        store.save(session)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = main(["resume", "--config", self.h.config_path,
+                         session.session_id], env={})
+
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, self.h.workspace_rel, "pending.txt")))
+        self.assertIn("resumed", stderr.getvalue())
+
+    def test_resume_aborted_session_runs_without_extra_flag(self):
+        store = SessionStore(os.path.join(self.h.tmp, "state"))
+        session = self.make_running_session(
+            session_id="agent-resume-aborted-cli",
+            command=["sh", "-c", "echo aborted > aborted.txt"])
+        session.transition("aborted")
+        session.finished_at = "2000-01-01T00:00:00Z"
+        store.save(session)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = main(["resume", "--config", self.h.config_path,
+                         session.session_id], env={})
+
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, self.h.workspace_rel, "aborted.txt")))
+        persisted = store.load(session.session_id)
+        self.assertEqual(persisted.state, "auto-committed")
+        self.assertNotEqual(persisted.finished_at, "2000-01-01T00:00:00Z")
+        self.assertIn("resumed", stderr.getvalue())
+
     def test_agent_option_sets_explicit_agent_kind(self):
         seen = {}
 

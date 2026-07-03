@@ -534,8 +534,9 @@ def _print_failure_details(store, session, verbose=False):
 def main_resume(argv=None, env=None, prog="ccc-agent resume"):
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Resume a running BranchFS session after a crash/reboot, "
-                    "or retry a failed session with --allow-failed.")
+        description="Resume a BranchFS session after a crash/reboot, add more "
+                    "work to a pending review, restart an aborted session, or "
+                    "retry a failed session with --allow-failed.")
     parser.add_argument("--config", help="path to config.json")
     parser.add_argument("--agent", default=None,
                         help="agent kind label for the resumed command")
@@ -1114,8 +1115,8 @@ def _print_main_help(stream=None):
         "Primary ops:\n"
         "  run              run a command, or the current shell when omitted, "
         "in a contained BranchFS session\n"
-        "  resume           re-mount and continue a running session after a "
-        "crash/reboot\n"
+        "  resume           re-mount/restart a session for crash recovery or "
+        "follow-up work\n"
         "  setup            write config, plugin entries, and optional shims\n"
         "  completion       print shell completion code (bash, zsh, fish)\n"
         "  softsandbox      diagnostic non-FUSE soft sandbox helper\n\n"

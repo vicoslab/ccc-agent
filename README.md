@@ -74,8 +74,9 @@ ccc-agent cleanup --older-than 30 --dry-run # preview without deleting
 ```
 
 If the node/container reboots while a session is `running`, the agent process and
-FUSE mounts are gone but the session bundle and BranchFS branch remain. Resume it
-from the durable metadata:
+FUSE mounts are gone but the session bundle and BranchFS branch remain. You can
+also resume a `pending-review` session to add more work before committing, or an
+`aborted` session to restart it under the same session id:
 
 ```bash
 ccc-agent resume <session>                  # re-run the exact stored command
@@ -83,16 +84,21 @@ ccc-agent resume <session> -- bash          # custom recovery command/shell
 ccc-agent resume <session> -- sh -lc '...'  # any custom exec after --
 ```
 
-`resume` only accepts sessions still marked `running`, reuses the existing branch
-(no new branch is created), re-mounts the saved roots, runs the stored command by
-default, and then performs the normal freeze/status/policy finalization. If you
-pass a custom command, the original `agent_command` stored in `session.json` is
-preserved; the custom exec is recorded as a resume event. Use `--force` only
-after verifying that no old agent process/mount is still alive.
+For `running`, `pending-review`, and explicitly allowed `failed` sessions,
+`resume` reuses the existing branch, re-mounts the saved roots, runs the stored
+command by default, and then performs the normal freeze/status/policy
+finalization. `pending-review`/`failed` branches are thawed before mounting.
+For `aborted` sessions, the previous branch was already discarded, so `resume`
+recreates the branch with the same session id and restarts from the current base.
+If you pass a custom command, the original `agent_command` stored in
+`session.json` is preserved; the custom exec is recorded as a resume event. Use
+`--force` only after verifying that no old agent process/mount is still alive.
+Failed sessions still require `--allow-failed`.
 
 `cleanup` only removes closed session bundles (`auto-committed`, `committed`,
 `aborted`) older than the requested age. Pending review, running, and failed
-sessions stay visible for human review/recovery.
+sessions stay visible for human review/recovery; aborted sessions remain
+restartable until cleanup removes their bundle.
 
 Or directly via the BranchFS CLI (branch name == session id):
 

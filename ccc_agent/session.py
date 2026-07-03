@@ -38,9 +38,11 @@ _TRANSITIONS = {
     "pending-review": ("committed", "aborted", "running", "failed"),
     "auto-committed": (),
     "committed": (),
-    "aborted": (),
+    # Explicit recovery path: ccc-agent resume may restart an aborted session
+    # by recreating its branch bundle under the same session id.
+    "aborted": ("running",),
     # Explicit recovery path: ccc-agent resume --allow-failed may reopen a
-    # failed session branch for another agent command. Other closed states stay
+    # failed session branch for another agent command. Committed states stay
     # terminal because their branches have been committed/discarded.
     "failed": ("running",),
 }

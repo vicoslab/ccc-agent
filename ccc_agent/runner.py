@@ -1097,13 +1097,16 @@ def resume_session(session_id, config, env=None, before_finalize=None,
                    force=False, allow_failed=False):
     """Re-mount and continue an existing session branch.
 
-    By default this is for crash/reboot recovery of sessions still marked
-    ``running``.  ``allow_failed`` is an explicit operator opt-in for retrying a
-    session whose branch was preserved after a failed mount/finalize/commit.
+    Resume handles crash/reboot recovery for ``running`` sessions and operator
+    follow-up work for ``pending-review`` sessions.  ``aborted`` sessions are
+    restarted by recreating the same branch id, because a successful abort has
+    discarded the previous branch delta.  ``allow_failed`` is an explicit
+    operator opt-in for retrying a session whose branch was preserved after a
+    failed mount/finalize/commit.
 
-    Resume deliberately does *not* create a new branch and it preserves the
-    original stored `agent_command`; `config.agent_command` is the command for
-    this invocation only (defaulted by the CLI to the stored command).
+    Resume preserves the original stored `agent_command`; `config.agent_command`
+    is the command for this invocation only (defaulted by the CLI to the stored
+    command).
     """
     env = dict(os.environ if env is None else env)
     if env.get(ENV_SESSION):
@@ -1114,7 +1117,10 @@ def resume_session(session_id, config, env=None, before_finalize=None,
     except KeyError:
         raise ResumeError("no such session: %s" % session_id)
     was_failed = session.state == "failed"
-    if session.state != "running" and not (allow_failed and was_failed):
+    was_pending_review = session.state == "pending-review"
+    was_aborted = session.state == "aborted"
+    resumable = session.state in ("running", "pending-review", "aborted")
+    if not resumable and not (allow_failed and was_failed):
         if was_failed:
             raise ResumeError(
                 "cannot resume session %s in state failed without "
@@ -1122,8 +1128,8 @@ def resume_session(session_id, config, env=None, before_finalize=None,
                 "--allow-failed if the preserved branch should be reopened)"
                 % session.session_id)
         raise ResumeError(
-            "cannot resume session %s in state %s (resume expects a running "
-            "session left behind by a crash/reboot)"
+            "cannot resume session %s in state %s (resume accepts running, "
+            "pending-review, aborted, or failed with --allow-failed)"
             % (session.session_id, session.state))
 
     active = _active_mounts(session)
@@ -1137,6 +1143,10 @@ def resume_session(session_id, config, env=None, before_finalize=None,
     session.add_event("resume-command", _command_detail(config.agent_command))
     if was_failed:
         session.add_event("resume-from-failed")
+    if was_pending_review:
+        session.add_event("resume-from-pending-review")
+    if was_aborted:
+        session.add_event("resume-from-aborted")
     if config.agent_kind != session.agent_kind:
         session.add_event("resume-agent", config.agent_kind)
     config.store.save(session)
@@ -1145,11 +1155,13 @@ def resume_session(session_id, config, env=None, before_finalize=None,
         _ensure_shared_agent_state_dirs(config)
         for root in session.protected_roots.values():
             config.backend.start_daemon(root)
-            if was_failed:
+            if was_aborted:
+                config.backend.create_branch(root)
+            elif was_failed or was_pending_review:
                 config.backend.thaw(root)
             _cleanup_stale_mount(root, config.backend)
             config.backend.mount(root, agent=True)
-        if was_failed:
+        if was_failed or was_pending_review or was_aborted:
             session.transition("running")
         session.add_event("resumed-bundle")
         config.store.save(session)

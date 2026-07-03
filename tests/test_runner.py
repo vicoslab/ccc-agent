@@ -300,6 +300,82 @@ class TestRunSession(unittest.TestCase):
         self.assertTrue(any(e["event"] == "resume-from-failed"
                             for e in persisted.events))
 
+    def test_resume_pending_review_session_thaws_existing_branch(self):
+        class ThawBeforeMountFake(FakeBranchFS):
+            def __init__(self):
+                super(ThawBeforeMountFake, self).__init__()
+                self.thaw_calls = 0
+
+            def thaw(self, root):
+                self.thaw_calls += 1
+                return super(ThawBeforeMountFake, self).thaw(root)
+
+            def mount(self, root, agent=True, allow_other=False):
+                if self.branch_state(root) != "open":
+                    raise AssertionError(
+                        "pending-review resume must thaw before mount")
+                return super(ThawBeforeMountFake, self).mount(
+                    root, agent=agent, allow_other=allow_other)
+
+        self.h.backend = ThawBeforeMountFake()
+        session = run_session(self.h.config(
+            ["sh", "-c", "echo kept > kept.txt"], mode="manual"))
+        self.assertEqual(session.state, "pending-review")
+        root = session.protected_roots["storage_user"]
+
+        resumed = resume_session(
+            session.session_id,
+            self.h.config(["sh", "-c", "echo more > more.txt"]))
+
+        self.assertEqual(resumed.state, "pending-review")
+        self.assertEqual(self.h.backend.thaw_calls, 1)
+        paths = sorted(change.path for change in self.h.backend.status(root))
+        self.assertIn("/storage/user/Projects/proj-a/kept.txt", paths)
+        self.assertIn("/storage/user/Projects/proj-a/more.txt", paths)
+        persisted = self.h.store.load(session.session_id)
+        self.assertTrue(any(e["event"] == "resume-from-pending-review"
+                            for e in persisted.events))
+
+    def test_resume_aborted_session_recreates_branch_and_finalizes(self):
+        class CreateBeforeMountFake(FakeBranchFS):
+            def __init__(self):
+                super(CreateBeforeMountFake, self).__init__()
+                self.create_calls = 0
+
+            def create_branch(self, root, parent="main"):
+                self.create_calls += 1
+                return super(CreateBeforeMountFake, self).create_branch(
+                    root, parent=parent)
+
+            def mount(self, root, agent=True, allow_other=False):
+                if self._key(root) not in self._state:
+                    raise AssertionError(
+                        "aborted resume must recreate branch before mount")
+                return super(CreateBeforeMountFake, self).mount(
+                    root, agent=agent, allow_other=allow_other)
+
+        self.h.backend = CreateBeforeMountFake()
+        session = self.running_session(
+            session_id="agent-resume-aborted",
+            command=["sh", "-c", "echo rerun > rerun.txt"])
+        root = session.protected_roots["storage_user"]
+        self.h.backend.abort(root)
+        session.transition("aborted")
+        session.finished_at = "2000-01-01T00:00:00Z"
+        self.h.store.save(session)
+
+        resumed = resume_session(session.session_id,
+                                 self.h.config(session.agent_command))
+
+        self.assertEqual(resumed.state, "auto-committed")
+        self.assertEqual(self.h.backend.create_calls, 1)
+        self.assertNotEqual(resumed.finished_at, "2000-01-01T00:00:00Z")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, "Projects", "proj-a", "rerun.txt")))
+        persisted = self.h.store.load(session.session_id)
+        self.assertTrue(any(e["event"] == "resume-from-aborted"
+                            for e in persisted.events))
+
     def test_resume_custom_command_is_one_shot_and_preserves_original_exec(self):
         original = ["sh", "-c", "echo original > original.txt"]
         session = self.running_session(session_id="agent-resume-custom",
