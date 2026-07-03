@@ -461,7 +461,7 @@ class TestMainRun(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("Accept changes?", stderr.getvalue())
 
-    def test_large_pending_review_text_uses_less(self):
+    def test_large_pending_review_text_uses_less_after_reclaiming_foreground(self):
         class TtyBuffer(io.StringIO):
             def isatty(self):
                 return True
@@ -469,14 +469,63 @@ class TestMainRun(unittest.TestCase):
         stream = TtyBuffer()
         with mock.patch("ccc_agent.cli._terminal_lines", return_value=2):
             with mock.patch("ccc_agent.cli.shutil.which", return_value="less"):
-                with mock.patch("ccc_agent.cli.subprocess.run") as run:
-                    getattr(cli_mod, "_display_or_page")(
-                        "one\ntwo\nthree\n", stream=stream)
+                with mock.patch("ccc_agent.cli._ensure_foreground_for_prompt",
+                                return_value=True) as foreground:
+                    with mock.patch("ccc_agent.cli.subprocess.run") as run:
+                        getattr(cli_mod, "_display_or_page")(
+                            "one\ntwo\nthree\n", stream=stream)
 
+        foreground.assert_called_once_with()
         run.assert_called_once()
         self.assertEqual(run.call_args[0][0], ["less", "-R"])
         self.assertEqual(run.call_args[1]["input"], "one\ntwo\nthree\n")
         self.assertIn("opening change review in less", stream.getvalue())
+
+    def test_pending_review_text_prints_directly_when_foreground_not_reclaimed(self):
+        class TtyBuffer(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = TtyBuffer()
+        with mock.patch("ccc_agent.cli._terminal_lines", return_value=2):
+            with mock.patch("ccc_agent.cli.shutil.which", return_value="less"):
+                with mock.patch("ccc_agent.cli._ensure_foreground_for_prompt",
+                                return_value=False):
+                    with mock.patch("ccc_agent.cli.subprocess.run") as run:
+                        getattr(cli_mod, "_display_or_page")(
+                            "one\ntwo\nthree\n", stream=stream)
+
+        run.assert_not_called()
+        self.assertEqual(stream.getvalue(), "one\ntwo\nthree\n")
+
+    def test_pending_review_pager_writes_to_review_stream_not_stdout(self):
+        class TtyStream(object):
+            def __init__(self):
+                self.parts = []
+
+            def isatty(self):
+                return True
+
+            def fileno(self):
+                return 8
+
+            def write(self, value):
+                self.parts.append(value)
+
+            def flush(self):
+                pass
+
+        stream = TtyStream()
+        with mock.patch("ccc_agent.cli._terminal_lines", return_value=2):
+            with mock.patch("ccc_agent.cli.shutil.which", return_value="less"):
+                with mock.patch("ccc_agent.cli._ensure_foreground_for_prompt",
+                                return_value=True):
+                    with mock.patch("ccc_agent.cli.subprocess.run") as run:
+                        getattr(cli_mod, "_display_or_page")(
+                            "one\ntwo\nthree\n", stream=stream)
+
+        run.assert_called_once()
+        self.assertIs(run.call_args[1]["stdout"], stream)
 
     def test_run_displays_containment_banner_at_session_start(self):
         """A newly-created contained session should be obvious to the user."""

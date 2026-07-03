@@ -230,16 +230,40 @@ def _terminal_lines():
     return shutil.get_terminal_size((80, 24)).lines
 
 
+def _stream_stdout(stream):
+    """Return stream as a subprocess stdout target when it has a real fd."""
+    try:
+        stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+    return stream
+
+
 def _display_or_page(text, stream=None):
     stream = sys.stderr if stream is None else stream
     text = text if text.endswith("\n") else text + "\n"
     too_tall = len(text.splitlines()) > max(1, _terminal_lines() - 4)
     if getattr(stream, "isatty", lambda: False)() and too_tall and shutil.which("less"):
+        # An interactive child shell can leave the terminal foreground process
+        # group pointing at the child.  If we spawn less while ccc-agent is still
+        # in the background pgrp, less is stopped by job control (SIGTTIN/TTOU)
+        # and ccc-agent waits forever.  Reclaim the terminal before paging; if
+        # that fails, print directly rather than orphaning a stopped pager.
+        if not _ensure_foreground_for_prompt():
+            stream.write(text)
+            return
         stream.write(
             "ccc-agent: opening change review in less "
             "(use Up/Down to browse, q to close)\n")
         stream.flush()
-        subprocess.run(["less", "-R"], input=text, text=True)
+        kwargs = {"input": text, "text": True}
+        stdout = _stream_stdout(stream)
+        if stdout is not None:
+            # Keep review output on the same terminal stream we tested for TTY.
+            # Otherwise a redirected stdout can make less appear to show nothing
+            # while stderr was the interactive stream.
+            kwargs["stdout"] = stdout
+        subprocess.run(["less", "-R"], **kwargs)
     else:
         stream.write(text)
 
