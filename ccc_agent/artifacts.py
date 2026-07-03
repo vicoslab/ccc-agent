@@ -18,6 +18,25 @@ def _write_json(path, data):
     os.replace(tmp, path)
 
 
+def _is_review_cache_file(name):
+    if name in ("session.json", "policy-decision.json", "summary.md"):
+        return True
+    return ((name.startswith("status.") or name.startswith("ignored.") or
+             name.startswith("warnings.")) and name.endswith(".json"))
+
+
+def clear_review_cache(review):
+    """Remove generated review/cache artifacts, preserving operator files."""
+    if not os.path.isdir(review):
+        return
+    for name in os.listdir(review):
+        if not _is_review_cache_file(name):
+            continue
+        path = os.path.join(review, name)
+        if os.path.isfile(path) or os.path.islink(path):
+            os.unlink(path)
+
+
 def write_review(store, session, changes_by_root, decision,
                  warnings_by_root=None, ignored_by_root=None):
     """Write session, status, ignored, warning, and decision artifacts."""
@@ -25,6 +44,7 @@ def write_review(store, session, changes_by_root, decision,
     ignored_by_root = ignored_by_root or {}
     review = store.review_dir(session.session_id)
     os.makedirs(review, exist_ok=True)
+    clear_review_cache(review)
 
     _write_json(os.path.join(review, "session.json"), session.to_dict())
     for root_name, changes in changes_by_root.items():

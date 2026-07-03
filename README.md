@@ -73,6 +73,15 @@ ccc-agent cleanup --older-than 30           # remove old closed session bundles
 ccc-agent cleanup --older-than 30 --dry-run # preview without deleting
 ```
 
+`ccc-agent diff` uses live BranchFS status while a session is still live
+(`created`, `mounting`, `running`, `finalizing`). Cached review JSON is used only
+for quiescent review/closed states where the branch is frozen or may no longer be
+mounted. `ccc-agent finish <session>` freezes the branch and rewrites generated
+review artifacts from fresh status. `ccc-agent thaw <session>` reopens a
+`pending-review` branch for more work and clears generated review artifacts so
+stale paths are not mistaken for current branch state; human-created files in the
+review directory are left alone.
+
 If the node/container reboots while a session is `running`, the agent process and
 FUSE mounts are gone but the session bundle and BranchFS branch remain. You can
 also resume a `pending-review` session to add more work before committing, or an
@@ -110,8 +119,12 @@ branchfs abort-branch  <session> --storage <store>   # discard the branch
 ```
 
 Durable review artifacts (summary.md, per-root status JSON, policy decision)
-land under `<state_dir>/<session-id>/reviews/`. Other non-store runtime data
-for the same run is bundled nearby, e.g.
+land under `<state_dir>/<session-id>/reviews/`. These files are generated cache
+for a frozen/completed review point: finalization rewrites them from fresh
+BranchFS status, and thaw removes generated files because the branch becomes
+mutable again. Non-generated operator notes or patches in the review directory
+are preserved. Other non-store runtime data for the same run is bundled nearby,
+e.g.
 `<state_dir>/<session-id>/session/session.json`,
 `<state_dir>/<session-id>/mounts/`, and
 `<state_dir>/<session-id>/control/control.sock`. BranchFS stores/deltas stay at

@@ -114,6 +114,7 @@ class TestController(unittest.TestCase):
         session = self.pending_session()
         review = self.h.store.review_dir(session.session_id)
         status_path = os.path.join(review, "status.storage_user.json")
+        os.makedirs(os.path.join(self.h.base, "tree"), exist_ok=True)
         change = Change("D", "/storage/user/tree", "tombstone", 0,
                         "storage_user", summary="3 nested deletions hidden")
         with open(status_path, "w") as fh:
@@ -124,6 +125,20 @@ class TestController(unittest.TestCase):
 
         self.assertIn("D /storage/user/tree", out.getvalue())
         self.assertIn("3 nested deletions hidden", out.getvalue())
+
+    def test_diff_filters_stored_tombstone_when_underlying_path_is_missing(self):
+        session = self.pending_session()
+        review = self.h.store.review_dir(session.session_id)
+        status_path = os.path.join(review, "status.storage_user.json")
+        stale = Change("D", "/storage/user/.claude.json.tmp.66.deadbeef",
+                       "tombstone", 0, "storage_user")
+        with open(status_path, "w") as fh:
+            json.dump([stale.to_dict()], fh)
+
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, out=out)
+
+        self.assertNotIn(".claude.json.tmp.66.deadbeef", out.getvalue())
 
     def test_diff_summarizes_ignored_policy_changes_without_full_listing(self):
         session = self.cache_review_session()
@@ -160,6 +175,27 @@ class TestController(unittest.TestCase):
         self.assertIn("--show-ignored", text)
         self.assertNotIn("/storage/user/.cache/pip/wheel.txt", text)
 
+    def test_thaw_clears_generated_review_cache(self):
+        session = self.pending_session()
+        review = self.h.store.review_dir(session.session_id)
+        status_path = os.path.join(review, "status.storage_user.json")
+        decision_path = os.path.join(review, "policy-decision.json")
+        summary_path = os.path.join(review, "summary.md")
+        note_path = os.path.join(review, "operator-notes.txt")
+        self.assertTrue(os.path.exists(status_path))
+        self.assertTrue(os.path.exists(decision_path))
+        self.assertTrue(os.path.exists(summary_path))
+        with open(note_path, "w") as fh:
+            fh.write("keep this human note\n")
+
+        updated = self.h.controller().thaw(session.session_id)
+
+        self.assertEqual(updated.state, "running")
+        self.assertFalse(os.path.exists(status_path))
+        self.assertFalse(os.path.exists(decision_path))
+        self.assertFalse(os.path.exists(summary_path))
+        self.assertTrue(os.path.exists(note_path))
+
     def test_review_accept_keeps_ignored_policy_changes_discarded_by_default(self):
         session = self.cache_review_session()
         updated = self.h.controller().review(session.session_id, accept=True)
@@ -195,6 +231,61 @@ class TestController(unittest.TestCase):
         out = io.StringIO()
         controller.diff(session.session_id, out=out)
         self.assertEqual(out.getvalue(), "")
+
+    def test_diff_running_session_ignores_stale_review_cache(self):
+        session, root = self.h.running_session(branch="agent-running-cache")
+        review = self.h.store.review_dir(session.session_id)
+        os.makedirs(review, exist_ok=True)
+        with open(os.path.join(review, "status.storage_user.json"), "w") as fh:
+            json.dump([
+                Change("A", "/storage/user/stale-from-cache.txt", "file", 1,
+                       "storage_user").to_dict()
+            ], fh)
+
+        live = os.path.join(root.mount, "Projects", "proj-a", "live.txt")
+        os.makedirs(os.path.dirname(live), exist_ok=True)
+        with open(live, "w") as fh:
+            fh.write("live\n")
+
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, out=out)
+
+        text = out.getvalue()
+        self.assertIn("/storage/user/Projects/proj-a/live.txt", text)
+        self.assertNotIn("stale-from-cache", text)
+
+    def test_finish_refreshes_existing_review_cache(self):
+        session, root = self.h.running_session(mode="manual",
+                                               branch="agent-refresh-cache")
+        review = self.h.store.review_dir(session.session_id)
+        os.makedirs(review, exist_ok=True)
+        stale_status = os.path.join(review, "status.storage_user.json")
+        with open(stale_status, "w") as fh:
+            json.dump([
+                Change("A", "/storage/user/stale-before-finish.txt", "file", 1,
+                       "storage_user").to_dict()
+            ], fh)
+        stale_ignored = os.path.join(review, "ignored.obsolete_root.json")
+        with open(stale_ignored, "w") as fh:
+            json.dump([
+                Change("A", "/storage/user/stale-ignored.txt", "file", 1,
+                       "obsolete_root").to_dict()
+            ], fh)
+
+        live = os.path.join(root.mount, "Projects", "proj-a", "fresh.txt")
+        os.makedirs(os.path.dirname(live), exist_ok=True)
+        with open(live, "w") as fh:
+            fh.write("fresh\n")
+
+        updated = self.h.controller().finish(session.session_id)
+
+        self.assertEqual(updated.state, "pending-review")
+        with open(stale_status) as fh:
+            cached = json.load(fh)
+        cached_paths = [entry["path"] for entry in cached]
+        self.assertIn("/storage/user/Projects/proj-a/fresh.txt", cached_paths)
+        self.assertNotIn("/storage/user/stale-before-finish.txt", cached_paths)
+        self.assertFalse(os.path.exists(stale_ignored))
 
     def test_diff_live_status_failure_is_actionable_control_error(self):
         session, _root = self.h.running_session(branch="agent-stale-running")

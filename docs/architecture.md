@@ -74,6 +74,24 @@ created -> mounting -> running -> finalizing -> frozen
   already set reuses the outer session — one review unit per task, no branch
   explosion.
 
+### Review artifacts and cache validity
+
+`<state_dir>/<session-id>/reviews/` is a durable review snapshot, not a live
+status database. `ccc-agent diff` may use cached `status.*.json` only when the
+session is quiescent (`pending-review`, terminal states, or a preserved failed
+session). For live states (`created`, `mounting`, `running`, `finalizing`), it
+must read live BranchFS status and ignore any old review cache left by a previous
+freeze/thaw cycle.
+
+Finalization always recomputes status after freezing and rewrites generated
+review files from scratch: `status.*.json`, `ignored.*.json`, `warnings.*.json`,
+`policy-decision.json`, `summary.md`, and `session.json`. `ccc-agent thaw` clears
+those generated artifacts after BranchFS thaw succeeds because the branch is
+mutable again; non-generated operator files such as notes or saved patches remain
+in the review directory. Cached tombstone/delete entries whose underlying base
+path is absent are filtered from review display because they are no-op remnants,
+not real deletes.
+
 ## Contained root layout (bwrap mode)
 
 `ccc_agent.runner._bwrap_command` builds a bubblewrap invocation that assembles

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 
+from . import artifacts
 from .branchfs import StatusReport
 from .policy import (Change, IgnoredChange, PolicyConfig, classify,
                      filter_ignored, net_final_changes,
@@ -31,6 +32,10 @@ CHECK_EXHAUSTED = "exhausted"  # dirty, budget spent: defer to human review
 # States whose BranchFS branches should already be closed/discarded. Failed and
 # pending-review sessions are deliberately kept for manual recovery/review.
 CLEANUP_STATES = ("auto-committed", "committed", "aborted")
+# While a session is live or being finalized, BranchFS status is the source of
+# truth.  Review artifacts from a previous freeze may still exist after `thaw`,
+# but they are stale until finalization rewrites them.
+LIVE_STATUS_STATES = ("created", "mounting", "running", "finalizing")
 MAX_TEXT_MERGE_BYTES = 1024 * 1024
 
 
@@ -316,7 +321,23 @@ class Controller(object):
                       "--accept --include-ignored`.\n" % session_id)
         return True
 
-    def _stored_review_changes(self, review):
+    def _can_use_stored_review(self, session):
+        return session.state not in LIVE_STATUS_STATES
+
+    def _stored_change_has_underlying_delete_target(self, session, change):
+        if change.op != "D":
+            return True
+        root = session.protected_roots.get(change.root)
+        if root is None:
+            return True
+        visible = self.alias_map.canonicalize(root.visible)
+        path = self.alias_map.canonicalize(change.path)
+        if not is_within(path, visible):
+            return True
+        rel = os.path.relpath(path, visible)
+        return os.path.lexists(os.path.join(root.base, rel))
+
+    def _stored_review_changes(self, session, review):
         changes = []
         ignored = []
         saw_status = False
@@ -325,12 +346,18 @@ class Controller(object):
             if name.startswith("status.") and name.endswith(".json"):
                 saw_status = True
                 with open(path) as fh:
-                    changes.extend(Change.from_dict(entry)
-                                   for entry in json.load(fh))
+                    changes.extend(
+                        change for change in (
+                            Change.from_dict(entry) for entry in json.load(fh))
+                        if self._stored_change_has_underlying_delete_target(
+                            session, change))
             elif name.startswith("ignored.") and name.endswith(".json"):
                 with open(path) as fh:
-                    ignored.extend(IgnoredChange.from_dict(entry)
-                                   for entry in json.load(fh))
+                    ignored.extend(
+                        item for item in (
+                            IgnoredChange.from_dict(entry) for entry in json.load(fh))
+                        if self._stored_change_has_underlying_delete_target(
+                            session, item.change))
         return (saw_status,
                 net_final_changes(changes, self.alias_map),
                 net_final_ignored_changes(ignored, self.alias_map))
@@ -455,15 +482,16 @@ class Controller(object):
         return session
 
     def diff(self, session_id, path=None, out=None, show_ignored=False):
-        """Stored review diff; falls back to live status when absent."""
+        """Show review diff, using cached artifacts only for quiescent states."""
         out = out or sys.stdout
         session = self._load(session_id)
         if path is not None:
             return self._diff_path(session, path, out,
                                    include_ignored=show_ignored)
         review = self.store.review_dir(session_id)
-        if os.path.isdir(review):
-            saw_status, changes, ignored = self._stored_review_changes(review)
+        if self._can_use_stored_review(session) and os.path.isdir(review):
+            saw_status, changes, ignored = self._stored_review_changes(
+                session, review)
             if saw_status:
                 self._write_change_sections(out, changes, ignored,
                                             show_ignored, session_id)
@@ -899,8 +927,10 @@ class Controller(object):
         self._require_state(session, ("pending-review",), "thaw")
         for root in session.protected_roots.values():
             self.backend.thaw(root)
+        artifacts.clear_review_cache(self.store.review_dir(session.session_id))
         session.transition("running")
         session.add_event("thawed")
+        session.add_event("review-cache-cleared")
         self.store.save(session)
         return session
 
