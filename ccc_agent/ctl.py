@@ -37,6 +37,9 @@ CLEANUP_STATES = ("auto-committed", "committed", "aborted")
 # but they are stale until finalization rewrites them.
 LIVE_STATUS_STATES = ("created", "mounting", "running", "finalizing")
 MAX_TEXT_MERGE_BYTES = 1024 * 1024
+# Avoid dumping arbitrary/binary or very large file contents into review output.
+# Operators can still see every changed path; hunks are limited to readable text.
+MAX_TEXT_DIFF_BYTES = MAX_TEXT_MERGE_BYTES
 
 
 def _touch_content_key(relpath):
@@ -481,15 +484,22 @@ class Controller(object):
                 out.write("%s\n" % _change_line(change))
         return session
 
-    def diff(self, session_id, path=None, out=None, show_ignored=False):
-        """Show review diff, using cached artifacts only for quiescent states."""
+    def diff(self, session_id, path=None, out=None, show_ignored=False,
+             show_file_diffs=False):
+        """Show changed paths; optionally append unified diffs for text files.
+
+        Cached review artifacts are sufficient for the path summary, but file
+        hunks need the preserved branch delta, so ``show_file_diffs`` uses the
+        live backend path.
+        """
         out = out or sys.stdout
         session = self._load(session_id)
         if path is not None:
             return self._diff_path(session, path, out,
                                    include_ignored=show_ignored)
         review = self.store.review_dir(session_id)
-        if self._can_use_stored_review(session) and os.path.isdir(review):
+        if (not show_file_diffs and self._can_use_stored_review(session)
+                and os.path.isdir(review)):
             saw_status, changes, ignored = self._stored_review_changes(
                 session, review)
             if saw_status:
@@ -500,6 +510,7 @@ class Controller(object):
         config = PolicyConfig.from_dict(session.policy)
         all_changes = []
         ignored = []
+        file_diff_changes = []
         for name, root in sorted(session.protected_roots.items()):
             out.write("# root %s (branch %s)\n" % (name, root.branch))
             report = self._live_status_report(session, root, action="diff")
@@ -508,8 +519,14 @@ class Controller(object):
                                                   self.alias_map)
             all_changes.extend(changes)
             ignored.extend(root_ignored)
+            file_diff_changes.extend((root, change) for change in changes)
+            if show_ignored:
+                file_diff_changes.extend((root, item.change)
+                                         for item in root_ignored)
         self._write_change_sections(out, all_changes, ignored, show_ignored,
                                     session_id)
+        if show_file_diffs:
+            self._write_file_diffs(file_diff_changes, out)
         return session
 
     def _path_candidates(self, session, root, path):
@@ -643,31 +660,90 @@ class Controller(object):
             raise ControlError(self._ambiguous_match_message(path, matches))
         return matches[0]
 
-    def _read_text_lines(self, path, label):
+    def _text_lines_for_diff(self, path):
+        """Return (lines, skip_reason) for a regular UTF-8 text file diff."""
+        if not os.path.exists(path):
+            return [], None
         if not os.path.isfile(path):
-            return []
-        with open(path, "rb") as fh:
-            data = fh.read()
+            return None, "non-file"
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            return None, "unreadable (%s)" % exc
+        if size > MAX_TEXT_DIFF_BYTES:
+            return None, "too large"
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            return None, "unreadable (%s)" % exc
         if b"\0" in data:
-            raise ControlError("cannot diff binary file: %s" % label)
-        return data.decode("utf-8", errors="replace").splitlines(True)
+            return None, "binary/non-text"
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "binary/non-text"
+        return text.splitlines(True), None
+
+    def _diff_lines_for_change(self, root, change):
+        rel, delta, base = self._store_paths(root, change)
+        if change.op == "D":
+            if not os.path.isfile(base):
+                return None, "non-file"
+        elif change.kind != "file":
+            return None, "non-file"
+
+        old, skip_reason = self._text_lines_for_diff(base)
+        if skip_reason:
+            return None, skip_reason
+        assert old is not None
+        new = []
+        if change.op != "D":
+            if not os.path.isfile(delta):
+                return None, "branch delta missing"
+            new, skip_reason = self._text_lines_for_diff(delta)
+            if skip_reason:
+                return None, skip_reason
+            assert new is not None
+        return list(difflib.unified_diff(old, new,
+                                         fromfile="a/" + rel,
+                                         tofile="b/" + rel)), None
+
+    def _write_diff_lines(self, out, lines):
+        for line in lines:
+            out.write(line if line.endswith("\n") else line + "\n")
+
+    def _write_file_diffs(self, changes, out):
+        wrote_header = False
+        skipped = []
+        for root, change in changes:
+            lines, skip_reason = self._diff_lines_for_change(root, change)
+            if skip_reason:
+                skipped.append((change.path, skip_reason))
+                continue
+            if not lines:
+                continue
+            if not wrote_header:
+                out.write("\nText file diffs:\n")
+                wrote_header = True
+            self._write_diff_lines(out, lines)
+        if skipped:
+            if not wrote_header:
+                out.write("\nText file diffs:\n")
+                wrote_header = True
+            for path, reason in skipped:
+                out.write("  skipped %s: %s\n" % (reason, path))
+        if wrote_header:
+            out.write("\n")
 
     def _diff_path(self, session, path, out, include_ignored=False):
         root, change = self._matching_change(
             session, path, include_ignored=include_ignored)
-        if change.kind != "file" and change.op != "D":
-            raise ControlError("cannot diff non-file path: %s" % change.path)
-        rel, delta, base = self._store_paths(root, change)
-        old = self._read_text_lines(base, "base:" + rel)
-        new = []
-        if change.op != "D":
-            if not os.path.isfile(delta):
-                raise ControlError("branch delta missing for %s" % change.path)
-            new = self._read_text_lines(delta, "branch:" + rel)
-        for line in difflib.unified_diff(old, new,
-                                         fromfile="a/" + rel,
-                                         tofile="b/" + rel):
-            out.write(line if line.endswith("\n") else line + "\n")
+        lines, skip_reason = self._diff_lines_for_change(root, change)
+        if skip_reason:
+            raise ControlError("cannot diff %s: %s" % (skip_reason,
+                                                       change.path))
+        self._write_diff_lines(out, lines)
         return session
 
     # -- mutating ------------------------------------------------------------
@@ -841,34 +917,30 @@ class Controller(object):
         return out
 
     def _emit_patch(self, changes, out):
-        """Unified base-vs-view diff the user can prune to a hunk subset, then
-        re-apply with `review --apply-patch`."""
+        """Unified base-vs-view text diff the user can prune to a hunk subset.
+
+        Binary, non-text, non-file, or oversized paths are intentionally skipped:
+        line-level patches only make sense for readable text files.
+        """
         for root, change in changes:
-            rel, delta, base = self._store_paths(root, change)
-            old = []
-            if os.path.isfile(base):
-                with open(base, "r", errors="replace") as fh:
-                    old = fh.readlines()
-            new = []
-            if change.op != "D" and os.path.isfile(delta):
-                with open(delta, "r", errors="replace") as fh:
-                    new = fh.readlines()
-            for line in difflib.unified_diff(old, new,
-                                             fromfile="a/" + rel,
-                                             tofile="b/" + rel):
-                out.write(line if line.endswith("\n") else line + "\n")
+            lines, skip_reason = self._diff_lines_for_change(root, change)
+            if skip_reason:
+                continue
+            self._write_diff_lines(out, lines)
 
     def review(self, session_id, accept=False, reject=False, commit_paths=None,
                emit_patch=False, apply_patch=None, out=None,
-               show_ignored=False, include_ignored=False):
+               show_ignored=False, include_ignored=False,
+               show_file_diffs=False):
         """Post-session review of a pending/frozen session's change set.
 
-        Default browses the diff.  ``accept`` commits policy-visible changes by
-        default, or all changes when ``include_ignored`` is true; ``reject``
-        discards everything, ``commit_paths`` commits a file-level subset (the
-        rest are discarded), ``emit_patch`` prints a base-vs-view unified diff,
-        and ``apply_patch`` applies a (possibly pruned) patch to base for
-        line-level control.
+        Default lists changed paths only. ``show_file_diffs`` additionally shows
+        unified hunks for readable text files. ``accept`` commits policy-visible
+        changes by default, or all changes when ``include_ignored`` is true;
+        ``reject`` discards everything, ``commit_paths`` commits a file-level
+        subset (the rest are discarded), ``emit_patch`` prints a base-vs-view
+        unified text diff, and ``apply_patch`` applies a (possibly pruned) patch
+        to base for line-level control.
         """
         out = out or sys.stdout
         if accept:
@@ -908,7 +980,8 @@ class Controller(object):
                       % len(applied))
             return self._finish_selective(session, "file-level commit")
 
-        return self.diff(session_id, out=out, show_ignored=show_ignored)
+        return self.diff(session_id, out=out, show_ignored=show_ignored,
+                         show_file_diffs=show_file_diffs)
 
     def _finish_selective(self, session, detail):
         """After a selective/patch apply to base, discard the branch deltas and

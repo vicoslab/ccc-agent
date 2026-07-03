@@ -61,11 +61,13 @@ A session that exits with un-committed changes stays as a reviewable branch:
 
 ```bash
 ccc-agent list                              # sessions + states
-ccc-agent review <session>                  # browse the diff
+ccc-agent review <session>                  # browse changed paths (no line hunks by default)
+ccc-agent diff <session> --show-file-diffs  # append hunks for changed text files; binary/non-text skipped
+ccc-agent diff <session> <path>             # unified diff for one changed text file
 ccc-agent review <session> --accept         # commit policy-visible changes; ignored runtime noise is discarded
 ccc-agent review <session> --reject         # discard everything
 ccc-agent review <session> --commit a,b     # commit only a,b (file-by-file)
-ccc-agent review <session> --emit-patch > c.patch  # line-by-line: prune hunks…
+ccc-agent review <session> --emit-patch > c.patch  # text hunks only: prune hunks…
 ccc-agent review <session> --apply-patch c.patch   # …then apply
 ccc-agent commit <session> [<session> ...]  # commit one or more pending/frozen sessions
 ccc-agent abort <session> [<session> ...]   # discard one or more sessions

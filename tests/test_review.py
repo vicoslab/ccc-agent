@@ -50,10 +50,23 @@ class ReviewHarness(object):
         with open(p, "w") as fh:
             fh.write(content)
 
+    def write_bytes(self, rel, content):
+        p = os.path.join(self.root.mount, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as fh:
+            fh.write(content)
+
     def write_base(self, rel, content):
         p = os.path.join(self.base, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w") as fh:
+            fh.write(content)
+        return p
+
+    def write_base_bytes(self, rel, content):
+        p = os.path.join(self.base, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as fh:
             fh.write(content)
         return p
 
@@ -168,6 +181,46 @@ class TestReview(unittest.TestCase):
         self.assertIn("-old line", patch)
         self.assertIn("+new line", patch)
         self.assertIn("b/Projects/proj-a/f.txt", patch)
+
+    def test_review_show_file_diffs_includes_only_text_file_hunks(self):
+        text_rel = "Projects/proj-a/text.txt"
+        binary_rel = "Projects/proj-a/blob.bin"
+        self.h.write_base(text_rel, "old line\n")
+        self.h.write(text_rel, "new line\n")
+        self.h.write_base_bytes(binary_rel, b"\x00old")
+        self.h.write_bytes(binary_rel, b"\x00new")
+        self.h.pending()
+
+        out = io.StringIO()
+        self.h.ctl.review(self.h.session.session_id,
+                          show_file_diffs=True, out=out)
+        text = out.getvalue()
+
+        self.assertIn("M /storage/user/Projects/proj-a/text.txt", text)
+        self.assertIn("M /storage/user/Projects/proj-a/blob.bin", text)
+        self.assertIn("Text file diffs:", text)
+        self.assertIn("--- a/Projects/proj-a/text.txt", text)
+        self.assertIn("-old line", text)
+        self.assertIn("+new line", text)
+        self.assertIn("skipped binary/non-text: /storage/user/Projects/proj-a/blob.bin", text)
+        self.assertNotIn("\x00new", text)
+
+    def test_diff_show_file_diffs_includes_text_hunks(self):
+        rel = "Projects/proj-a/diff.txt"
+        self.h.write_base(rel, "old\n")
+        self.h.write(rel, "new\n")
+        self.h.pending()
+
+        out = io.StringIO()
+        self.h.ctl.diff(self.h.session.session_id,
+                        show_file_diffs=True, out=out)
+        text = out.getvalue()
+
+        self.assertIn("M /storage/user/Projects/proj-a/diff.txt", text)
+        self.assertIn("Text file diffs:", text)
+        self.assertIn("--- a/Projects/proj-a/diff.txt", text)
+        self.assertIn("-old", text)
+        self.assertIn("+new", text)
 
     @unittest.skipUnless(shutil.which("patch"), "patch(1) not available")
     def test_apply_patch_applies_hunks_to_base(self):

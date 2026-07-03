@@ -271,11 +271,6 @@ def _display_or_page(text, stream=None):
 def _pending_review_text(controller, session):
     changed = io.StringIO()
     controller.diff(session.session_id, out=changed)
-    patch = io.StringIO()
-    try:
-        controller.review(session.session_id, emit_patch=True, out=patch)
-    except ControlError as exc:
-        patch.write("(diff unavailable: %s)\n" % exc)
 
     lines = [
         "ccc-agent: Pending changes for %s" % session.session_id,
@@ -283,8 +278,8 @@ def _pending_review_text(controller, session):
         "Changed paths:",
         changed.getvalue().rstrip() or "(none)",
         "",
-        "Diff:",
-        patch.getvalue().rstrip() or "(no textual diff)",
+        "Use `ccc-agent diff %s --show-file-diffs` to include text file hunks."
+        % session.session_id,
         "",
     ]
     return "\n".join(lines)
@@ -519,10 +514,11 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     if session.state == "pending-review" and not nested_invocation:
         sys.stderr.write(
             "ccc-agent: review with: ccc-agent diff %s\n"
-            "ccc-agent: file diff: ccc-agent diff %s <path>\n"
+            "ccc-agent: text diffs: ccc-agent diff %s --show-file-diffs\n"
+            "ccc-agent: single file diff: ccc-agent diff %s <path>\n"
             "ccc-agent: then: ccc-agent commit %s | ccc-agent abort %s\n"
             % (session.session_id, session.session_id, session.session_id,
-               session.session_id))
+               session.session_id, session.session_id))
     if session.state == "failed":
         return 1
     if session.exit_status not in (0, None):
@@ -649,10 +645,11 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
     if session.state == "pending-review":
         sys.stderr.write(
             "ccc-agent: review with: ccc-agent diff %s\n"
-            "ccc-agent: file diff: ccc-agent diff %s <path>\n"
+            "ccc-agent: text diffs: ccc-agent diff %s --show-file-diffs\n"
+            "ccc-agent: single file diff: ccc-agent diff %s <path>\n"
             "ccc-agent: then: ccc-agent commit %s | ccc-agent abort %s\n"
             % (session.session_id, session.session_id, session.session_id,
-               session.session_id))
+               session.session_id, session.session_id))
     if session.state == "failed":
         return 1
     if session.exit_status not in (0, None):
@@ -810,6 +807,9 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
     dp = sub.add_parser("diff", help="show changed paths, or a unified diff for one file")
     dp.add_argument("--show-ignored", action="store_true",
                     help="also list policy-ignored/cache/runtime changes")
+    dp.add_argument("--show-file-diffs", action="store_true",
+                    help="also show unified diffs for changed text files "
+                         "(binary/non-text files are skipped)")
     _add_session_id_arg(dp)
     dp.add_argument("path", nargs="?", help="optional changed file to diff")
     rv = sub.add_parser("review", help="post-session change review")
@@ -820,6 +820,9 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                          "policy-ignored cache/runtime changes too")
     rv.add_argument("--show-ignored", action="store_true",
                     help="show full policy-ignored/cache/runtime change list")
+    rv.add_argument("--show-file-diffs", action="store_true",
+                    help="also show unified diffs for changed text files "
+                         "(binary/non-text files are skipped)")
     rv.add_argument("--reject", action="store_true",
                     help="discard everything (revert)")
     rv.add_argument("--commit", dest="commit_paths",
@@ -861,7 +864,8 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
             controller.status(args.session_id)
         elif args.cmd == "diff":
             controller.diff(args.session_id, path=args.path,
-                            show_ignored=args.show_ignored)
+                            show_ignored=args.show_ignored,
+                            show_file_diffs=args.show_file_diffs)
         elif args.cmd == "review":
             commit_paths = ([p for p in args.commit_paths.split(",") if p]
                             if args.commit_paths else None)
@@ -869,7 +873,8 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                 args.session_id, accept=args.accept, reject=args.reject,
                 commit_paths=commit_paths, emit_patch=args.emit_patch,
                 apply_patch=args.apply_patch, show_ignored=args.show_ignored,
-                include_ignored=args.include_ignored)
+                include_ignored=args.include_ignored,
+                show_file_diffs=args.show_file_diffs)
             if session.state in ("committed", "aborted"):
                 sys.stderr.write("session %s now %s\n"
                                  % (session.session_id, session.state))
@@ -923,10 +928,11 @@ _RUN_OPTIONS = (
     "--config", "--help",
 )
 _CLEANUP_OPTIONS = ("--older-than", "--dry-run", "--config", "--help")
-_DIFF_OPTIONS = ("--show-ignored", "--config", "--help")
+_DIFF_OPTIONS = ("--show-ignored", "--show-file-diffs", "--config", "--help")
 _REVIEW_OPTIONS = (
     "--accept", "--reject", "--commit", "--emit-patch", "--apply-patch",
-    "--show-ignored", "--include-ignored", "--config", "--help",
+    "--show-ignored", "--show-file-diffs", "--include-ignored", "--config",
+    "--help",
 )
 _RESUME_OPTIONS = (
     "--agent", "--allow-failed", "--force", "--full-isolation",

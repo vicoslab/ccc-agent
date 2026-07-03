@@ -263,7 +263,7 @@ class TestMainRun(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.h.base, self.h.workspace_rel, "artifact.txt")))
 
-    def test_pending_review_finish_line_shows_changes_and_diff(self):
+    def test_pending_review_finish_line_shows_changes_without_line_diff(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = main_run([
@@ -279,12 +279,13 @@ class TestMainRun(unittest.TestCase):
         self.assertIn("finished: pending-review (1 change needs review)", output)
         self.assertIn("Pending changes for", output)
         self.assertIn("A /storage/user/Projects/proj-a/review.txt", output)
-        self.assertIn("--- a/Projects/proj-a/review.txt", output)
-        self.assertIn("+hello", output)
+        self.assertNotIn("Diff:", output)
+        self.assertNotIn("--- a/Projects/proj-a/review.txt", output)
+        self.assertNotIn("+hello", output)
         self.assertIn("then: ccc-agent commit", output)
         self.assertNotIn("Accept changes?", output)
 
-    def test_pending_review_lists_all_paths_before_all_diffs(self):
+    def test_pending_review_lists_all_paths_without_file_hunks(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = main_run([
@@ -300,16 +301,12 @@ class TestMainRun(unittest.TestCase):
         self.assertEqual(code, 0)
         output = stderr.getvalue()
         self.assertIn("finished: pending-review (2 changes need review)", output)
-        changed_start = output.index("Changed paths:")
-        diff_start = output.index("\nDiff:\n")
-        changed_section = output[changed_start:diff_start]
-        diff_section = output[diff_start:]
+        changed_section = output[output.index("Changed paths:"):]
         self.assertIn("A /storage/user/Projects/proj-a/a.txt", changed_section)
         self.assertIn("A /storage/user/Projects/proj-a/sub/b.txt", changed_section)
+        self.assertNotIn("Diff:", changed_section)
         self.assertNotIn("--- a/Projects/proj-a/a.txt", changed_section)
         self.assertNotIn("--- a/Projects/proj-a/sub/b.txt", changed_section)
-        self.assertIn("--- a/Projects/proj-a/a.txt", diff_section)
-        self.assertIn("--- a/Projects/proj-a/sub/b.txt", diff_section)
 
     def test_pending_review_quick_yes_commits(self):
         stderr = io.StringIO()
@@ -952,6 +949,30 @@ class TestMainCtl(unittest.TestCase):
         self.assertIn("/storage/user/Projects/proj-a/result.txt", out.getvalue())
         self.assertIn("/storage/user/.cache/pip/wheel.txt", out.getvalue())
 
+    def test_diff_show_file_diffs_cli_flag_adds_text_file_hunks(self):
+        base_path = os.path.join(self.h.base, self.h.workspace_rel, "cli-diff.txt")
+        with open(base_path, "w") as fh:
+            fh.write("old\n")
+        self.assertEqual(main_run([
+            "--config", self.h.config_path,
+            "--workspace", "/storage/user/Projects/proj-a",
+            "--policy", "manual",
+            "--", "sh", "-c", "printf 'old\\nnew\\n' > cli-diff.txt",
+        ], env={}), 0)
+        sid = self.h.sessions()[0]
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main_ctl(["--config", self.h.config_path, "diff",
+                             "--show-file-diffs", sid], env={})
+
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("M /storage/user/Projects/proj-a/cli-diff.txt", text)
+        self.assertIn("Text file diffs:", text)
+        self.assertIn("--- a/Projects/proj-a/cli-diff.txt", text)
+        self.assertIn("+new", text)
+
     def test_review_accept_include_ignored_cli_flag_commits_ignored_changes(self):
         sid = self.make_pending_cache_session()
 
@@ -1152,6 +1173,11 @@ class TestShellCompletion(unittest.TestCase):
         matches = self.complete(["ccc-agent", "review", "--"])
         self.assertIn("--show-ignored", matches)
         self.assertIn("--include-ignored", matches)
+        self.assertIn("--show-file-diffs", matches)
+
+    def test_diff_completion_lists_file_diff_option(self):
+        matches = self.complete(["ccc-agent", "diff", "--"])
+        self.assertIn("--show-file-diffs", matches)
 
     def test_session_completion_uses_config_flag_after_op(self):
         self.assertEqual(
