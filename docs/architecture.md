@@ -146,7 +146,12 @@ bwrap's isolated minimal `/dev` instead of binding the container device tree.
 The agent gets a scrubbed environment (`--clearenv` + an explicit `--setenv`
 allowlist). No network or proc isolation is enforced by design; the boundary
 is filesystem confinement plus PID-namespace process isolation, not a full
-container-escape prevention boundary.
+container-escape prevention boundary. Rootless bwrap maps the user id and one
+primary group id into the user namespace. It cannot preserve every outer
+supplementary group in the common unprivileged path; if default runtime access is
+enabled and `/var/run/docker.sock` is accessible outside only via a supplementary
+group, `ccc-agent` maps that socket group as the sandbox gid so Docker remains
+usable. Set `bwrap_gid` explicitly to override this auto-selection.
 
 In **`none` mode** (debug only) the agent runs with its cwd inside the mounted
 view but nothing else isolated — **not a security boundary**: absolute-path

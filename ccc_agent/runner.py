@@ -17,6 +17,7 @@ import binascii
 import json
 import os
 import shutil
+import stat
 import subprocess
 
 from . import artifacts
@@ -130,7 +131,7 @@ class RunnerConfig(object):
         self.container_run_access = bool(container_run_access)
         # bwrap needs no extra container privilege and no uid/gid: it mints
         # namespace-scoped CAP_SYS_ADMIN from an unprivileged user namespace
-        # and runs the agent as the same host uid (mapped to 0 inside).
+        # while the sandbox process still runs as the real uid by default.
         # Per-turn (Stop-boundary) commit via the control socket; defaults on
         # for bwrap (the interactive case) and off otherwise.  `none` can opt in
         # for debugging (the hook reaches the host socket directly).
@@ -195,6 +196,7 @@ def _primary_root(session, alias_map):
 # symlinks, not bound as dirs.
 BWRAP_RO_DIRS = ("/usr", "/etc", "/opt")
 BWRAP_USRMERGE_DIRS = ("/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32")
+CONTAINER_RUNTIME_GROUP_SOCKET_PATHS = ("/var/run/docker.sock", "/run/docker.sock")
 AGENT_STATE_DIRS = (
     ".codex", ".claude", ".hermes",
     ".local/share/claude", ".local/state/claude",
@@ -610,6 +612,50 @@ def _append_shared_agent_state_binds(argv, config):
         argv += ["--bind", src, dest]
 
 
+def _container_runtime_socket_gid():
+    """Return a supplementary runtime-socket gid that bwrap should map.
+
+    Rootless bwrap can map only the uid/gid we ask it to use. Supplementary
+    groups from the outer container are not preserved, so a Docker socket that is
+    accessible outside ccc-agent only through a supplementary group can become
+    `nogroup`/inaccessible inside the user namespace.  If the current process can
+    access a known runtime socket through one of its supplementary groups, map
+    that socket gid as the sandbox's primary gid.  Explicit ``bwrap_gid`` still
+    wins for deployments that prefer a fixed group.
+    """
+    uid = os.getuid()
+    primary_gid = os.getgid()
+    supplementary = set(os.getgroups())
+    for path in CONTAINER_RUNTIME_GROUP_SOCKET_PATHS:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if not stat.S_ISSOCK(st.st_mode):
+            continue
+        if st.st_gid == primary_gid:
+            return None
+        if st.st_uid == uid and (st.st_mode & stat.S_IWUSR):
+            return None
+        if st.st_gid not in supplementary:
+            continue
+        if not (st.st_mode & stat.S_IWGRP):
+            continue
+        if os.access(path, os.R_OK | os.W_OK):
+            return st.st_gid
+    return None
+
+
+def _bwrap_gid(config):
+    if config.bwrap_gid is not None:
+        return config.bwrap_gid
+    if config.container_run_access:
+        socket_gid = _container_runtime_socket_gid()
+        if socket_gid is not None:
+            return socket_gid
+    return os.getgid()
+
+
 def _bwrap_command(session, config, control=None):
     """Build a bubblewrap command that confines the agent rootlessly.
 
@@ -617,8 +663,8 @@ def _bwrap_command(session, config, control=None):
     creates an unprivileged user+mount+pid namespace,
     recursively binds the OS read-only, overlays the BranchFS view read-write
     at its visible path (hiding the real underlay), and execs the agent as the
-    same host uid mapped to 0.  No network/proc isolation is enforced (per
-    design); /proc is bound from the container by default.
+    same uid by default.  No network/proc isolation is enforced (per design);
+    /proc is bound from the container by default.
     """
     alias_map = config.alias_map
     primary = _primary_root(session, alias_map)
@@ -630,10 +676,13 @@ def _bwrap_command(session, config, control=None):
     home = "/home/%s" % config.owner
 
     # Map to the REAL uid inside the namespace (not 0): the view files are owned
-    # by this uid, and some agents (claude) refuse to run as root.  Overridable
-    # via bwrap_uid/bwrap_gid for agents that genuinely want in-sandbox root.
+    # by this uid, and some agents (claude) refuse to run as root.  bwrap can
+    # only map one gid in the common unprivileged path, so choose an accessible
+    # runtime-socket gid when Docker access depends on a supplementary group;
+    # explicit bwrap_uid/bwrap_gid still override for deployments that need a
+    # fixed identity.
     uid = str(config.bwrap_uid if config.bwrap_uid is not None else os.getuid())
-    gid = str(config.bwrap_gid if config.bwrap_gid is not None else os.getgid())
+    gid = str(_bwrap_gid(config))
     argv = [config.bwrap_bin,
             "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
             "--uid", uid, "--gid", gid,

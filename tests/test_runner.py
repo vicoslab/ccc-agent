@@ -9,6 +9,7 @@ These mirror the Phase 2 validation list from the accepted design:
 
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -625,6 +626,74 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertNotIn(("--bind", "/dev", "/dev"), triples)
         self.assertNotIn("--dev", argv)
 
+    def test_bwrap_uses_accessible_docker_socket_gid(self):
+        seen = {}
+        real_stat = os.stat
+        real_access = os.access
+
+        def docker_socket_stat():
+            values = list(real_stat("/run"))
+            values[stat.ST_MODE] = stat.S_IFSOCK | 0o660
+            values[stat.ST_UID] = 0
+            values[stat.ST_GID] = 998
+            return os.stat_result(values)
+
+        def fake_stat(path, *args, **kwargs):
+            if os.fspath(path) == "/var/run/docker.sock":
+                return docker_socket_stat()
+            return real_stat(path, *args, **kwargs)
+
+        def fake_access(path, mode, *args, **kwargs):
+            if os.fspath(path) == "/var/run/docker.sock":
+                return True
+            return real_access(path, mode, *args, **kwargs)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        patches = (
+            mock.patch.object(os, "stat", side_effect=fake_stat),
+            mock.patch.object(os, "access", side_effect=fake_access),
+            mock.patch.object(os, "getgid", return_value=2094),
+            mock.patch.object(os, "getgroups", return_value=[2094, 998]),
+            mock.patch.object(subprocess, "run", side_effect=fake_run),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            run_session(self._bwrap_config(["true"]))
+
+        argv = seen["argv"]
+        gi = argv.index("--gid")
+        self.assertEqual(argv[gi + 1], "998")
+
+    def test_bwrap_explicit_gid_overrides_accessible_docker_socket_gid(self):
+        seen = {}
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if os.fspath(path) == "/var/run/docker.sock":
+                values = list(real_stat("/run"))
+                values[stat.ST_MODE] = stat.S_IFSOCK | 0o660
+                values[stat.ST_UID] = 0
+                values[stat.ST_GID] = 998
+                return os.stat_result(values)
+            return real_stat(path, *args, **kwargs)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(os, "stat", side_effect=fake_stat), \
+                mock.patch.object(os, "access", return_value=True), \
+                mock.patch.object(os, "getgid", return_value=2094), \
+                mock.patch.object(os, "getgroups", return_value=[2094, 998]), \
+                mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["true"], bwrap_gid=2094))
+
+        argv = seen["argv"]
+        gi = argv.index("--gid")
+        self.assertEqual(argv[gi + 1], "2094")
+
     def test_bwrap_full_isolation_omits_container_run_and_uses_minimal_dev(self):
         seen = {}
 
@@ -646,6 +715,34 @@ class TestBwrapConfinement(unittest.TestCase):
                                               for k in range(len(argv) - 1)])
         self.assertIn(("--dev", "/dev"), [(argv[k], argv[k + 1])
                                            for k in range(len(argv) - 1)])
+
+    def test_bwrap_full_isolation_keeps_primary_gid_even_if_docker_socket_accessible(self):
+        seen = {}
+        real_stat = os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if os.fspath(path) == "/var/run/docker.sock":
+                values = list(real_stat("/run"))
+                values[stat.ST_MODE] = stat.S_IFSOCK | 0o660
+                values[stat.ST_UID] = 0
+                values[stat.ST_GID] = 998
+                return os.stat_result(values)
+            return real_stat(path, *args, **kwargs)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(os, "stat", side_effect=fake_stat), \
+                mock.patch.object(os, "access", return_value=True), \
+                mock.patch.object(os, "getgid", return_value=2094), \
+                mock.patch.object(os, "getgroups", return_value=[2094, 998]), \
+                mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["true"], container_run_access=False))
+
+        argv = seen["argv"]
+        gi = argv.index("--gid")
+        self.assertEqual(argv[gi + 1], "2094")
 
     def test_bwrap_ro_binds_and_setenv_after_view(self):
         seen = {}

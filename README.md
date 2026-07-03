@@ -176,8 +176,12 @@ Confinement modes (`confinement` in config.json):
   container-escape-prevention boundary; use `ccc-agent run
   --full-isolation` or config `container_run_access: false` to omit ambient
   `/run`/`/var` access and restore bwrap's isolated minimal `/dev`. No container
-  `CAP_SYS_ADMIN` needed (just unprivileged user namespaces). `bwrap_bin` and
-  `bwrap_proc_mode` (`bind`|`ro`|`fresh`) are configurable.
+  `CAP_SYS_ADMIN` needed (just unprivileged user namespaces). Rootless bwrap
+  maps the user id plus one group id, not the full supplementary group list; in
+  default runtime-access mode, `ccc-agent` maps the Docker socket's group id when
+  the outer process can access `/var/run/docker.sock` only through that
+  supplementary group. Set config `bwrap_gid` to override this auto-selection.
+  `bwrap_bin` and `bwrap_proc_mode` (`bind`|`ro`|`fresh`) are configurable.
 - **`none`** (debug only — *not* a security boundary): runs the agent with its
   cwd inside the view but nothing else isolated; absolute-path writes bypass the
   view. Use only to exercise the policy/commit pipeline without bwrap.
