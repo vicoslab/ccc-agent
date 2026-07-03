@@ -160,7 +160,8 @@ Confinement modes (`confinement` in config.json):
 - **`bwrap`** (default, the real boundary): runs the agent in a rootless
   bubblewrap user+mount+pid namespace — OS read-only, the BranchFS view
   read-write at its visible path, the real underlay/store hidden. By default it
-  also exposes the existing CCC/container runtime views for `/run` and a
+  also exposes the existing CCC/container runtime views for `/run`, read-only
+  `/var` (including the conventional `/var/run/docker.sock` Docker path), and a
   device-capable `/dev` bind, so the agent can use sockets/devices that the
   container deployment already exposes (Docker, ssh-agent, `/dev/fuse`, etc.).
   The `/dev` bind must use bwrap `--dev-bind`, not ordinary `--bind`, because
@@ -168,7 +169,7 @@ Confinement modes (`confinement` in config.json):
   unusable for Python startup. This is intentionally not a full
   container-escape-prevention boundary; use `ccc-agent run
   --full-isolation` or config `container_run_access: false` to omit ambient
-  `/run` access and restore bwrap's isolated minimal `/dev`. No container
+  `/run`/`/var` access and restore bwrap's isolated minimal `/dev`. No container
   `CAP_SYS_ADMIN` needed (just unprivileged user namespaces). `bwrap_bin` and
   `bwrap_proc_mode` (`bind`|`ro`|`fresh`) are configurable.
 - **`none`** (debug only — *not* a security boundary): runs the agent with its

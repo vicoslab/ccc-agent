@@ -526,7 +526,7 @@ class TestBwrapConfinement(unittest.TestCase):
                             or e.get("event") == "bwrap-launch"
                             for e in session.events))
 
-    def test_bwrap_uses_device_capable_container_dev_by_default(self):
+    def test_bwrap_exposes_container_run_var_and_dev_by_default(self):
         seen = {}
 
         def fake_run(argv, **kwargs):
@@ -539,7 +539,12 @@ class TestBwrapConfinement(unittest.TestCase):
         argv = seen["argv"]
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
+        pairs = [(argv[k], argv[k + 1])
+                 for k in range(len(argv) - 1)]
         self.assertIn(("--bind", "/run", "/run"), triples)
+        self.assertIn(("--ro-bind", "/var", "/var"), triples)
+        self.assertNotIn(("--dir", "/var"), pairs)
+        self.assertNotIn(("--symlink", "/run", "/var/run"), triples)
         self.assertIn(("--dev-bind", "/dev", "/dev"), triples)
         self.assertNotIn(("--bind", "/dev", "/dev"), triples)
         self.assertNotIn("--dev", argv)
@@ -559,6 +564,10 @@ class TestBwrapConfinement(unittest.TestCase):
                    for k in range(len(argv) - 2)]
         self.assertNotIn(("--bind", "/run", "/run"), triples)
         self.assertNotIn(("--bind", "/dev", "/dev"), triples)
+        self.assertNotIn(("--ro-bind", "/var", "/var"), triples)
+        self.assertNotIn(("--symlink", "/run", "/var/run"), triples)
+        self.assertNotIn(("--dir", "/var"), [(argv[k], argv[k + 1])
+                                              for k in range(len(argv) - 1)])
         self.assertIn(("--dev", "/dev"), [(argv[k], argv[k + 1])
                                            for k in range(len(argv) - 1)])
 

@@ -151,7 +151,7 @@ def build_runtime(config):
 
 
 def _container_run_access(config, full_isolation=False):
-    """Whether bwrap should inherit container runtime /run and /dev views."""
+    """Whether bwrap should inherit container runtime /run, /var, and /dev."""
     return bool(config.get("container_run_access", True)) and not full_isolation
 
 
@@ -386,9 +386,9 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
                              "paths inside BranchFS review instead of the "
                              "default shared direct runtime bind")
     parser.add_argument("--full-isolation", action="store_true",
-                        help="do not bind the existing container /run into "
-                             "the bwrap sandbox; restores the stricter "
-                             "no-ambient-runtime-sockets behavior")
+                        help="do not bind the existing container /run, /var, "
+                             "or /dev into the bwrap sandbox; restores the "
+                             "stricter no-ambient-runtime-sockets behavior")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print the full session event log (always shows "
                              "the error detail on failure)")
@@ -553,9 +553,9 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
                              "paths inside BranchFS review instead of the "
                              "default shared direct runtime bind")
     parser.add_argument("--full-isolation", action="store_true",
-                        help="do not bind the existing container /run into "
-                             "the bwrap sandbox; restores the stricter "
-                             "no-ambient-runtime-sockets behavior")
+                        help="do not bind the existing container /run, /var, "
+                             "or /dev into the bwrap sandbox; restores the "
+                             "stricter no-ambient-runtime-sockets behavior")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print the full session event log")
     parser.add_argument("session_id", metavar="session-id")

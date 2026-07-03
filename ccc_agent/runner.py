@@ -120,8 +120,9 @@ class RunnerConfig(object):
         self.bwrap_ro_binds = list(bwrap_ro_binds)
         self.bwrap_setenv = dict(bwrap_setenv or {})
         # By default the sandbox inherits selected runtime namespaces from the
-        # existing CCC container: /run for deployment-provided sockets and a
-        # device-capable /dev bind for container-visible devices such as
+        # existing CCC container: /run and a read-only /var for
+        # deployment-provided sockets (including conventional /var/run paths),
+        # plus a device-capable /dev bind for container-visible devices such as
         # /dev/fuse. These are still the outer container's namespaced resources,
         # not raw host views. Use --full-isolation / container_run_access=false
         # to omit this ambient container runtime view and fall back to bwrap's
@@ -669,6 +670,12 @@ def _bwrap_command(session, config, control=None):
     else:
         argv += ["--dev", "/dev"]
     argv += ["--tmpfs", "/tmp"]
+    if config.container_run_access and os.path.isdir("/var"):
+        # Expose the container's /var read-only in default runtime-access mode.
+        # This makes the conventional /var/run/docker.sock path work when the
+        # outer CCC container exposes Docker, without letting the agent write
+        # logs/cache/lock files into the real container /var.
+        argv += ["--ro-bind", "/var", "/var"]
     if config.container_run_access and os.path.isdir("/run"):
         argv += ["--bind", "/run", "/run"]
 
