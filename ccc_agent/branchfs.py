@@ -9,6 +9,7 @@ the supervisor's orchestration, policy, and artifact logic.
 Both backends speak in terms of :class:`ccc_agent.session.ProtectedRoot`.
 """
 
+import errno
 import json
 import os
 import shlex
@@ -69,6 +70,73 @@ def _unix_socket_ready(path):
         return False
     finally:
         sock.close()
+
+
+def _decode_mountinfo_field(value):
+    return (value.replace("\\040", " ")
+                 .replace("\\011", "\t")
+                 .replace("\\012", "\n")
+                 .replace("\\134", "\\"))
+
+
+def _branchfs_mountinfo_entry(path, mountinfo_path="/proc/self/mountinfo"):
+    target = os.path.abspath(path)
+    try:
+        with open(mountinfo_path) as fh:
+            lines = list(fh)
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.rstrip("\n").split()
+        if len(fields) < 10:
+            continue
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if separator + 2 >= len(fields):
+            continue
+        mountpoint = os.path.abspath(_decode_mountinfo_field(fields[4]))
+        if mountpoint != target:
+            continue
+        fstype = fields[separator + 1]
+        source = fields[separator + 2]
+        if (fstype == "fuse" or fstype.startswith("fuse.")) and (
+                source == "branchfs" or fstype == "fuse.branchfs"):
+            return {"mountpoint": mountpoint, "fstype": fstype,
+                    "source": source}
+    return None
+
+
+def _disconnected_mount(path):
+    try:
+        os.stat(path)
+        return False
+    except OSError as exc:
+        return exc.errno == errno.ENOTCONN
+
+
+def _run_lazy_unmount_command(argv):
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _lazy_unmount_path(path):
+    attempts = []
+    for argv in (["fusermount3", "-uz", path],
+                 ["fusermount", "-uz", path],
+                 ["umount", "-l", path]):
+        code, out, err = _run_lazy_unmount_command(argv)
+        if code == 0:
+            return
+        detail = (err or out or "exit %d" % code).strip()
+        attempts.append("%s: %s" % (" ".join(argv), detail))
+    raise BranchfsError("lazy unmount failed for %s: %s"
+                        % (path, "; ".join(attempts)))
 
 
 def _remove_empty_orphan_branch_dir(root):
@@ -386,11 +454,16 @@ class BranchfsCli(object):
 
     def __init__(self, binary="branchfs", run=None,
                  timeout_seconds=DEFAULT_BRANCHFS_TIMEOUT_SECONDS,
-                 daemon_ready=None, sleep=None):
+                 daemon_ready=None, sleep=None, mountinfo_path=None,
+                 disconnected_mount_probe=None, lazy_unmount=None):
         self.binary = binary
         self.timeout_seconds = timeout_seconds
         self._daemon_ready = daemon_ready or _unix_socket_ready
         self._sleep = sleep or time.sleep
+        self._mountinfo_path = mountinfo_path or "/proc/self/mountinfo"
+        self._disconnected_mount_probe = (disconnected_mount_probe or
+                                          _disconnected_mount)
+        self._lazy_unmount = lazy_unmount or _lazy_unmount_path
         if run is None:
             self._run = lambda argv: _run_subprocess(
                 argv, timeout=self.timeout_seconds)
@@ -461,6 +534,13 @@ class BranchfsCli(object):
             argv.append("--allow-other")
         argv.append(root.mount)
         self._invoke(*argv)
+
+    def cleanup_stale_mount(self, root):
+        if _branchfs_mountinfo_entry(root.mount, self._mountinfo_path) is None:
+            return
+        if not self._disconnected_mount_probe(root.mount):
+            return
+        self._lazy_unmount(root.mount)
 
     def unmount(self, root):
         self._invoke("unmount", root.mount, "--storage", root.store)

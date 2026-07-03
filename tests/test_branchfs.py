@@ -178,6 +178,54 @@ class TestBranchfsCli(unittest.TestCase):
         # mountpoint stays the final positional argument
         self.assertEqual(call[-1], self.root.mount)
 
+    def test_cleanup_stale_mount_lazy_unmounts_disconnected_branchfs_fuse(self):
+        mountinfo = os.path.join(self.tmp.name, "mountinfo")
+        with open(mountinfo, "w") as fh:
+            fh.write("42 1 0:99 / %s rw - fuse branchfs rw\n" % self.root.mount)
+        unmounted = []
+        cli = BranchfsCli(
+            run=RecordingRunner(),
+            mountinfo_path=mountinfo,
+            disconnected_mount_probe=lambda path: True,
+            lazy_unmount=lambda path: unmounted.append(path),
+        )
+
+        cli.cleanup_stale_mount(self.root)
+
+        self.assertEqual(unmounted, [self.root.mount])
+
+    def test_cleanup_stale_mount_ignores_active_branchfs_fuse(self):
+        mountinfo = os.path.join(self.tmp.name, "mountinfo")
+        with open(mountinfo, "w") as fh:
+            fh.write("42 1 0:99 / %s rw - fuse branchfs rw\n" % self.root.mount)
+        unmounted = []
+        cli = BranchfsCli(
+            run=RecordingRunner(),
+            mountinfo_path=mountinfo,
+            disconnected_mount_probe=lambda path: False,
+            lazy_unmount=lambda path: unmounted.append(path),
+        )
+
+        cli.cleanup_stale_mount(self.root)
+
+        self.assertEqual(unmounted, [])
+
+    def test_cleanup_stale_mount_ignores_non_branchfs_mount(self):
+        mountinfo = os.path.join(self.tmp.name, "mountinfo")
+        with open(mountinfo, "w") as fh:
+            fh.write("42 1 0:99 / %s rw - ext4 /dev/sda rw\n" % self.root.mount)
+        unmounted = []
+        cli = BranchfsCli(
+            run=RecordingRunner(),
+            mountinfo_path=mountinfo,
+            disconnected_mount_probe=lambda path: True,
+            lazy_unmount=lambda path: unmounted.append(path),
+        )
+
+        cli.cleanup_stale_mount(self.root)
+
+        self.assertEqual(unmounted, [])
+
     def test_mount_omits_allow_other_by_default(self):
         runner = RecordingRunner()
         cli = BranchfsCli(run=runner)
