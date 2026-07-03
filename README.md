@@ -61,19 +61,27 @@ A session that exits with un-committed changes stays as a reviewable branch:
 
 ```bash
 ccc-agent list                              # sessions + states
-ccc-agent review <session>                  # browse changed paths (no line hunks by default)
+ccc-agent review <session>                  # browse, then accept/select/reject/later on a TTY
+ccc-agent diff <session>                    # read-only changed-path summary
 ccc-agent diff <session> --show-file-diffs  # append hunks for changed text files; binary/non-text skipped
 ccc-agent diff <session> <path>             # unified diff for one changed text file
-ccc-agent review <session> --accept         # commit policy-visible changes; ignored runtime noise is discarded
-ccc-agent review <session> --reject         # discard everything
-ccc-agent review <session> --commit a,b     # commit only a,b (file-by-file)
+ccc-agent review <session> --accept         # scripted commit of policy-visible changes; ignored runtime noise is discarded
+ccc-agent review <session> --reject         # scripted discard everything
+ccc-agent review <session> --commit a,b     # scripted commit only a,b (file-by-file)
 ccc-agent review <session> --emit-patch > c.patch  # text hunks only: prune hunks…
 ccc-agent review <session> --apply-patch c.patch   # …then apply
-ccc-agent commit <session> [<session> ...]  # commit one or more pending/frozen sessions
-ccc-agent abort <session> [<session> ...]   # discard one or more sessions
+ccc-agent commit <session> [<session> ...]  # scripted commit one or more pending/frozen sessions
+ccc-agent abort <session> [<session> ...]   # scripted discard one or more sessions
 ccc-agent cleanup --older-than 30           # remove old closed session bundles
 ccc-agent cleanup --older-than 30 --dry-run # preview without deleting
 ```
+
+On an interactive TTY, plain `ccc-agent review <session>` first shows the same
+changed-path summary as `diff`, then prompts for `yes`/`no`/`later` or
+`selective accept`. Selective accept opens a stdlib terminal tree selector:
+Up/Down move, Enter opens a folder, Backspace returns to the parent, Space
+selects a file or an entire folder subtree, `c` commits selected paths, and
+`q`/Esc cancels back to the review prompt.
 
 `ccc-agent diff` uses live BranchFS status while a session is still live
 (`created`, `mounting`, `running`, `finalizing`). Cached review JSON is used only

@@ -12,8 +12,10 @@ import tempfile
 import unittest
 
 import ccc_agent.ctl as ctl_module
+from ccc_agent import cli as cli_module
 from ccc_agent.branchfs import FakeBranchFS
 from ccc_agent.ctl import Controller
+from ccc_agent.policy import Change
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import RootSpec
 from ccc_agent.session import SessionStore
@@ -126,6 +128,37 @@ class TestReview(unittest.TestCase):
         self.assertEqual(session.state, "committed")
         self.assertTrue(self.h.base_has("keep.txt"))
         self.assertFalse(self.h.base_has("drop.txt"))
+
+    def test_interactive_tree_selector_selects_entire_folder_subtree(self):
+        changes = [
+            Change("A", "/storage/user/Projects/proj-a/root.txt", "file", 1, "r"),
+            Change("A", "/storage/user/Projects/proj-a/sub/a.txt", "file", 1, "r"),
+            Change("A", "/storage/user/Projects/proj-a/sub/b.txt", "file", 1, "r"),
+        ]
+        keys = iter(["KEY_DOWN", " ", "c"])
+
+        selected = cli_module._select_review_paths_interactive(
+            changes, key_reader=lambda: next(keys), stream=io.StringIO(),
+            clear_screen=False)
+
+        self.assertEqual(set(selected), {
+            "/storage/user/Projects/proj-a/sub/a.txt",
+            "/storage/user/Projects/proj-a/sub/b.txt",
+        })
+
+    def test_interactive_tree_selector_opens_folder_and_goes_back(self):
+        changes = [
+            Change("A", "/storage/user/Projects/proj-a/root.txt", "file", 1, "r"),
+            Change("A", "/storage/user/Projects/proj-a/sub/a.txt", "file", 1, "r"),
+            Change("A", "/storage/user/Projects/proj-a/sub/b.txt", "file", 1, "r"),
+        ]
+        keys = iter(["KEY_DOWN", "KEY_ENTER", " ", "KEY_BACKSPACE", "c"])
+
+        selected = cli_module._select_review_paths_interactive(
+            changes, key_reader=lambda: next(keys), stream=io.StringIO(),
+            clear_screen=False)
+
+        self.assertEqual(selected, ["/storage/user/Projects/proj-a/sub/a.txt"])
 
     def test_accept_auto_merges_clean_same_file_text_changes(self):
         rel = "Projects/proj-a/merge.txt"

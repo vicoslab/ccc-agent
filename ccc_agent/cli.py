@@ -28,6 +28,7 @@ import io
 import json
 import os
 import shutil
+import select
 import signal
 import subprocess
 import sys
@@ -268,9 +269,12 @@ def _display_or_page(text, stream=None):
         stream.write(text)
 
 
-def _pending_review_text(controller, session):
+def _pending_review_text(controller, session, show_ignored=False,
+                         show_file_diffs=False):
     changed = io.StringIO()
-    controller.diff(session.session_id, out=changed)
+    controller.diff(session.session_id, out=changed,
+                    show_ignored=show_ignored,
+                    show_file_diffs=show_file_diffs)
 
     lines = [
         "ccc-agent: Pending changes for %s" % session.session_id,
@@ -333,13 +337,218 @@ def _read_review_choice():
     return input()
 
 
-def _prompt_pending_review_decision(controller, session, stream=None):
+class _ReviewTreeNode(object):
+    def __init__(self, name, path, parent=None):
+        self.name = name
+        self.path = path
+        self.parent = parent
+        self.children = {}
+        self.change = None
+
+    def changed_paths(self):
+        paths = []
+        if self.change is not None:
+            paths.append(self.change.path)
+        for child in self.sorted_children():
+            paths.extend(child.changed_paths())
+        return paths
+
+    def sorted_children(self):
+        return [self.children[name] for name in sorted(self.children)]
+
+
+def _review_tree_common_root(changes):
+    paths = [c.path for c in changes]
+    if not paths:
+        return "/"
+    if len(paths) == 1:
+        return os.path.dirname(paths[0]) or "/"
+    try:
+        return os.path.commonpath(paths) or "/"
+    except ValueError:
+        return "/"
+
+
+def _build_review_tree(changes):
+    common = _review_tree_common_root(changes)
+    root = _ReviewTreeNode(common or "/", common or "/")
+    for change in sorted(changes, key=lambda c: c.path):
+        try:
+            rel = os.path.relpath(change.path, common)
+        except ValueError:
+            rel = change.path.lstrip(os.sep)
+        if rel in ("", "."):
+            root.change = change
+            continue
+        current = root
+        prefix = common.rstrip(os.sep)
+        for part in rel.split(os.sep):
+            prefix = (prefix + os.sep + part) if prefix else os.sep + part
+            current = current.children.setdefault(
+                part, _ReviewTreeNode(part, prefix, parent=current))
+        current.change = change
+    return root
+
+
+def _node_selection_mark(node, selected):
+    paths = node.changed_paths()
+    if not paths:
+        return "[ ]"
+    count = sum(1 for path in paths if path in selected)
+    if count == len(paths):
+        return "[x]"
+    if count:
+        return "[~]"
+    return "[ ]"
+
+
+def _toggle_node_selection(node, selected):
+    paths = node.changed_paths()
+    if not paths:
+        return
+    if all(path in selected for path in paths):
+        for path in paths:
+            selected.discard(path)
+    else:
+        for path in paths:
+            selected.add(path)
+
+
+def _render_review_tree(root, cwd, cursor, selected, stream, clear_screen=True,
+                        message=None):
+    if clear_screen:
+        stream.write("\x1b[2J\x1b[H")
+    stream.write("ccc-agent: selective accept\n")
+    stream.write("Space selects a file or whole folder subtree; "
+                 "Enter opens a folder; Backspace goes up; "
+                 "c commits selected; q/Esc cancels.\n")
+    stream.write("current: %s\n" % cwd.path)
+    stream.write("selected: %d path(s)\n" % len(selected))
+    if message:
+        stream.write("%s\n" % message)
+    entries = cwd.sorted_children()
+    if not entries:
+        stream.write("  (no changed paths here)\n")
+    for idx, node in enumerate(entries):
+        marker = ">" if idx == cursor else " "
+        suffix = "/" if node.children else ""
+        stream.write("%s %s %s%s\n"
+                     % (marker, _node_selection_mark(node, selected),
+                        node.name, suffix))
+    stream.flush()
+
+
+def _read_tree_key():
+    """Read one navigation key in cbreak mode and normalize common sequences."""
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            # Arrow keys arrive as escape sequences.  A bare Escape is cancel.
+            try:
+                ready, _w, _x = select.select([sys.stdin], [], [], 0.05)
+            except (OSError, ValueError):
+                ready = []
+            if not ready:
+                return "ESC"
+            nxt = sys.stdin.read(1)
+            if nxt == "[":
+                code = sys.stdin.read(1)
+                return {
+                    "A": "KEY_UP",
+                    "B": "KEY_DOWN",
+                    "C": "KEY_RIGHT",
+                    "D": "KEY_LEFT",
+                }.get(code, "ESC")
+            return "ESC"
+        if ch in ("\r", "\n"):
+            return "KEY_ENTER"
+        if ch in ("\x7f", "\b"):
+            return "KEY_BACKSPACE"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+def _select_review_paths_interactive(changes, key_reader=None, stream=None,
+                                     clear_screen=True):
+    """Interactive tree selector for file/folder-level selective accept.
+
+    Returns a list of selected change paths, or ``None`` when the user cancels.
+    The implementation is intentionally stdlib-only so ccc-agent keeps its
+    dependency-free deployment contract inside CCC images.
+    """
+    stream = sys.stderr if stream is None else stream
+    key_reader = key_reader or _read_tree_key
+    root = _build_review_tree(changes)
+    cwd = root
+    cursor = 0
+    selected = set()
+    message = None
+    while True:
+        entries = cwd.sorted_children()
+        if entries:
+            cursor = max(0, min(cursor, len(entries) - 1))
+        else:
+            cursor = 0
+        _render_review_tree(root, cwd, cursor, selected, stream,
+                            clear_screen=clear_screen, message=message)
+        message = None
+        key = key_reader()
+        if key in ("KEY_UP", "k"):
+            if entries:
+                cursor = (cursor - 1) % len(entries)
+        elif key in ("KEY_DOWN", "j"):
+            if entries:
+                cursor = (cursor + 1) % len(entries)
+        elif key in ("KEY_ENTER", "\r", "\n"):
+            if entries and entries[cursor].children:
+                cwd = entries[cursor]
+                cursor = 0
+        elif key in ("KEY_BACKSPACE", "KEY_LEFT", "\x7f", "\b"):
+            if cwd.parent is not None:
+                cwd = cwd.parent
+                cursor = 0
+        elif key == " ":
+            if entries:
+                _toggle_node_selection(entries[cursor], selected)
+        elif key in ("c", "C"):
+            if selected:
+                return sorted(selected)
+            message = "No paths selected; select at least one path or press q to cancel."
+        elif key in ("q", "Q", "ESC", "\x1b"):
+            return None
+
+
+def _selective_accept_review(controller, session, stream=None,
+                             include_ignored=False):
+    stream = sys.stderr if stream is None else stream
+    changes = [change for _root, change in controller._changes(
+        session, include_ignored=include_ignored)]
+    if not changes:
+        stream.write("ccc-agent: no changes available for selective accept\n")
+        return session
+    selected = _select_review_paths_interactive(changes, stream=stream)
+    if selected is None:
+        stream.write("ccc-agent: selective accept cancelled\n")
+        return None
+    updated = controller.review(session.session_id, commit_paths=selected,
+                                out=stream, include_ignored=include_ignored)
+    stream.write("ccc-agent: selective accept committed %d path(s) in session %s\n"
+                 % (len(selected), updated.session_id))
+    return updated
+
+
+def _prompt_pending_review_decision(controller, session, stream=None,
+                                    include_ignored=False):
     stream = sys.stderr if stream is None else stream
     _ensure_foreground_for_prompt()
     while True:
         stream.write(
             "ccc-agent: Accept changes? "
-            "yes/y=commit / no/n=discard / "
+            "yes/y=commit / select/s=selective accept / no/n=discard / "
             "later/l/Esc=keep for review [later]: ")
         stream.flush()
         try:
@@ -350,10 +559,18 @@ def _prompt_pending_review_decision(controller, session, stream=None):
             stream.write("\n")
         choice = raw_choice.strip().lower()
         if choice in ("y", "yes"):
-            updated = controller.commit(session.session_id)
+            updated = controller.commit(session.session_id,
+                                        include_ignored=include_ignored)
             stream.write("ccc-agent: committed session %s\n"
                          % updated.session_id)
             return updated
+        if choice in ("s", "select", "selective"):
+            updated = _selective_accept_review(
+                controller, session, stream=stream,
+                include_ignored=include_ignored)
+            if updated is not None:
+                return updated
+            continue
         if choice in ("n", "no"):
             updated = controller.abort(session.session_id)
             stream.write("ccc-agent: discarded session %s\n"
@@ -363,25 +580,38 @@ def _prompt_pending_review_decision(controller, session, stream=None):
             stream.write("ccc-agent: kept for later review: %s\n"
                          % session.session_id)
             return session
-        stream.write("ccc-agent: please answer yes/y, no/n, or later/l/Esc.\n")
+        stream.write("ccc-agent: please answer yes/y, select/s, no/n, or later/l/Esc.\n")
+
+
+def _review_pending_session(controller, session, display_stream=None,
+                            prompt_stream=None, show_ignored=False,
+                            show_file_diffs=False, include_ignored=False,
+                            prompt=True):
+    display_stream = sys.stdout if display_stream is None else display_stream
+    prompt_stream = sys.stderr if prompt_stream is None else prompt_stream
+    if session.state not in ("pending-review", "frozen"):
+        return session
+    try:
+        _display_or_page(_pending_review_text(
+            controller, session, show_ignored=show_ignored,
+            show_file_diffs=show_file_diffs), stream=display_stream)
+    except ControlError as exc:
+        prompt_stream.write("ccc-agent: could not show pending changes: %s\n" % exc)
+    if prompt and _is_interactive_review():
+        try:
+            return _prompt_pending_review_decision(
+                controller, session, stream=prompt_stream,
+                include_ignored=include_ignored)
+        except ControlError as exc:
+            prompt_stream.write("ccc-agent: review decision failed: %s\n" % exc)
+    return session
 
 
 def _handle_pending_review_finish(store, backend, alias_map, session, stream=None):
-    if session.state != "pending-review":
-        return session
     stream = sys.stderr if stream is None else stream
     controller = Controller(store=store, backend=backend, alias_map=alias_map)
-    try:
-        _display_or_page(_pending_review_text(controller, session), stream=stream)
-    except ControlError as exc:
-        stream.write("ccc-agent: could not show pending changes: %s\n" % exc)
-    if _is_interactive_review():
-        try:
-            return _prompt_pending_review_decision(controller, session,
-                                                   stream=stream)
-        except ControlError as exc:
-            stream.write("ccc-agent: review decision failed: %s\n" % exc)
-    return session
+    return _review_pending_session(controller, session, display_stream=stream,
+                                   prompt_stream=stream)
 
 
 def main_run(argv=None, env=None, prog="ccc-agent run"):
@@ -513,12 +743,13 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
 
     if session.state == "pending-review" and not nested_invocation:
         sys.stderr.write(
-            "ccc-agent: review with: ccc-agent diff %s\n"
+            "ccc-agent: review with: ccc-agent review %s\n"
+            "ccc-agent: diff only: ccc-agent diff %s\n"
             "ccc-agent: text diffs: ccc-agent diff %s --show-file-diffs\n"
             "ccc-agent: single file diff: ccc-agent diff %s <path>\n"
-            "ccc-agent: then: ccc-agent commit %s | ccc-agent abort %s\n"
+            "ccc-agent: scripted: ccc-agent commit %s | ccc-agent abort %s\n"
             % (session.session_id, session.session_id, session.session_id,
-               session.session_id, session.session_id))
+               session.session_id, session.session_id, session.session_id))
     if session.state == "failed":
         return 1
     if session.exit_status not in (0, None):
@@ -644,12 +875,13 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
                                                 session)
     if session.state == "pending-review":
         sys.stderr.write(
-            "ccc-agent: review with: ccc-agent diff %s\n"
+            "ccc-agent: review with: ccc-agent review %s\n"
+            "ccc-agent: diff only: ccc-agent diff %s\n"
             "ccc-agent: text diffs: ccc-agent diff %s --show-file-diffs\n"
             "ccc-agent: single file diff: ccc-agent diff %s <path>\n"
-            "ccc-agent: then: ccc-agent commit %s | ccc-agent abort %s\n"
+            "ccc-agent: scripted: ccc-agent commit %s | ccc-agent abort %s\n"
             % (session.session_id, session.session_id, session.session_id,
-               session.session_id, session.session_id))
+               session.session_id, session.session_id, session.session_id))
     if session.state == "failed":
         return 1
     if session.exit_status not in (0, None):
@@ -812,7 +1044,14 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                          "(binary/non-text files are skipped)")
     _add_session_id_arg(dp)
     dp.add_argument("path", nargs="?", help="optional changed file to diff")
-    rv = sub.add_parser("review", help="post-session change review")
+    rv = sub.add_parser(
+        "review", help="browse changes and, on a TTY, choose a review decision",
+        description=("Browse a pending/frozen session's changes. With no "
+                     "action flags, an interactive TTY prompts for a decision "
+                     "after showing the summary."),
+        epilog=("Prompt choices: yes/y commits, select/s opens a tree selector "
+                "for file/folder-level commit, no/n discards, and later/l/Esc "
+                "keeps the session for review."))
     _add_session_id_arg(rv)
     rv.add_argument("--accept", action="store_true", help="commit everything")
     rv.add_argument("--include-ignored", action="store_true",
@@ -869,12 +1108,24 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
         elif args.cmd == "review":
             commit_paths = ([p for p in args.commit_paths.split(",") if p]
                             if args.commit_paths else None)
-            session = controller.review(
-                args.session_id, accept=args.accept, reject=args.reject,
-                commit_paths=commit_paths, emit_patch=args.emit_patch,
-                apply_patch=args.apply_patch, show_ignored=args.show_ignored,
-                include_ignored=args.include_ignored,
-                show_file_diffs=args.show_file_diffs)
+            has_review_action = bool(args.accept or args.reject or commit_paths
+                                     or args.emit_patch or args.apply_patch)
+            if has_review_action:
+                session = controller.review(
+                    args.session_id, accept=args.accept, reject=args.reject,
+                    commit_paths=commit_paths, emit_patch=args.emit_patch,
+                    apply_patch=args.apply_patch, show_ignored=args.show_ignored,
+                    include_ignored=args.include_ignored,
+                    show_file_diffs=args.show_file_diffs)
+            else:
+                session = controller._load(args.session_id)
+                controller._require_state(session, ("pending-review", "frozen"),
+                                          "review")
+                session = _review_pending_session(
+                    controller, session, display_stream=sys.stdout,
+                    prompt_stream=sys.stderr, show_ignored=args.show_ignored,
+                    show_file_diffs=args.show_file_diffs,
+                    include_ignored=args.include_ignored)
             if session.state in ("committed", "aborted"):
                 sys.stderr.write("session %s now %s\n"
                                  % (session.session_id, session.state))

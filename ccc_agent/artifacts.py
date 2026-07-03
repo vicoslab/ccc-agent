@@ -172,12 +172,14 @@ def render_summary(session, changes_by_root, decision, warnings_by_root=None,
     out("")
     out("```bash")
     out("ccc-agent show %s" % session.session_id)
-    out("ccc-agent diff %s          # list changed paths" % session.session_id)
+    out("ccc-agent review %s        # browse and choose accept/select/reject/later" %
+        session.session_id)
+    out("ccc-agent diff %s          # list changed paths only" % session.session_id)
     out("ccc-agent diff %s <path>   # unified diff for one text file" %
         session.session_id)
-    out("ccc-agent commit %s   # apply branch to real storage; repeat IDs to batch" %
+    out("ccc-agent commit %s   # scripted full commit; repeat IDs to batch" %
         session.session_id)
-    out("ccc-agent abort %s    # discard branch; repeat IDs to batch" % session.session_id)
+    out("ccc-agent abort %s    # scripted discard; repeat IDs to batch" % session.session_id)
     out("```")
     out("")
     return "\n".join(lines)

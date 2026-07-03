@@ -282,7 +282,8 @@ class TestMainRun(unittest.TestCase):
         self.assertNotIn("Diff:", output)
         self.assertNotIn("--- a/Projects/proj-a/review.txt", output)
         self.assertNotIn("+hello", output)
-        self.assertIn("then: ccc-agent commit", output)
+        self.assertIn("review with: ccc-agent review", output)
+        self.assertIn("scripted: ccc-agent commit", output)
         self.assertNotIn("Accept changes?", output)
 
     def test_pending_review_lists_all_paths_without_file_hunks(self):
@@ -987,6 +988,58 @@ class TestMainCtl(unittest.TestCase):
             self.h.base, self.h.workspace_rel, "result.txt")))
         self.assertTrue(os.path.isfile(os.path.join(
             self.h.base, ".cache", "pip", "wheel.txt")))
+
+    def test_review_interactive_yes_commits_after_displaying_changes(self):
+        sid = self.make_pending_session("review-yes.txt")
+
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch("ccc_agent.cli._is_interactive_review", return_value=True):
+            with mock.patch("builtins.input", return_value="yes"):
+                with contextlib.redirect_stdout(out):
+                    with contextlib.redirect_stderr(err):
+                        code = main_ctl(["--config", self.h.config_path,
+                                         "review", sid], env={})
+
+        self.assertEqual(code, 0)
+        self.assertIn("A /storage/user/Projects/proj-a/review-yes.txt",
+                      out.getvalue())
+        self.assertIn("Accept changes?", err.getvalue())
+        self.assertIn("committed session", err.getvalue())
+        self.assertEqual(self.store().load(sid).state, "committed")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, self.h.workspace_rel, "review-yes.txt")))
+
+    def test_review_interactive_selective_commits_only_selected_paths(self):
+        before = set(self.h.sessions())
+        self.assertEqual(main_run([
+            "--config", self.h.config_path,
+            "--workspace", "/storage/user/Projects/proj-a",
+            "--policy", "manual",
+            "--", "sh", "-c",
+            "printf 'keep\\n' > keep.txt; printf 'drop\\n' > drop.txt",
+        ], env={}), 0)
+        created = sorted(set(self.h.sessions()) - before)
+        self.assertEqual(len(created), 1)
+        sid = created[0]
+
+        err = io.StringIO()
+        with mock.patch("ccc_agent.cli._is_interactive_review", return_value=True):
+            with mock.patch("builtins.input", return_value="select"):
+                with mock.patch(
+                    "ccc_agent.cli._select_review_paths_interactive",
+                    return_value=["/storage/user/Projects/proj-a/keep.txt"]):
+                    with contextlib.redirect_stderr(err):
+                        code = main_ctl(["--config", self.h.config_path,
+                                         "review", sid], env={})
+
+        self.assertEqual(code, 0)
+        self.assertIn("selective accept", err.getvalue())
+        self.assertEqual(self.store().load(sid).state, "committed")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, self.h.workspace_rel, "keep.txt")))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.h.base, self.h.workspace_rel, "drop.txt")))
 
     def test_abort_accepts_multiple_session_ids_and_reports_each_ok(self):
         sid1 = self.make_pending_session("abort-one.txt")
