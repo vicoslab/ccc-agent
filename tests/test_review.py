@@ -7,8 +7,12 @@ file-level subset, and line-level emit-patch / apply-patch.
 
 import io
 import os
+import pty
 import shutil
+import sys
 import tempfile
+import threading
+import time
 import unittest
 
 import ccc_agent.ctl as ctl_module
@@ -159,6 +163,32 @@ class TestReview(unittest.TestCase):
             clear_screen=False)
 
         self.assertEqual(selected, ["/storage/user/Projects/proj-a/sub/a.txt"])
+
+    def _read_tree_key_from_pty(self, seq):
+        master_fd, slave_fd = pty.openpty()
+        old_stdin = sys.stdin
+        stdin = os.fdopen(slave_fd, "r", encoding="utf-8", buffering=1)
+
+        def writer():
+            time.sleep(0.05)
+            os.write(master_fd, seq)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            sys.stdin = stdin
+            return cli_module._read_tree_key()
+        finally:
+            sys.stdin = old_stdin
+            stdin.close()
+            os.close(master_fd)
+            thread.join(1)
+
+    def test_read_tree_key_handles_csi_and_application_cursor_arrows(self):
+        self.assertEqual(self._read_tree_key_from_pty(b"\x1b[A"), "KEY_UP")
+        self.assertEqual(self._read_tree_key_from_pty(b"\x1b[B"), "KEY_DOWN")
+        self.assertEqual(self._read_tree_key_from_pty(b"\x1bOA"), "KEY_UP")
+        self.assertEqual(self._read_tree_key_from_pty(b"\x1bOB"), "KEY_DOWN")
 
     def test_accept_auto_merges_clean_same_file_text_changes(self):
         rel = "Projects/proj-a/merge.txt"

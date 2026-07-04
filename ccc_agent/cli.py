@@ -414,62 +414,215 @@ def _toggle_node_selection(node, selected):
             selected.add(path)
 
 
+def _review_tree_lines(root, cwd, cursor, selected, message=None):
+    lines = [
+        "ccc-agent: selective accept",
+        "Space selects a file or whole folder subtree; "
+        "Enter opens a folder; Backspace goes up; "
+        "c commits selected; q/Esc cancels.",
+        "current: %s" % cwd.path,
+        "selected: %d path(s)" % len(selected),
+    ]
+    if message:
+        lines.append(str(message))
+    entries = cwd.sorted_children()
+    if not entries:
+        lines.append("  (no changed paths here)")
+    for idx, node in enumerate(entries):
+        marker = ">" if idx == cursor else " "
+        suffix = "/" if node.children else ""
+        lines.append("%s %s %s%s"
+                     % (marker, _node_selection_mark(node, selected),
+                        node.name, suffix))
+    return lines
+
+
 def _render_review_tree(root, cwd, cursor, selected, stream, clear_screen=True,
                         message=None):
     if clear_screen:
         stream.write("\x1b[2J\x1b[H")
-    stream.write("ccc-agent: selective accept\n")
-    stream.write("Space selects a file or whole folder subtree; "
-                 "Enter opens a folder; Backspace goes up; "
-                 "c commits selected; q/Esc cancels.\n")
-    stream.write("current: %s\n" % cwd.path)
-    stream.write("selected: %d path(s)\n" % len(selected))
-    if message:
-        stream.write("%s\n" % message)
-    entries = cwd.sorted_children()
-    if not entries:
-        stream.write("  (no changed paths here)\n")
-    for idx, node in enumerate(entries):
-        marker = ">" if idx == cursor else " "
-        suffix = "/" if node.children else ""
-        stream.write("%s %s %s%s\n"
-                     % (marker, _node_selection_mark(node, selected),
-                        node.name, suffix))
+    for line in _review_tree_lines(root, cwd, cursor, selected,
+                                   message=message):
+        stream.write(line + "\n")
     stream.flush()
 
 
+def _decode_tree_escape_sequence(seq):
+    """Normalize terminal escape bytes after the leading ESC byte."""
+    if not seq:
+        return "ESC"
+    # Cursor keys may arrive as CSI (ESC [ A) or application cursor mode
+    # (ESC O A).  Modified arrows can include parameters such as ESC [ 1 ; 5 A,
+    # so look for the final direction byte instead of assuming fixed length.
+    if seq[:1] in (b"[", b"O"):
+        for byte in seq[1:]:
+            key = {
+                ord("A"): "KEY_UP",
+                ord("B"): "KEY_DOWN",
+                ord("C"): "KEY_RIGHT",
+                ord("D"): "KEY_LEFT",
+            }.get(byte)
+            if key is not None:
+                return key
+    return "ESC"
+
+
 def _read_tree_key():
-    """Read one navigation key in cbreak mode and normalize common sequences."""
+    """Read one navigation key and normalize common terminal keys.
+
+    This deliberately uses byte-level ``os.read``.  The previous implementation
+    mixed ``sys.stdin.read(1)`` with ``select`` on the underlying file
+    descriptor; Python's text buffering could consume the rest of an escape
+    sequence before ``select`` saw it, causing arrow keys to be mistaken for a
+    bare Escape and cancelling the selector.
+    """
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            # Arrow keys arrive as escape sequences.  A bare Escape is cancel.
+        ch = os.read(fd, 1)
+        if ch == b"\x1b":
+            seq = b""
             try:
-                ready, _w, _x = select.select([sys.stdin], [], [], 0.05)
+                ready, _w, _x = select.select([fd], [], [], 0.2)
             except (OSError, ValueError):
                 ready = []
-            if not ready:
-                return "ESC"
-            nxt = sys.stdin.read(1)
-            if nxt == "[":
-                code = sys.stdin.read(1)
-                return {
-                    "A": "KEY_UP",
-                    "B": "KEY_DOWN",
-                    "C": "KEY_RIGHT",
-                    "D": "KEY_LEFT",
-                }.get(code, "ESC")
-            return "ESC"
-        if ch in ("\r", "\n"):
+            if ready:
+                try:
+                    seq = os.read(fd, 1)
+                    if seq[:1] in (b"[", b"O"):
+                        for _ in range(15):
+                            if _decode_tree_escape_sequence(seq) != "ESC":
+                                break
+                            ready, _w, _x = select.select([fd], [], [], 0.02)
+                            if not ready:
+                                break
+                            seq += os.read(fd, 1)
+                except OSError:
+                    seq = b""
+            return _decode_tree_escape_sequence(seq)
+        if ch in (b"\r", b"\n"):
             return "KEY_ENTER"
-        if ch in ("\x7f", "\b"):
+        if ch in (b"\x7f", b"\b"):
             return "KEY_BACKSPACE"
-        return ch
+        try:
+            return ch.decode()
+        except UnicodeDecodeError:
+            return ""
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+_CURSES_UNAVAILABLE = object()
+
+
+def _select_review_paths_curses(changes):
+    """Curses-backed selector for real terminals.
+
+    Curses owns keypad/arrow decoding, avoiding fragile manual handling of
+    terminal escape sequences in the normal interactive path.  The small
+    key-reader loop below remains for unit tests and as a fallback if curses is
+    unavailable in a minimal environment.
+    """
+    try:
+        import curses
+    except ImportError:
+        return _CURSES_UNAVAILABLE
+
+    root = _build_review_tree(changes)
+    selected = set()
+    state = {"cwd": root, "cursor": 0, "message": None}
+
+    def run(stdscr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        while True:
+            cwd = state["cwd"]
+            entries = cwd.sorted_children()
+            if entries:
+                state["cursor"] = max(0, min(state["cursor"],
+                                               len(entries) - 1))
+            else:
+                state["cursor"] = 0
+
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            lines = _review_tree_lines(root, cwd, state["cursor"], selected,
+                                       message=state["message"])
+            state["message"] = None
+            for y, line in enumerate(lines[:max(0, height - 1)]):
+                try:
+                    attr = curses.A_REVERSE if line.startswith(">") else 0
+                    stdscr.addnstr(y, 0, line, max(1, width - 1), attr)
+                except curses.error:
+                    pass
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            key_name = {
+                curses.KEY_UP: "KEY_UP",
+                curses.KEY_DOWN: "KEY_DOWN",
+                curses.KEY_RIGHT: "KEY_RIGHT",
+                curses.KEY_LEFT: "KEY_LEFT",
+                curses.KEY_BACKSPACE: "KEY_BACKSPACE",
+                curses.KEY_ENTER: "KEY_ENTER",
+            }.get(key)
+            if key == 27:
+                seq = []
+                stdscr.nodelay(True)
+                try:
+                    for _ in range(16):
+                        nxt = stdscr.getch()
+                        if nxt == -1:
+                            break
+                        if 0 <= nxt <= 255:
+                            seq.append(nxt)
+                        decoded = _decode_tree_escape_sequence(bytes(seq))
+                        if decoded != "ESC":
+                            key_name = decoded
+                            break
+                    else:
+                        key_name = _decode_tree_escape_sequence(bytes(seq))
+                    if key_name is None:
+                        key_name = _decode_tree_escape_sequence(bytes(seq))
+                finally:
+                    stdscr.nodelay(False)
+            cwd = state["cwd"]
+            entries = cwd.sorted_children()
+            cursor = state["cursor"]
+            if key_name == "KEY_UP" or key == ord("k"):
+                if entries:
+                    state["cursor"] = (cursor - 1) % len(entries)
+            elif key_name == "KEY_DOWN" or key == ord("j"):
+                if entries:
+                    state["cursor"] = (cursor + 1) % len(entries)
+            elif key_name == "KEY_ENTER" or key in (10, 13):
+                if entries and entries[cursor].children:
+                    state["cwd"] = entries[cursor]
+                    state["cursor"] = 0
+            elif key_name in ("KEY_BACKSPACE", "KEY_LEFT") or key in (8, 127):
+                if cwd.parent is not None:
+                    state["cwd"] = cwd.parent
+                    state["cursor"] = 0
+            elif key == ord(" "):
+                if entries:
+                    _toggle_node_selection(entries[cursor], selected)
+            elif key in (ord("c"), ord("C")):
+                if selected:
+                    return sorted(selected)
+                state["message"] = (
+                    "No paths selected; select at least one path or press q "
+                    "to cancel.")
+            elif key in (ord("q"), ord("Q")) or key_name == "ESC":
+                return None
+
+    try:
+        return curses.wrapper(run)
+    except Exception:
+        return _CURSES_UNAVAILABLE
 
 
 def _select_review_paths_interactive(changes, key_reader=None, stream=None,
@@ -477,10 +630,20 @@ def _select_review_paths_interactive(changes, key_reader=None, stream=None,
     """Interactive tree selector for file/folder-level selective accept.
 
     Returns a list of selected change paths, or ``None`` when the user cancels.
-    The implementation is intentionally stdlib-only so ccc-agent keeps its
-    dependency-free deployment contract inside CCC images.
+    Real TTY use goes through curses so terminal arrow decoding is delegated to
+    the platform terminal library.  The injected key-reader path is kept for
+    tests and as a minimal fallback if curses is unavailable.
     """
     stream = sys.stderr if stream is None else stream
+    if key_reader is None and clear_screen:
+        try:
+            stdin_is_tty = sys.stdin.isatty()
+        except Exception:
+            stdin_is_tty = False
+        if stdin_is_tty:
+            curses_result = _select_review_paths_curses(changes)
+            if curses_result is not _CURSES_UNAVAILABLE:
+                return curses_result
     key_reader = key_reader or _read_tree_key
     root = _build_review_tree(changes)
     cwd = root
