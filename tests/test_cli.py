@@ -631,6 +631,39 @@ class TestMainRun(unittest.TestCase):
             session.session_id)
         self.assertEqual(persisted.agent_command, original)
 
+    def test_resume_separator_command_can_pass_its_own_cmd_option(self):
+        session = self.make_running_session(
+            session_id="agent-resume-cmd-passthrough-cli",
+            command=["sh", "-c", "echo original > original.txt"])
+
+        code = main(["resume", "--config", self.h.config_path,
+                     session.session_id, "--", "sh", "-c",
+                     "printf '%s' \"$1\" > passthrough.txt", "sh",
+                     "--cmd"], env={})
+
+        self.assertEqual(code, 0)
+        with open(os.path.join(self.h.base, self.h.workspace_rel,
+                               "passthrough.txt")) as fh:
+            self.assertEqual(fh.read(), "--cmd")
+
+    def test_resume_cmd_option_overrides_stored_command_once(self):
+        original = ["sh", "-c", "echo original > original.txt"]
+        session = self.make_running_session(
+            session_id="agent-resume-cmd-option-cli", command=original)
+
+        code = main(["resume", "--config", self.h.config_path,
+                     session.session_id, "--cmd",
+                     "sh -c 'echo cmdflag > cmdflag.txt'"], env={})
+
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, self.h.workspace_rel, "cmdflag.txt")))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.h.base, self.h.workspace_rel, "original.txt")))
+        persisted = SessionStore(os.path.join(self.h.tmp, "state")).load(
+            session.session_id)
+        self.assertEqual(persisted.agent_command, original)
+
     def test_resume_failed_session_requires_allow_failed_flag(self):
         session = self.make_running_session(
             session_id="agent-resume-failed-cli",
@@ -1424,7 +1457,10 @@ class TestShellCompletion(unittest.TestCase):
         self.assertIn("--force", matches)
         self.assertIn("--allow-failed", matches)
         self.assertIn("--agent", matches)
+        self.assertIn("--cmd", matches)
         self.assertIn("--full-isolation", matches)
+        self.assertEqual(self.complete(["ccc-agent", "resume", "agent-alpha",
+                                        "--cmd", ""]), [])
 
     def test_run_completion_lists_full_isolation_option(self):
         matches = self.complete(["ccc-agent", "run", "--"])

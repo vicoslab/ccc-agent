@@ -98,9 +98,10 @@ also resume a `pending-review` session to add more work before committing, or an
 `aborted` session to restart it under the same session id:
 
 ```bash
-ccc-agent resume <session>                  # re-run the exact stored command
-ccc-agent resume <session> -- bash          # custom recovery command/shell
-ccc-agent resume <session> -- sh -lc '...'  # any custom exec after --
+ccc-agent resume <session>                         # re-run the exact stored command
+ccc-agent resume <session> --cmd bash              # custom shell-style command string
+ccc-agent resume <session> --cmd 'codex exec ...'  # e.g. switch agents for follow-up work
+ccc-agent resume <session> -- sh -lc '...'         # exact custom argv after --
 ```
 
 For `running`, `pending-review`, and explicitly allowed `failed` sessions,

@@ -29,6 +29,7 @@ import json
 import os
 import shutil
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -1008,6 +1009,57 @@ def _print_failure_details(store, session, verbose=False):
             % (store.session_file(session.session_id), session.session_id))
 
 
+def _split_resume_cmd_option(value):
+    try:
+        command = shlex.split(value)
+    except ValueError as exc:
+        raise ValueError("argument --cmd: %s" % exc)
+    if not command:
+        raise ValueError("argument --cmd: expected a non-empty command")
+    return command
+
+
+def _extract_resume_cmd_option(argv):
+    """Pull ``--cmd CMD`` out before argparse's REMAINDER positional.
+
+    ``resume`` already accepts ``SESSION -- argv...`` for exact argv-style
+    overrides.  ``--cmd`` is a convenience shell-style string that must work
+    after the session id too, so argparse cannot parse it directly once the
+    REMAINDER positional starts.  Do not inspect tokens after a literal ``--``;
+    those belong to the resumed command, not to ``ccc-agent resume``.
+    """
+    argv = list(argv)
+    try:
+        separator = argv.index("--")
+    except ValueError:
+        scan = argv
+        tail = []
+    else:
+        scan = argv[:separator]
+        tail = argv[separator:]
+
+    remaining = []
+    command = None
+    i = 0
+    while i < len(scan):
+        token = scan[i]
+        if token == "--cmd":
+            if command is not None:
+                raise ValueError("argument --cmd: may only be specified once")
+            i += 1
+            if i >= len(scan):
+                raise ValueError("argument --cmd: expected one command string")
+            command = _split_resume_cmd_option(scan[i])
+        elif token.startswith("--cmd="):
+            if command is not None:
+                raise ValueError("argument --cmd: may only be specified once")
+            command = _split_resume_cmd_option(token.split("=", 1)[1])
+        else:
+            remaining.append(token)
+        i += 1
+    return remaining + tail, command
+
+
 def main_resume(argv=None, env=None, prog="ccc-agent resume"):
     parser = argparse.ArgumentParser(
         prog=prog,
@@ -1017,6 +1069,11 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
     parser.add_argument("--config", help="path to config.json")
     parser.add_argument("--agent", default=None,
                         help="agent kind label for the resumed command")
+    parser.add_argument("--cmd", metavar="CMD",
+                        help="shell-style command string to run instead of "
+                             "the stored command, e.g. --cmd 'bash' or "
+                             "--cmd 'codex exec ...'; for exact argv use "
+                             "SESSION -- argv ...")
     parser.add_argument("--force", action="store_true",
                         help="resume even if the old session mount still "
                              "appears active (use only after verifying no old "
@@ -1039,11 +1096,21 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
     parser.add_argument("session_id", metavar="session-id")
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="-- command to run (default: stored command)")
-    args = parser.parse_args(argv)
+    try:
+        parse_argv, cmd_option = _extract_resume_cmd_option(
+            list(sys.argv[1:] if argv is None else argv))
+    except ValueError as exc:
+        parser.error(str(exc))
+    args = parser.parse_args(parse_argv)
 
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]
+    if cmd_option is not None:
+        if command:
+            parser.error("argument --cmd: cannot be combined with a command "
+                         "after --")
+        command = cmd_option
     custom_command = bool(command)
 
     config = load_config(args.config, env=env)
@@ -1575,7 +1642,7 @@ _TOP_LEVEL_OPTIONS = ("--config", "--version", "--help")
 _GLOBAL_VALUE_OPTIONS = frozenset(("--config",))
 _CLEANUP_VALUE_OPTIONS = frozenset(("--older-than",))
 _REVIEW_VALUE_OPTIONS = frozenset(("--commit", "--apply-patch"))
-_RESUME_VALUE_OPTIONS = frozenset(("--agent",))
+_RESUME_VALUE_OPTIONS = frozenset(("--agent", "--cmd"))
 _RUN_OPTIONS = (
     "--agent", "--full-isolation", "--hide", "--policy",
     "--protect-agent-state", "--scope", "--verbose", "--workspace", "-v",
@@ -1589,7 +1656,7 @@ _REVIEW_OPTIONS = (
     "--help",
 )
 _RESUME_OPTIONS = (
-    "--agent", "--allow-failed", "--force", "--full-isolation",
+    "--agent", "--cmd", "--allow-failed", "--force", "--full-isolation",
     "--protect-agent-state", "--verbose", "-v", "--config", "--help",
 )
 
@@ -1802,7 +1869,7 @@ def _print_main_help(stream=None):
         "  run              start a contained BranchFS session; when no command "
         "is given, open the invoking shell (legacy alias: launch)\n"
         "  resume           reopen an existing session and run the stored "
-        "command, or a custom command after --\n\n"
+        "command, --cmd CMD, or a custom argv after --\n\n"
         "Session/control ops (run outside a contained session):\n"
         "  list, ls         list session records; accepts an optional session-id "
         "prefix\n"
@@ -1839,7 +1906,8 @@ def _print_main_help(stream=None):
         "Examples:\n"
         "  ccc-agent run --workspace /home/$USER/project -- codex exec 'fix bug'\n"
         "  ccc-agent resume <session>             # rerun the stored command\n"
-        "  ccc-agent resume <session> -- bash     # resume with a custom shell\n"
+        "  ccc-agent resume <session> --cmd bash  # resume with a custom shell\n"
+        "  ccc-agent resume <session> -- bash     # exact custom argv\n"
         "  ccc-agent list                         # or: ccc-agent ls\n"
         "  ccc-agent review <session> --accept\n"
         "  ccc-agent diff <session> <path>\n"

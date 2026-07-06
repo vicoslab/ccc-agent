@@ -51,8 +51,9 @@ created -> mounting -> running -> finalizing -> frozen
   `CCC_AGENT_SESSION` set, and finalizes on exit.
 - If a node/container reboots while a session is `running`, `ccc-agent resume
   <session>` reuses the existing branch bundle, re-mounts the saved roots, runs
-  the stored `agent_command` by default (or a custom command after `--`), and
-  then follows the same process-exit finalization path. Resume also supports
+  the stored `agent_command` by default (or a custom shell-style command with
+  `--cmd CMD` / exact argv after `--`), and then follows the same process-exit
+  finalization path. Resume also supports
   `pending-review` follow-up work by thawing the preserved branch before
   mounting. `aborted` sessions are restartable under the same session id, but
   because abort has already discarded the branch delta, resume recreates an
