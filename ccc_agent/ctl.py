@@ -1,7 +1,7 @@
 """Operator/hook control surface over branch sessions (ccc-agent).
 
-Hooks are *reporters*: ``finish-turn`` only records lifecycle events, and
-``check-before-final`` only reads live status to drive bounded self-repair.
+Hooks are *reporters*: ``turn-record`` only records lifecycle events, and
+``turn-check`` only reads live status to drive bounded self-repair.
 Commit authority stays here, in trusted supervisor code, behind explicit
 operator commands (or the runner's policy decision).
 """
@@ -24,7 +24,7 @@ from .runner import finalize_session
 from .paths import is_within
 from .session import TERMINAL_STATES
 
-# check-before-final outcomes (stable strings for hook adapters and logs)
+# turn-check outcomes (stable strings for hook adapters and logs)
 CHECK_ALLOW = "allow"          # change set clean: finish normally
 CHECK_REPAIR = "repair"        # dirty, budget left: agent should revert
 CHECK_EXHAUSTED = "exhausted"  # dirty, budget spent: defer to human review
@@ -1036,14 +1036,14 @@ class Controller(object):
         """
         out = out or sys.stdout
         session = self._load(session_id)
-        self._require_state(session, ("running",), "check-before-final")
+        self._require_state(session, ("running",), "turn-check")
 
         config = PolicyConfig.from_dict(session.policy)
         changes = []
         potential_conflicts = []
         for _name, root in sorted(session.protected_roots.items()):
             root_changes = self._live_status(session, root,
-                                             action="check-before-final")
+                                             action="turn-check")
             changes.extend(root_changes)
             for change in root_changes:
                 rel, delta, base = self._store_paths(root, change)

@@ -1129,9 +1129,9 @@ def _ctl_socket(args, env):
         return 0
     client = ControlClient(sock, token)
     try:
-        if args.cmd == "finalize-turn":
+        if args.cmd == "turn-finalize":
             resp = client.finalize_turn()
-        else:  # approve-turn
+        else:  # turn-approve
             paths = ([p for p in args.paths.split(",") if p]
                      if getattr(args, "paths", None) else None)
             resp = client.approve_turn(args.approval_token, args.decision,
@@ -1150,10 +1150,10 @@ def _ctl_socket(args, env):
             sys.stderr.write("  - %s\n" % path)
         sys.stderr.write(
             "ccc-agent: ask the user how to handle these, then run ONE of:\n"
-            "    ccc-agent approve-turn %s            # commit all\n"
-            "    ccc-agent approve-turn %s keep       # keep, don't commit\n"
-            "    ccc-agent approve-turn %s revert     # discard (you undo)\n"
-            "    ccc-agent approve-turn %s --paths a,b # commit only a,b\n"
+            "    ccc-agent turn-approve %s            # commit all\n"
+            "    ccc-agent turn-approve %s keep       # keep, don't commit\n"
+            "    ccc-agent turn-approve %s revert     # discard (you undo)\n"
+            "    ccc-agent turn-approve %s --paths a,b # commit only a,b\n"
             % (token2, token2, token2, token2))
         return 2
     if verdict == VERDICT_COMMITTED:
@@ -1175,11 +1175,31 @@ def _ctl_socket(args, env):
 
 _SESSION_ID_CTL_OPS = (
     "show", "status", "commit", "abort", "thaw", "finish",
-    "finish-turn", "check-before-final",
+    "turn-record", "turn-check",
 )
 _BATCH_SESSION_ID_CTL_OPS = (
-    "commit", "abort", "thaw", "finish", "finish-turn",
+    "commit", "abort", "thaw", "finish", "turn-record",
 )
+_CTL_COMMAND_HELP = {
+    "list": "list session records; accepts an optional session-id prefix",
+    "cleanup": "remove old terminal session bundles after an age check",
+    "show": "dump the full persisted session record as JSON",
+    "status": "read live BranchFS status for each protected root",
+    "diff": "show changed paths, or a unified diff for one changed file",
+    "review": ("browse pending/frozen changes and choose "
+               "commit/select/reject/later"),
+    "commit": "commit pending/frozen session deltas to the real underlay",
+    "abort": "discard session branch deltas and mark the session aborted",
+    "thaw": "reopen a pending-review branch for more work",
+    "finish": "finalize a running/manual session now (freeze + policy review)",
+    "turn-record": "record a turn-boundary event for a session-id hook adapter",
+    "turn-check": ("check live changes for hook-driven repair before "
+                           "finalizing"),
+    "turn-finalize": ("inside-session plugin op: finalize the current turn "
+                      "via socket"),
+    "turn-approve": ("inside-session plugin op: answer a pending turn "
+                     "approval token"),
+}
 
 
 def _nonnegative_days(value):
@@ -1218,7 +1238,7 @@ def _run_batch_session_op(controller, cmd, session_ids, stream=None):
                 session = controller.thaw(session_id)
             elif cmd == "finish":
                 session = controller.finish(session_id)
-            elif cmd == "finish-turn":
+            elif cmd == "turn-record":
                 session = controller.finish_turn(session_id)
             else:
                 raise ControlError("unsupported batch op: %s" % cmd)
@@ -1229,6 +1249,16 @@ def _run_batch_session_op(controller, cmd, session_ids, stream=None):
         stream.write("%s: ok%s\n"
                      % (session.session_id, _batch_ok_detail(cmd, session)))
     return 1 if failed else 0
+
+
+def _add_ctl_parser(subparsers, name, aliases=()):
+    kwargs = {
+        "help": _CTL_COMMAND_HELP[name],
+        "description": _CTL_COMMAND_HELP[name],
+    }
+    if aliases:
+        kwargs["aliases"] = aliases
+    return subparsers.add_parser(name, **kwargs)
 
 
 def main_ctl(argv=None, env=None, prog="ccc-agent"):
@@ -1246,21 +1276,19 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
         description="Inspect and control BranchFS agent sessions.")
     parser.add_argument("--config", help="path to config.json")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    lp = sub.add_parser("list")
+    lp = _add_ctl_parser(sub, "list", aliases=("ls",))
     lp.add_argument("session_id", nargs="?", metavar="session-id-prefix",
                     help="optional session id prefix filter")
-    cp = sub.add_parser(
-        "cleanup",
-        help="remove old closed session bundles (default: older than 30 days)")
+    cp = _add_ctl_parser(sub, "cleanup")
     cp.add_argument("--older-than", metavar="DAYS", type=_nonnegative_days,
                     default=30,
                     help="remove closed sessions older than DAYS (default: 30)")
     cp.add_argument("--dry-run", action="store_true",
                     help="show what would be removed without deleting")
     for name in _SESSION_ID_CTL_OPS:
-        p = sub.add_parser(name)
+        p = _add_ctl_parser(sub, name)
         _add_session_id_arg(p, multiple=name in _BATCH_SESSION_ID_CTL_OPS)
-    dp = sub.add_parser("diff", help="show changed paths, or a unified diff for one file")
+    dp = _add_ctl_parser(sub, "diff")
     dp.add_argument("--show-ignored", action="store_true",
                     help="also list policy-ignored/cache/runtime changes")
     dp.add_argument("--show-file-diffs", action="store_true",
@@ -1268,14 +1296,13 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                          "(binary/non-text files are skipped)")
     _add_session_id_arg(dp)
     dp.add_argument("path", nargs="?", help="optional changed file to diff")
-    rv = sub.add_parser(
-        "review", help="browse changes and, on a TTY, choose a review decision",
-        description=("Browse a pending/frozen session's changes. With no "
-                     "action flags, an interactive TTY prompts for a decision "
-                     "after showing the summary."),
-        epilog=("Prompt choices: yes/y commits, select/s opens a tree selector "
-                "for file/folder-level commit, no/n discards, and later/l/Esc "
-                "keeps the session for review."))
+    rv = _add_ctl_parser(sub, "review")
+    rv.description = ("Browse a pending/frozen session's changes. With no "
+                      "action flags, an interactive TTY prompts for a decision "
+                      "after showing the summary.")
+    rv.epilog = ("Prompt choices: yes/y commits, select/s opens a tree selector "
+                 "for file/folder-level commit, no/n discards, and later/l/Esc "
+                 "keeps the session for review.")
     _add_session_id_arg(rv)
     rv.add_argument("--accept", action="store_true", help="commit everything")
     rv.add_argument("--include-ignored", action="store_true",
@@ -1298,8 +1325,8 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                     help="apply a (possibly pruned) patch to base for "
                          "line-level commit")
     # per-turn socket ops (no session_id; identified by the socket+token)
-    sub.add_parser("finalize-turn")
-    ap = sub.add_parser("approve-turn")
+    _add_ctl_parser(sub, "turn-finalize")
+    ap = _add_ctl_parser(sub, "turn-approve")
     ap.add_argument("approval_token")
     ap.add_argument("decision", nargs="?", default="yes",
                     help="yes (commit all, default) | keep (don't commit) | "
@@ -1308,7 +1335,7 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                                     "file-by-file; the rest are held")
     args = parser.parse_args(argv)
 
-    if args.cmd in ("finalize-turn", "approve-turn"):
+    if args.cmd in ("turn-finalize", "turn-approve"):
         return _ctl_socket(args, env)
 
     config = load_config(args.config, env=env)
@@ -1316,7 +1343,7 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
     controller = Controller(store=store, backend=backend, alias_map=alias_map)
 
     try:
-        if args.cmd == "list":
+        if args.cmd in ("list", "ls"):
             controller.list(getattr(args, "session_id", None))
         elif args.cmd == "cleanup":
             controller.cleanup(older_than_days=args.older_than,
@@ -1355,7 +1382,7 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                                  % (session.session_id, session.state))
         elif args.cmd in _BATCH_SESSION_ID_CTL_OPS:
             return _run_batch_session_op(controller, args.cmd, args.session_ids)
-        elif args.cmd == "check-before-final":
+        elif args.cmd == "turn-check":
             # exit 2 = "block the stop, repair": the only code that loops the
             # agent. Allow and exhausted both exit 0 so hooks cannot livelock.
             if controller.check_before_final(args.session_id) == CHECK_REPAIR:
@@ -1383,14 +1410,15 @@ def main_softsandbox(argv=None, env=None):
 
 
 _CTL_OPS = (set(_SESSION_ID_CTL_OPS) | {
-    "list", "cleanup", "diff", "review", "finalize-turn", "approve-turn",
+    "list", "ls", "cleanup", "diff", "review", "turn-finalize",
+    "turn-approve",
 })
 _SESSION_ID_COMPLETION_OPS = (
-    set(_SESSION_ID_CTL_OPS) | {"diff", "review", "list", "resume"}
+    set(_SESSION_ID_CTL_OPS) | {"diff", "review", "list", "ls", "resume"}
 )
 _MULTI_SESSION_ID_COMPLETION_OPS = set(_BATCH_SESSION_ID_CTL_OPS)
 _MAIN_OPS = tuple(sorted(_CTL_OPS | {
-    "run", "launch", "resume", "setup", "softsandbox", "completion",
+    "run", "resume", "setup", "softsandbox", "completion",
 }))
 _TOP_LEVEL_OPTIONS = ("--config", "--version", "--help")
 _GLOBAL_VALUE_OPTIONS = frozenset(("--config",))
@@ -1617,24 +1645,50 @@ def _print_main_help(stream=None):
         "Unified CCC agent containment CLI.\n\n"
         "Global options:\n"
         "  --version        print the ccc-agent release version\n\n"
-        "Primary ops:\n"
-        "  run              run a command, or the current shell when omitted, "
-        "in a contained BranchFS session\n"
-        "  resume           re-mount/restart a session for crash recovery or "
-        "follow-up work\n"
+        "Primary user ops:\n"
+        "  run              start a contained BranchFS session; when no command "
+        "is given, open the invoking shell (legacy alias: launch)\n"
+        "  resume           reopen an existing session and run the stored "
+        "command, or a custom command after --\n\n"
+        "Session/control ops (run outside a contained session):\n"
+        "  list, ls         list session records; accepts an optional session-id "
+        "prefix\n"
+        "  review           browse pending/frozen changes and choose "
+        "commit/select/reject/later\n"
+        "  diff             show changed paths, or a unified diff for one "
+        "changed file\n"
+        "  show             dump the full persisted session record as JSON\n"
+        "  status           read live BranchFS status for each protected root\n"
+        "  finish           finalize a running/manual session now "
+        "(freeze + policy review)\n"
+        "  commit           commit pending/frozen session deltas to the real "
+        "underlay; repeat IDs to batch\n"
+        "  abort            discard session branch deltas and mark aborted; "
+        "repeat IDs to batch\n"
+        "  thaw             reopen a pending-review branch for more work\n"
+        "  cleanup          remove old terminal session bundles after an age "
+        "check\n\n"
+        "Plugin/hook ops (normally invoked by agent plugins/hooks):\n"
+        "  turn-finalize   inside session: finalize the current turn via the "
+        "control socket\n"
+        "  turn-approve    inside session: answer a pending per-turn approval "
+        "token\n"
+        "  turn-check      hook adapter: ask a running session to repair "
+        "policy/conflict issues before finalizing\n"
+        "  turn-record     hook adapter: record a turn-boundary event for a "
+        "session id\n\n"
+        "Auxiliary setup/debug ops:\n"
         "  setup            write config, plugin entries, and optional shims\n"
         "  completion       print shell completion code (bash, zsh, fish)\n"
-        "  softsandbox      diagnostic non-FUSE soft sandbox helper\n\n"
-        "Session/control ops:\n"
-        "  list, cleanup, show, status, diff, review, commit, abort, thaw, finish\n"
-        "  finish-turn, check-before-final, finalize-turn, approve-turn\n\n"
+        "  softsandbox      run the legacy diagnostic non-FUSE soft sandbox\n\n"
         "Examples:\n"
         "  ccc-agent run --workspace /home/$USER/project -- codex exec 'fix bug'\n"
         "  ccc-agent resume <session>             # rerun the stored command\n"
         "  ccc-agent resume <session> -- bash     # resume with a custom shell\n"
-        "  ccc-agent list\n"
-        "  ccc-agent cleanup --older-than 30 --dry-run\n"
+        "  ccc-agent list                         # or: ccc-agent ls\n"
         "  ccc-agent review <session> --accept\n"
+        "  ccc-agent diff <session> <path>\n"
+        "  ccc-agent cleanup --older-than 30 --dry-run\n"
         "  ccc-agent setup --system --enable-shims\n")
 
 

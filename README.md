@@ -43,16 +43,16 @@ Outcome per policy:
 
 ### Per-turn review (interactive, in the agent UI)
 
-At each Stop boundary the agent's hook calls `ccc-agent finalize-turn` over
+At each Stop boundary the agent's hook calls `ccc-agent turn-finalize` over
 the control socket. In-scope changes auto-commit and the agent continues;
 out-of-scope changes are reported to the user, who responds (relayed by the
 agent) with one of:
 
 ```bash
-ccc-agent approve-turn <token>            # accept all flagged changes
-ccc-agent approve-turn <token> keep       # keep deltas, don't commit (continue)
-ccc-agent approve-turn <token> revert     # reject; the agent undoes them
-ccc-agent approve-turn <token> --paths a,b # commit only a,b (file-by-file)
+ccc-agent turn-approve <token>            # accept all flagged changes
+ccc-agent turn-approve <token> keep       # keep deltas, don't commit (continue)
+ccc-agent turn-approve <token> revert     # reject; the agent undoes them
+ccc-agent turn-approve <token> --paths a,b # commit only a,b (file-by-file)
 ```
 
 ### Post-session review (operator) + lingering sessions
@@ -60,7 +60,7 @@ ccc-agent approve-turn <token> --paths a,b # commit only a,b (file-by-file)
 A session that exits with un-committed changes stays as a reviewable branch:
 
 ```bash
-ccc-agent list                              # sessions + states
+ccc-agent list                              # sessions + states (alias: ccc-agent ls)
 ccc-agent review <session>                  # browse, then accept/select/reject/later on a TTY
 ccc-agent diff <session>                    # read-only changed-path summary
 ccc-agent diff <session> --show-file-diffs  # append hunks for changed text files; binary/non-text skipped
@@ -176,7 +176,8 @@ remain readable through the shared agent-state bind.
 | Piece | Role |
 |---|---|
 | `bin/ccc-agent` / `ccc-agent run` | trusted launcher: session + branch bundle + agent/shell + finalize; also used by transparent shims (workspace = `$PWD`) |
-| `ccc-agent list/show/diff/...` | operator + in-sandbox control ops: list/show/diff/commit/abort/review/finalize-turn/approve-turn; `cleanup` prunes old closed session bundles |
+| `ccc-agent list` / `ccc-agent ls` / `show` / `diff` / ... | operator controls outside a contained session: list/show/diff/review/commit/abort/finish/thaw/cleanup |
+| `ccc-agent turn-finalize` / `turn-approve` | in-sandbox plugin control ops over the session control socket |
 | `ccc-agent setup` | installer/wiring op: config, plugin entries, optional transparent PATH shims |
 | `ccc_agent/` | stdlib-only Python: session store, policy engine, BranchFS driver, bwrap assembler, control socket + per-turn handler |
 | `shims/ccc-agent-shim.sh` | transparent `codex`/`claude`/... PATH shims |
@@ -248,9 +249,9 @@ part of normal setup. `ccc-agent completion <bash|zsh|fish>` remains available
 only as a debug / one-off fallback.
 
 The completion hook reads the configured session store and completes optional
-`session-id` prefixes for `list`, plus required `session-id` arguments for
+`session-id` prefixes for `list`/`ls`, plus required `session-id` arguments for
 `show`, `status`, `diff`, `review`, `commit`, `abort`, `thaw`, `finish`,
-`finish-turn`, and `check-before-final`. It also completes `cleanup` options
+`turn-record`, and `turn-check`. It also completes `cleanup` options
 such as `--older-than` and `--dry-run`.
 
 `ccc-agent setup` does what pip can't: writes `config.json` with the
@@ -295,7 +296,7 @@ Hard rules:
   agent's view (bwrap mode enforces this by exposing only the view; in `none`
   debug mode the `.ccc-agent` deny pattern is the only fallback);
 - hooks report and at most request self-repair (`ccc-agent
-  check-before-final` exits 2 with the offending paths while the per-session
+  turn-check` exits 2 with the offending paths while the per-session
   repair budget lasts); only the supervisor/operator commits.
 
 Shims (optional, after the explicit wrapper works for you):

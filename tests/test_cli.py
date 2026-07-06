@@ -917,6 +917,33 @@ class TestMainCtl(unittest.TestCase):
         self.assertEqual(main_ctl(["--config", self.h.config_path, "show",
                                    sid], env={}), 0)
 
+    def test_ls_alias_lists_sessions(self):
+        main_run([
+            "--config", self.h.config_path,
+            "--workspace", "/storage/user/Projects/proj-a",
+            "--", "sh", "-c", "echo x > f.txt",
+        ], env={})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main_ctl(["--config", self.h.config_path, "ls"], env={})
+
+        self.assertEqual(code, 0)
+        self.assertIn(self.h.sessions()[0], out.getvalue())
+
+    def test_control_help_describes_subcommands(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                main_ctl(["--help"], env={})
+
+        self.assertEqual(cm.exception.code, 0)
+        text = out.getvalue()
+        self.assertIn("list session records", text)
+        self.assertIn("ls", text)
+        self.assertIn("finalize the current turn", text)
+        self.assertIn("inside-session plugin op: answer a pending turn", text)
+        self.assertIn("approval token", text)
+
     def test_diff_accepts_optional_path(self):
         base_path = os.path.join(self.h.base, self.h.workspace_rel, "cli.txt")
         with open(base_path, "w") as fh:
@@ -1102,7 +1129,7 @@ class TestMainCtl(unittest.TestCase):
 
         for op, ids in (("thaw", (thaw1, thaw2)),
                         ("finish", (run1, run2)),
-                        ("finish-turn", (turn1, turn2))):
+                        ("turn-record", (turn1, turn2))):
             with self.subTest(op=op):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
@@ -1200,7 +1227,7 @@ class TestShellCompletion(unittest.TestCase):
 
     def test_session_id_ops_complete_session_ids(self):
         ops = (list(getattr(cli_mod, "_SESSION_ID_CTL_OPS"))
-               + ["diff", "review", "list"])
+               + ["diff", "review", "list", "ls"])
         for op in ops:
             with self.subTest(op=op):
                 self.assertEqual(
@@ -1258,10 +1285,23 @@ class TestShellCompletion(unittest.TestCase):
         self.assertIn("agent-alpha", text)
         self.assertNotIn("agent-beta", text)
 
+    def test_ls_alias_accepts_completed_session_prefix(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["--config", self.h.config_path, "ls", "agent-a"],
+                        env={})
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("agent-alpha", text)
+        self.assertNotIn("agent-beta", text)
+
     def test_top_level_completion_lists_matching_ops(self):
         matches = self.complete(["ccc-agent", "st"])
         self.assertIn("status", matches)
         self.assertIn("cleanup", self.complete(["ccc-agent", "cl"]))
+        list_matches = self.complete(["ccc-agent", "l"])
+        self.assertIn("list", list_matches)
+        self.assertIn("ls", list_matches)
 
     def test_cleanup_completion_lists_options_not_session_ids(self):
         matches = self.complete(["ccc-agent", "cleanup", "--"])
@@ -1317,6 +1357,36 @@ class TestUnifiedMain(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.getvalue(), "ccc-agent v0.2\n")
 
+    def test_top_level_help_groups_commands_by_audience(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["--help"], env={})
+
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        primary = text.index("Primary user ops:")
+        session = text.index("Session/control ops")
+        plugin = text.index("Plugin/hook ops")
+        auxiliary = text.index("Auxiliary setup/debug ops:")
+        self.assertLess(primary, session)
+        self.assertLess(session, plugin)
+        self.assertLess(plugin, auxiliary)
+        primary_text = text[primary:session]
+        self.assertIn("  run", primary_text)
+        self.assertIn("  resume", primary_text)
+        self.assertNotIn("setup", primary_text)
+        session_text = text[session:plugin]
+        self.assertIn("list, ls", session_text)
+        self.assertIn("review", session_text)
+        self.assertIn("commit", session_text)
+        plugin_text = text[plugin:auxiliary]
+        self.assertIn("turn-finalize", plugin_text)
+        self.assertIn("turn-approve", plugin_text)
+        auxiliary_text = text[auxiliary:]
+        self.assertIn("setup", auxiliary_text)
+        self.assertIn("completion", auxiliary_text)
+        self.assertIn("softsandbox", auxiliary_text)
+
 
 class TestMainCtlCheckBeforeFinal(unittest.TestCase):
     """Exit-code contract for the hook: 2 = repair, 0 = allow/exhausted."""
@@ -1359,7 +1429,7 @@ class TestMainCtlCheckBeforeFinal(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = main_ctl(["--config", self.h.config_path,
-                             "check-before-final", sid], env={})
+                             "turn-check", sid], env={})
         return code, out.getvalue()
 
     def test_repair_then_exhausted_exit_codes(self):

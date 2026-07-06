@@ -225,7 +225,7 @@ class TestHookScripts(unittest.TestCase):
         self._check_syntax(os.path.join(HOOKS, "codex-stop-hook.sh"))
 
     def test_hermes_finish_turn_syntax(self):
-        self._check_syntax(os.path.join(HOOKS, "hermes-finish-turn.sh"))
+        self._check_syntax(os.path.join(HOOKS, "hermes-turn-record.sh"))
 
     def test_claude_hook_exits_0_without_session(self):
         result = subprocess.run(

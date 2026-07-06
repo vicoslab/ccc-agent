@@ -180,7 +180,7 @@ class TestTurnController(unittest.TestCase):
 
     def test_handle_dispatch(self):
         self.h.write("Projects/proj-a/a.txt", "one")
-        resp = self.h.tc.handle({"op": "finalize-turn"})
+        resp = self.h.tc.handle({"op": "turn-finalize"})
         self.assertEqual(resp["verdict"], VERDICT_COMMITTED)
         bad = self.h.tc.handle({"op": "nonsense"})
         self.assertFalse(bad["ok"])

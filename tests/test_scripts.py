@@ -16,8 +16,8 @@ SHIM_SH = os.path.join(ASSETS, "shims", "ccc-agent-shim.sh")
 SOFTSANDBOX_SH = os.path.join(ASSETS, "scripts", "softsandbox.sh")
 HOOKS = [os.path.join(ASSETS, "hooks", name)
          for name in ("claude-stop-hook.sh", "codex-stop-hook.sh",
-                      "hermes-finish-turn.sh")]
-# hooks with blocking stop semantics (check-before-final self-repair)
+                      "hermes-turn-record.sh")]
+# hooks with blocking stop semantics (turn-check self-repair)
 STOP_HOOKS = [os.path.join(ASSETS, "hooks", name)
               for name in ("claude-stop-hook.sh", "codex-stop-hook.sh")]
 # plugin-bundled stop hooks (the auto-injected per-contained-run path)
@@ -67,7 +67,7 @@ class TestPluginAssets(unittest.TestCase):
         with open(os.path.join(root, "__init__.py")) as fh:
             src = fh.read()
         self.assertIn("def register", src)
-        self.assertIn("finalize-turn", src)
+        self.assertIn("turn-finalize", src)
 
     def test_bundled_stop_hooks_match(self):
         # the claude/codex plugin stop hooks are the same adapter; guard drift
@@ -158,7 +158,7 @@ class TestShim(unittest.TestCase):
 
 
 class TestStopHookSelfRepair(unittest.TestCase):
-    """check-before-final wiring: exit 2 blocks the stop so the agent can
+    """turn-check wiring: exit 2 blocks the stop so the agent can
     repair; every other ctl outcome degrades to report-only (never blocks)."""
 
     def setUp(self):
@@ -172,7 +172,7 @@ class TestStopHookSelfRepair(unittest.TestCase):
         with open(self.ctl, "w") as fh:
             fh.write("#!/bin/sh\n"
                      "echo \"CALLED $1\"\n"
-                     "if [ \"$1\" = check-before-final ]; then exit %d; fi\n"
+                     "if [ \"$1\" = turn-check ]; then exit %d; fi\n"
                      "exit 0\n" % check_rc)
         os.chmod(self.ctl, 0o755)
 
@@ -190,27 +190,27 @@ class TestStopHookSelfRepair(unittest.TestCase):
             proc = self.run_hook(hook)
             self.assertEqual(proc.returncode, 2, "%s: %s" % (hook, proc.stderr))
             # repair instructions must reach the harness on stderr
-            self.assertIn("check-before-final", proc.stderr)
-            self.assertNotIn("finish-turn", proc.stdout + proc.stderr)
+            self.assertIn("turn-check", proc.stderr)
+            self.assertNotIn("turn-record", proc.stdout + proc.stderr)
 
     def test_clean_check_reports_turn_and_exits_zero(self):
         for hook in STOP_HOOKS:
             self.fake_ctl(0)
             proc = self.run_hook(hook)
             self.assertEqual(proc.returncode, 0, "%s: %s" % (hook, proc.stderr))
-            self.assertIn("CALLED finish-turn", proc.stdout)
+            self.assertIn("CALLED turn-record", proc.stdout)
 
     def test_ctl_failure_never_blocks_stop(self):
         for hook in STOP_HOOKS:
             self.fake_ctl(1)  # e.g. ControlError from a racing finalize
             proc = self.run_hook(hook)
             self.assertEqual(proc.returncode, 0, "%s: %s" % (hook, proc.stderr))
-            self.assertIn("CALLED finish-turn", proc.stdout)
+            self.assertIn("CALLED turn-record", proc.stdout)
 
 
 class TestStopHookControlSocket(unittest.TestCase):
     """When CCC_AGENT_CONTROL_SOCK is set the hook signals the supervisor via
-    `ccc-agent finalize-turn` and propagates its exit code, instead of the
+    `ccc-agent turn-finalize` and propagates its exit code, instead of the
     store-based self-repair path."""
 
     def setUp(self):
@@ -224,7 +224,7 @@ class TestStopHookControlSocket(unittest.TestCase):
         with open(self.ctl, "w") as fh:
             fh.write("#!/bin/sh\n"
                      "echo \"CALLED $1\" 1>&2\n"
-                     "if [ \"$1\" = finalize-turn ]; then exit %d; fi\n"
+                     "if [ \"$1\" = turn-finalize ]; then exit %d; fi\n"
                      "exit 0\n" % finalize_rc)
         os.chmod(self.ctl, 0o755)
 
@@ -242,15 +242,15 @@ class TestStopHookControlSocket(unittest.TestCase):
             self.fake_ctl(0)
             proc = self.run_hook(hook)
             self.assertEqual(proc.returncode, 0, "%s: %s" % (hook, proc.stderr))
-            self.assertIn("CALLED finalize-turn", proc.stderr)
-            self.assertNotIn("check-before-final", proc.stderr)
+            self.assertIn("CALLED turn-finalize", proc.stderr)
+            self.assertNotIn("turn-check", proc.stderr)
 
     def test_needs_approval_blocks_stop(self):
         for hook in STOP_HOOKS:
             self.fake_ctl(2)
             proc = self.run_hook(hook)
             self.assertEqual(proc.returncode, 2, "%s: %s" % (hook, proc.stderr))
-            self.assertIn("CALLED finalize-turn", proc.stderr)
+            self.assertIn("CALLED turn-finalize", proc.stderr)
 
 
 class TestHooksAreNoopsOutsideSessions(unittest.TestCase):

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end per-turn commit + in-UI-relayed approval on real FUSE + real bwrap.
 # A scripted "agent" runs INSIDE the sandbox and drives the control socket:
-#   turn 1 (in-scope)     -> finalize-turn -> committed to base mid-session
-#   turn 2 (out-of-scope) -> finalize-turn -> needs-approval + token
-#                         -> approve-turn yes -> committed
+#   turn 1 (in-scope)     -> turn-finalize -> committed to base mid-session
+#   turn 2 (out-of-scope) -> turn-finalize -> needs-approval + token
+#                         -> turn-approve yes -> committed
 # Proves: base updated at the Stop boundary while the mount stays live, and
 # out-of-scope only reaches base via a relayed approval.
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)
@@ -36,18 +36,18 @@ cat > "$PROJ_BASE/Projects/proj-a/run-turns.sh" <<EOF
 CTL="/ccc-agent/bin/ccc-agent"
 echo "=== turn1: in-scope write + finalize ==="
 echo "turn1" > result1.txt
-"\$CTL" finalize-turn; echo "finalize1_rc=\$?"
+"\$CTL" turn-finalize; echo "finalize1_rc=\$?"
 echo "mount-alive-after-commit: \$(cat result1.txt)"
 echo "=== turn2: out-of-scope write + finalize (expect needs-approval) ==="
 echo "turn2-inscope" > result2.txt
 echo "escaped" > /storage/user/escape.txt
-out=\$("\$CTL" finalize-turn 2>&1); rc=\$?
+out=\$("\$CTL" turn-finalize 2>&1); rc=\$?
 echo "\$out"
 echo "finalize2_rc=\$rc"
-tok=\$(printf '%s\n' "\$out" | sed -n 's/.*approve-turn \([0-9a-f][0-9a-f]*\).*/\1/p' | head -1)
+tok=\$(printf '%s\n' "\$out" | sed -n 's/.*turn-approve \([0-9a-f][0-9a-f]*\).*/\1/p' | head -1)
 echo "captured_token=\$tok"
-echo "=== user approves -> approve-turn yes ==="
-"\$CTL" approve-turn "\$tok" yes; echo "approve_rc=\$?"
+echo "=== user approves -> turn-approve yes ==="
+"\$CTL" turn-approve "\$tok" yes; echo "approve_rc=\$?"
 EOF
 
 cat > "$CFG" <<EOF

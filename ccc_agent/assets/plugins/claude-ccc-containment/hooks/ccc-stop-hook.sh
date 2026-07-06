@@ -31,10 +31,10 @@ fi
 # commits the turn's in-scope changes and exits 0 (the stop proceeds); on
 # out-of-scope changes it exits 2 with the offending paths and an approval
 # token on stderr, which the agent feeds back to the user before running
-# `ccc-agent approve-turn <token>`.
+# `ccc-agent turn-approve <token>`.
 if [ -n "${CCC_AGENT_CONTROL_SOCK:-}" ]; then
     rc=0
-    "$CTL" finalize-turn || rc=$?
+    "$CTL" turn-finalize || rc=$?
     exit "$rc"
 fi
 
@@ -43,10 +43,10 @@ fi
 # agent reverts the flagged paths; any other outcome must NOT block (finalize
 # parks dirty sessions as pending-review for a human).
 rc=0
-"$CTL" check-before-final "$CCC_AGENT_SESSION" 1>&2 || rc=$?
+"$CTL" turn-check "$CCC_AGENT_SESSION" 1>&2 || rc=$?
 if [ "$rc" -eq 2 ]; then
     exit 2
 fi
 
-"$CTL" finish-turn "$CCC_AGENT_SESSION" || true
+"$CTL" turn-record "$CCC_AGENT_SESSION" || true
 exit 0

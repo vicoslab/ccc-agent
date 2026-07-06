@@ -15,7 +15,7 @@ changes without a relayed user approval; an agent can at worst spoof its OWN
 approval (accepted) but can never escape the in-scope policy.
 
 Protocol: one JSON object per line, request then response, connection per call.
-  request : {"version":1, "token":..., "op":"finalize-turn"|"approve-turn", ...}
+  request : {"version":1, "token":..., "op":"turn-finalize"|"turn-approve", ...}
   response: {"ok":true, "verdict":..., ...} | {"ok":false, "error":...}
 """
 
@@ -26,7 +26,7 @@ import threading
 
 PROTOCOL_VERSION = 1
 
-# verdicts returned by finalize-turn / approve-turn
+# verdicts returned by turn-finalize / turn-approve
 VERDICT_COMMITTED = "committed"          # in-scope (or approved): applied to base
 VERDICT_NEEDS_APPROVAL = "needs-approval"  # out-of-scope: relay to the user
 VERDICT_NOOP = "noop"                    # nothing changed this turn
@@ -175,7 +175,7 @@ class ControlClient(object):
 
     def finalize_turn(self):
         """Signal end-of-turn (Stop boundary). Returns the supervisor verdict."""
-        return self._request({"op": "finalize-turn"})
+        return self._request({"op": "turn-finalize"})
 
     def approve_turn(self, approval_token, decision, paths=None):
         """Relay the user's decision for an out-of-scope turn.
@@ -185,7 +185,7 @@ class ControlClient(object):
         undo).  ``paths`` (optional) selects a file-level subset to commit; the
         rest are held.
         """
-        req = {"op": "approve-turn",
+        req = {"op": "turn-approve",
                "approval_token": approval_token,
                "decision": decision}
         if paths:
