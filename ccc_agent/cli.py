@@ -344,14 +344,17 @@ class _ReviewTreeNode(object):
         self.parent = parent
         self.children = {}
         self.change = None
+        self._changed_paths_cache = None
 
     def changed_paths(self):
-        paths = []
-        if self.change is not None:
-            paths.append(self.change.path)
-        for child in self.sorted_children():
-            paths.extend(child.changed_paths())
-        return paths
+        if self._changed_paths_cache is None:
+            paths = []
+            if self.change is not None:
+                paths.append(self.change.path)
+            for child in self.sorted_children():
+                paths.extend(child.changed_paths())
+            self._changed_paths_cache = tuple(paths)
+        return self._changed_paths_cache
 
     def sorted_children(self):
         return [self.children[name] for name in sorted(self.children)]
@@ -516,6 +519,28 @@ def _read_tree_key():
 _CURSES_UNAVAILABLE = object()
 
 
+def _configure_curses_default_colors(curses_module, stdscr):
+    """Use the terminal's default foreground/background colors in curses.
+
+    Without ``use_default_colors`` curses often paints blank cells with its
+    compiled-in black background, which makes the selector look like a solid
+    black panel in terminals that use a different default theme.
+    """
+    normal_attr = 0
+    try:
+        curses_module.start_color()
+        curses_module.use_default_colors()
+        curses_module.init_pair(1, -1, -1)
+        normal_attr = curses_module.color_pair(1)
+        try:
+            stdscr.bkgdset(" ", normal_attr)
+        except curses_module.error:
+            pass
+    except Exception:
+        normal_attr = 0
+    return normal_attr, normal_attr | curses_module.A_REVERSE
+
+
 def _select_review_paths_curses(changes):
     """Curses-backed selector for real terminals.
 
@@ -539,6 +564,8 @@ def _select_review_paths_curses(changes):
         except curses.error:
             pass
         stdscr.keypad(True)
+        normal_attr, cursor_attr = _configure_curses_default_colors(
+            curses, stdscr)
         while True:
             cwd = state["cwd"]
             entries = cwd.sorted_children()
@@ -555,7 +582,7 @@ def _select_review_paths_curses(changes):
             state["message"] = None
             for y, line in enumerate(lines[:max(0, height - 1)]):
                 try:
-                    attr = curses.A_REVERSE if line.startswith(">") else 0
+                    attr = cursor_attr if line.startswith(">") else normal_attr
                     stdscr.addnstr(y, 0, line, max(1, width - 1), attr)
                 except curses.error:
                     pass
@@ -685,11 +712,41 @@ def _select_review_paths_interactive(changes, key_reader=None, stream=None,
             return None
 
 
-def _selective_accept_review(controller, session, stream=None,
-                             include_ignored=False):
-    stream = sys.stderr if stream is None else stream
-    changes = [change for _root, change in controller._changes(
+def _selector_changes_for_review(controller, session, include_ignored=False):
+    """Fast path for selector contents.
+
+    Prefer generated review artifacts for frozen/pending-review sessions so
+    opening the selective-accept browser does not run a second expensive
+    BranchFS status scan immediately after the review summary was displayed.
+    The eventual commit still calls ``Controller.review(... commit_paths=...)``
+    and rechecks authoritative branch/store state before mutating storage.
+    """
+    try:
+        review = controller.store.review_dir(session.session_id)
+        if (controller._can_use_stored_review(session) and
+                os.path.isdir(review)):
+            saw_status, changes, ignored = controller._stored_review_changes(
+                session, review)
+            if saw_status:
+                if include_ignored:
+                    return list(changes) + [item.change for item in ignored]
+                return list(changes)
+    except Exception:
+        pass
+    return [change for _root, change in controller._changes(
         session, include_ignored=include_ignored)]
+
+
+def _selective_accept_review(controller, session, stream=None,
+                             include_ignored=False, selector_changes=None):
+    stream = sys.stderr if stream is None else stream
+    if selector_changes is None:
+        changes = [change for _root, change in controller._changes(
+            session, include_ignored=include_ignored)]
+    elif callable(selector_changes):
+        changes = list(selector_changes())
+    else:
+        changes = list(selector_changes)
     if not changes:
         stream.write("ccc-agent: no changes available for selective accept\n")
         return session
@@ -705,7 +762,8 @@ def _selective_accept_review(controller, session, stream=None,
 
 
 def _prompt_pending_review_decision(controller, session, stream=None,
-                                    include_ignored=False):
+                                    include_ignored=False,
+                                    selector_changes=None):
     stream = sys.stderr if stream is None else stream
     _ensure_foreground_for_prompt()
     while True:
@@ -730,7 +788,8 @@ def _prompt_pending_review_decision(controller, session, stream=None,
         if choice in ("s", "select", "selective"):
             updated = _selective_accept_review(
                 controller, session, stream=stream,
-                include_ignored=include_ignored)
+                include_ignored=include_ignored,
+                selector_changes=selector_changes)
             if updated is not None:
                 return updated
             continue
@@ -764,7 +823,9 @@ def _review_pending_session(controller, session, display_stream=None,
         try:
             return _prompt_pending_review_decision(
                 controller, session, stream=prompt_stream,
-                include_ignored=include_ignored)
+                include_ignored=include_ignored,
+                selector_changes=lambda: _selector_changes_for_review(
+                    controller, session, include_ignored=include_ignored))
         except ControlError as exc:
             prompt_stream.write("ccc-agent: review decision failed: %s\n" % exc)
     return session

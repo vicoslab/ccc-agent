@@ -14,6 +14,8 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import ccc_agent.ctl as ctl_module
 from ccc_agent import cli as cli_module
@@ -189,6 +191,69 @@ class TestReview(unittest.TestCase):
         self.assertEqual(self._read_tree_key_from_pty(b"\x1b[B"), "KEY_DOWN")
         self.assertEqual(self._read_tree_key_from_pty(b"\x1bOA"), "KEY_UP")
         self.assertEqual(self._read_tree_key_from_pty(b"\x1bOB"), "KEY_DOWN")
+
+    def test_selective_accept_uses_prefetched_selector_changes(self):
+        class FakeController(object):
+            def __init__(self):
+                self.review_paths = None
+
+            def _changes(self, session, include_ignored=False):
+                raise AssertionError("selector should not rescan status before opening")
+
+            def review(self, session_id, commit_paths=None, out=None,
+                       include_ignored=False):
+                self.review_paths = list(commit_paths)
+                return SimpleNamespace(session_id=session_id)
+
+        change = Change("A", "/storage/user/Projects/proj-a/keep.txt",
+                        "file", 1, "r")
+        controller = FakeController()
+        session = SimpleNamespace(session_id="agent-test")
+        stream = io.StringIO()
+        with mock.patch.object(
+                cli_module, "_select_review_paths_interactive",
+                return_value=[change.path]) as selector:
+            updated = cli_module._selective_accept_review(
+                controller, session, stream=stream, selector_changes=[change])
+
+        self.assertEqual(updated.session_id, "agent-test")
+        self.assertEqual(controller.review_paths, [change.path])
+        selector.assert_called_once_with([change], stream=stream)
+
+    def test_curses_selector_uses_terminal_default_colors(self):
+        calls = []
+
+        class FakeCurses(object):
+            A_REVERSE = 0x10000
+
+            class error(Exception):
+                pass
+
+            def start_color(self):
+                calls.append("start_color")
+
+            def use_default_colors(self):
+                calls.append("use_default_colors")
+
+            def init_pair(self, pair, fg, bg):
+                calls.append(("init_pair", pair, fg, bg))
+
+            def color_pair(self, pair):
+                return pair << 8
+
+        class FakeScreen(object):
+            def bkgdset(self, char, attr):
+                calls.append(("bkgdset", char, attr))
+
+        normal, selected = cli_module._configure_curses_default_colors(
+            FakeCurses(), FakeScreen())
+
+        self.assertEqual(normal, 1 << 8)
+        self.assertEqual(selected, (1 << 8) | FakeCurses.A_REVERSE)
+        self.assertIn("start_color", calls)
+        self.assertIn("use_default_colors", calls)
+        self.assertIn(("init_pair", 1, -1, -1), calls)
+        self.assertIn(("bkgdset", " ", 1 << 8), calls)
 
     def test_accept_auto_merges_clean_same_file_text_changes(self):
         rel = "Projects/proj-a/merge.txt"
