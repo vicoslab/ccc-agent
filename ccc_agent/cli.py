@@ -1263,6 +1263,11 @@ def _ctl_socket(args, env):
         sys.stderr.write("ccc-agent: control error: %s\n" % exc)
         return 0
     verdict = resp.get("verdict")
+    if (args.cmd == "turn-finalize" and
+            getattr(args, "default_keep", False) and
+            verdict != VERDICT_NEEDS_APPROVAL):
+        _write_default_keep_summary(resp, sys.stdout)
+        return 0
     if verdict == VERDICT_KEPT_STATUS:
         _write_kept_status(resp, sys.stdout)
         return 0
@@ -1350,9 +1355,24 @@ def _ctl_socket(args, env):
     return 0
 
 
+def _write_default_keep_summary(resp, stream):
+    committed = len(resp.get("committed") or [])
+    kept_paths = resp.get("kept")
+    if kept_paths is None:
+        kept_paths = resp.get("held")
+    kept = len(kept_paths or [])
+    stream.write("committed (%d), kept local (%d)\n" % (committed, kept))
+
+
 def _write_kept_status(resp, stream):
+    committed = list(resp.get("committed") or [])
     paths = list(resp.get("kept") or [])
     stale = list(resp.get("stale") or [])
+    committed_stale = list(resp.get("committed_stale") or [])
+    if committed:
+        stream.write("committed this live BranchFS session:\n")
+        for path in committed:
+            stream.write("  - %s\n" % path)
     if not paths:
         stream.write("no kept non-workspace paths are currently live\n")
     else:
@@ -1365,6 +1385,10 @@ def _write_kept_status(resp, stream):
             "or: ccc-agent turn-resolve discard --paths %s\n"
             "or inspect again: ccc-agent turn-kept-status\n"
             % (joined, joined))
+    if committed_stale:
+        stream.write("remembered committed paths no longer present as live changes:\n")
+        for path in committed_stale:
+            stream.write("  - %s\n" % path)
     if stale:
         stream.write("remembered kept paths no longer present as live changes:\n")
         for path in stale:

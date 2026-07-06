@@ -970,9 +970,9 @@ class TestBwrapConfinement(unittest.TestCase):
 
     def test_bwrap_injects_codex_plugin_with_ensure_dirs(self):
         src = self._make_plugin("codex-ccc-containment")
-        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0"
+        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         plugins = {"codex": {"src": src, "sandbox_path": sandbox,
-                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"],
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
                              "argv": []}}
 
         argv = self._capture_argv(["codex"], "codex", plugins)
@@ -980,7 +980,7 @@ class TestBwrapConfinement(unittest.TestCase):
                    for k in range(len(argv) - 2)]
         self.assertIn(("--ro-bind", src, sandbox), triples)
         self.assertTrue(any(argv[k] == "--dir" and
-                            argv[k + 1] == "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"
+                            argv[k + 1] == "/home/domen/.codex/plugins/cache/ccc-agent/ccc"
                             for k in range(len(argv) - 1)))
         # no argv flags configured -> command is unchanged
         self.assertEqual(self._wrapped_agent_command(argv), ["codex"])
@@ -988,9 +988,9 @@ class TestBwrapConfinement(unittest.TestCase):
     def test_bwrap_shared_agent_state_dirs_are_rw_binds_by_default(self):
         paths, binds = self._agent_state_binds()
         src = self._make_plugin("codex-ccc-containment")
-        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0"
+        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         plugins = {"codex": {"src": src, "sandbox_path": sandbox,
-                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"],
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
                              "argv": []}}
 
         argv = self._capture_argv(["codex"], "codex", plugins,
@@ -1250,9 +1250,9 @@ class TestBwrapConfinement(unittest.TestCase):
     def test_shared_agent_state_skips_agent_home_policy_ignores(self):
         _paths, binds = self._agent_state_binds()
         src = self._make_plugin("codex-ccc-containment")
-        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0"
+        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         plugins = {"codex": {"src": src, "sandbox_path": sandbox,
-                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"],
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
                              "argv": []}}
 
         def fake_run(argv, **kwargs):
@@ -1269,9 +1269,9 @@ class TestBwrapConfinement(unittest.TestCase):
     def test_protected_agent_state_ignores_only_codex_plugin_subpaths(self):
         _paths, binds = self._agent_state_binds()
         src = self._make_plugin("codex-ccc-containment")
-        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0"
+        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         plugins = {"codex": {"src": src, "sandbox_path": sandbox,
-                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"],
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
                              "argv": []}}
 
         def fake_run(argv, **kwargs):
@@ -1283,9 +1283,9 @@ class TestBwrapConfinement(unittest.TestCase):
                 agent_state_binds=binds, protect_agent_state=True))
 
         self.assertNotIn("/storage/user/.codex", session.policy["ignore_patterns"])
-        self.assertIn("/storage/user/.codex/plugins/cache/ccc-agent/ccc-agent",
+        self.assertIn("/storage/user/.codex/plugins/cache/ccc-agent/ccc",
                       session.policy["ignore_patterns"])
-        self.assertIn("/storage/user/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0",
+        self.assertIn("/storage/user/.codex/plugins/cache/ccc-agent/ccc/0.2.0",
                       session.policy["ignore_patterns"])
 
     def test_bwrap_plugin_mount_paths_are_ignored_even_without_policy_default(self):
@@ -1368,9 +1368,9 @@ class TestBwrapConfinement(unittest.TestCase):
 
     def test_bwrap_auto_detects_plugin_from_absolute_executable_path(self):
         src = self._make_plugin("codex-ccc-containment")
-        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0"
+        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         plugins = {"codex": {"src": src, "sandbox_path": sandbox,
-                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"],
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
                              "argv": []}}
         absolute_codex = os.path.join(self._tmp.name, "bin", "codex")
 
@@ -1386,11 +1386,11 @@ class TestBwrapConfinement(unittest.TestCase):
     def test_explicit_agent_kind_wins_over_executable_basename(self):
         codex_src = self._make_plugin("codex-ccc-containment")
         claude_src = self._make_plugin("claude-ccc-containment")
-        codex_sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0"
+        codex_sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         claude_sandbox = "/ccc-agent/plugins/claude-ccc-containment"
         plugins = {
             "codex": {"src": codex_src, "sandbox_path": codex_sandbox,
-                      "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"],
+                      "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
                       "argv": []},
             "claude": {"src": claude_src, "sandbox_path": claude_sandbox,
                        "argv": ["--plugin-dir", claude_sandbox]},

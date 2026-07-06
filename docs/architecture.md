@@ -34,10 +34,10 @@ inspect, commit, or abort them. This holds because:
    control-socket path invokes `turn-finalize --default-keep` so the supervisor
    can commit in-scope workspace changes and keep non-workspace/out-of-policy
    paths in the branch without turning intermediate autonomous loops into
-   approval gates. A bundled `branchfs-commit` skill tells the agent to run
-   `turn-review-kept` only when it is actually finished/idle; users can inspect
-   the live kept set with `turn-kept-status`. The hook itself never gets direct
-   BranchFS commit/abort authority.
+   approval gates. Bundled `ccc-commit` and `/ccc:*` command skills let the
+   user/agent inspect status, review kept paths, and translate commit/discard
+   prompts into `turn-resolve` calls. The hook itself never gets direct BranchFS
+   commit/abort authority.
 
 ## Session lifecycle (process-exit completion, first milestone)
 

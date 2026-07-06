@@ -133,9 +133,9 @@ SANDBOX_PLUGIN_ROOT = "/ccc-agent/plugins"
 # Codex sessions; ccc-agent remains the write-protection boundary.
 CODEX_DISABLE_INNER_SANDBOX_ARG = "--dangerously-bypass-approvals-and-sandbox"
 
-CODEX_PLUGIN_NAME = "ccc-agent"
+CODEX_PLUGIN_NAME = "ccc"
 CODEX_PLUGIN_MARKETPLACE = "ccc-agent"
-CODEX_PLUGIN_VERSION = "0.1.0"
+CODEX_PLUGIN_VERSION = "0.2.0"
 CODEX_PLUGIN_ID = "%s@%s" % (CODEX_PLUGIN_NAME, CODEX_PLUGIN_MARKETPLACE)
 
 CODEX_CONFIG_BEGIN = "# BEGIN ccc-agent Codex plugin"

@@ -41,8 +41,11 @@ class TestPluginAssets(unittest.TestCase):
 
     def test_claude_plugin_layout(self):
         root = os.path.join(PLUGINS, "claude-ccc-containment")
-        self.assertTrue(os.path.isfile(
-            os.path.join(root, ".claude-plugin", "plugin.json")))
+        manifest_path = os.path.join(root, ".claude-plugin", "plugin.json")
+        self.assertTrue(os.path.isfile(manifest_path))
+        with open(manifest_path) as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["name"], "ccc")
         with open(os.path.join(root, "hooks", "hooks.json")) as fh:
             hooks = json.load(fh)
         self.assertIn("Stop", hooks["hooks"])
@@ -53,27 +56,64 @@ class TestPluginAssets(unittest.TestCase):
 
     def test_codex_plugin_layout(self):
         root = os.path.join(PLUGINS, "codex-ccc-containment")
-        self.assertTrue(os.path.isfile(
-            os.path.join(root, ".codex-plugin", "plugin.json")))
+        manifest_path = os.path.join(root, ".codex-plugin", "plugin.json")
+        self.assertTrue(os.path.isfile(manifest_path))
+        with open(manifest_path) as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest["name"], "ccc")
         with open(os.path.join(root, "hooks", "hooks.json")) as fh:
             hooks = json.load(fh)
         self.assertIn("Stop", hooks["hooks"])
         self.assertTrue(os.path.isfile(
             os.path.join(root, "hooks", "ccc-stop-hook.sh")))
 
-    def test_branchfs_commit_skill_is_bundled_for_claude_and_codex(self):
+    def test_ccc_commit_skill_is_bundled_for_claude_and_codex(self):
         bodies = []
         for plugin in ("claude-ccc-containment", "codex-ccc-containment"):
-            path = os.path.join(PLUGINS, plugin, "skills", "branchfs-commit",
+            for old_name in ("branchfs-commit", "contained-commit"):
+                old_path = os.path.join(PLUGINS, plugin, "skills", old_name)
+                self.assertFalse(os.path.exists(old_path), old_path)
+            path = os.path.join(PLUGINS, plugin, "skills", "ccc-commit",
                                 "SKILL.md")
             self.assertTrue(os.path.isfile(path), path)
             with open(path) as fh:
                 bodies.append(fh.read())
         self.assertEqual(len(set(bodies)), 1)
-        self.assertLess(len(bodies[0].split()), 130)
+        self.assertIn("name: ccc-commit", bodies[0])
+        self.assertLess(len(bodies[0].split()), 190)
+        self.assertNotIn("BranchFS", bodies[0])
+        self.assertNotIn("branchfs", bodies[0].lower())
+        self.assertIn("Always use this skill", bodies[0])
+        self.assertIn("contained filesystem", bodies[0])
+        self.assertIn("You must run", bodies[0])
+        self.assertIn("ccc-agent turn-kept-status", bodies[0])
+        self.assertIn("finished your work", bodies[0])
+        self.assertIn("would otherwise idle", bodies[0])
+        self.assertIn("Do not stop active loops/goals", bodies[0])
         self.assertIn("turn-review-kept", bodies[0])
-        self.assertIn("turn-kept-status", bodies[0])
         self.assertIn("turn-resolve", bodies[0])
+
+    def test_ccc_user_command_skills_are_bundled_for_claude_and_codex(self):
+        expected = {
+            "status": "ccc-agent turn-kept-status",
+            "commit": "ccc-agent turn-resolve commit",
+            "discard": "ccc-agent turn-resolve discard",
+            "op": "ccc-agent turn-",
+        }
+        bodies = []
+        for plugin in ("claude-ccc-containment", "codex-ccc-containment"):
+            for name, command in expected.items():
+                path = os.path.join(PLUGINS, plugin, "skills", name,
+                                    "SKILL.md")
+                self.assertTrue(os.path.isfile(path), path)
+                with open(path) as fh:
+                    body = fh.read()
+                bodies.append(body)
+                self.assertIn("disable-model-invocation: true", body)
+                self.assertIn("$ARGUMENTS", body)
+                self.assertIn(command, body)
+                self.assertNotIn("BranchFS", body)
+                self.assertLess(len(body.split()), 180)
 
     def test_hermes_plugin_layout(self):
         root = os.path.join(PLUGINS, "hermes-ccc-containment")

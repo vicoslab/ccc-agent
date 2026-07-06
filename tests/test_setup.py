@@ -125,13 +125,13 @@ class TestSetupConfig(unittest.TestCase):
         self.assertTrue(plugins["claude"]["src"].endswith(
             "/plugins/claude-ccc-containment"))
         self.assertEqual(plugins["codex"]["sandbox_path"],
-                         "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0")
+                         "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0")
         self.assertEqual(plugins["codex"]["ensure_dirs"],
-                         ["/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"])
+                         ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"])
         self.assertEqual(plugins["codex"]["argv"],
                          [setup_mod.CODEX_DISABLE_INNER_SANDBOX_ARG])
         self.assertEqual(plugins["codex"]["plugin_id"],
-                         "ccc-agent@ccc-agent")
+                         "ccc@ccc-agent")
         self.assertEqual(
             plugins["hermes"]["setenv"]["HERMES_BUNDLED_PLUGINS"],
             "/ccc-agent/plugins/hermes")
@@ -167,9 +167,9 @@ class TestSetupConfig(unittest.TestCase):
         self.assertEqual(cfg["cred_mounts"], [])
         plugins = cfg["agent_plugins"]
         self.assertEqual(plugins["codex"]["sandbox_path"],
-                         "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent/0.1.0")
+                         "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0")
         self.assertEqual(plugins["codex"]["plugin_id"],
-                         "ccc-agent@ccc-agent")
+                         "ccc@ccc-agent")
         self.assertEqual(plugins["codex"]["argv"],
                          [setup_mod.CODEX_DISABLE_INNER_SANDBOX_ARG])
         self.assertEqual(plugins["claude"]["argv"],
@@ -213,7 +213,7 @@ class TestSetupConfig(unittest.TestCase):
             self.assertIn("BEGIN ccc-agent Codex plugin", codex_toml)
             self.assertIn("contained `ccc-agent run -- codex` sessions", codex_toml)
             self.assertIn("safe to leave enabled", codex_toml)
-            self.assertIn('plugins."ccc-agent@ccc-agent".enabled = true',
+            self.assertIn('plugins."ccc@ccc-agent".enabled = true',
                           codex_toml)
             self.assertFalse(os.path.exists(os.path.join(home, ".claude", "settings.json")))
 

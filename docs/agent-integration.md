@@ -19,7 +19,8 @@ supervisor's existing end-of-process finalize is the per-turn commit.
 **Claude interactive** loads a CCC plugin whose Stop hook reports the turn with
 `--default-keep`: ordinary in-policy workspace changes are committed immediately.
 New non-workspace/out-of-policy paths are kept in the BranchFS branch only, so
-intermediate autonomous loops do not become approval gates. The user can resolve
+intermediate autonomous loops do not become approval gates. The hook prints a
+small progress line such as `committed (2), kept local (1)`. The user can resolve
 those kept paths later during final/session review, or explicitly while the
 session is still live with `turn-resolve`.
 
@@ -53,23 +54,41 @@ ccc-agent turn-approve <token> --commit a --keep b --discard c
 
 `keep` is durable session state: the path remains in the BranchFS branch, is not
 committed to the real underlay, and is not re-prompted on later turns or after a
-control-server restart. The live state can be inspected any time from inside the
-contained session:
+control-server restart. The live state can be inspected any time from inside the contained session. The
+native plugin command namespace is `ccc`, so the user-facing commands are:
+
+```text
+/ccc:status [filter]       # show committed paths plus kept/non-committed paths
+/ccc:commit [paths|prompt] # commit selected kept paths
+/ccc:discard [all|prompt]  # discard selected kept paths; agent must undo
+/ccc:op <prompt>           # natural-language dispatcher to turn-* operations
+```
+
+`/ccc:op` is the flexible form for requests such as “discard all files in this
+folder but keep those”: the agent first runs status, translates the prompt into
+specific kept paths, asks if ambiguous, then runs the concrete `ccc-agent
+turn-resolve ...` commands. Direct CLI equivalents remain:
 
 ```bash
 ccc-agent turn-kept-status
 ```
 
 When an agent is genuinely finished/idle (not still looping/thinking), the
-bundled `branchfs-commit` skill tells it to run:
+bundled `ccc-commit` skill tells it to run:
+
+```bash
+ccc-agent turn-kept-status
+```
+
+If that command reports kept paths, the agent asks the user what to do and can
+run the explicit review prompt:
 
 ```bash
 ccc-agent turn-review-kept
 ```
 
-If that command reports kept paths, the agent asks the user what to do. If the
-user later changes their mind while the session is still live, or answers that
-final prompt, the agent relays the request explicitly:
+If the user later changes their mind while the session is still live, or answers
+that final prompt, the agent relays the request explicitly:
 
 ```bash
 ccc-agent turn-resolve commit --paths a,b
@@ -85,8 +104,8 @@ remain available through normal `pending-review` session review.
 **Hermes** loads a CCC bundled plugin (`HERMES_BUNDLED_PLUGINS`) whose
 `post_llm_call` / `on_session_end` hooks report turn boundaries with
 `--default-keep`. Hermes hooks cannot block or feed instructions back, so kept
-non-workspace paths are resolved through the same final/idle `turn-review-kept`
-flow or normal session-end review.
+non-workspace paths are resolved through the same final/idle
+`turn-kept-status` → `turn-review-kept` flow or normal session-end review.
 
 Hooks are **best-effort turn-boundary signals only**. If a plugin fails to load,
 a hook crashes, or an agent version changes the contract, the agent loses
@@ -123,16 +142,19 @@ ccc-agent run -- claude -p "…"
 ```
 
 The plugin dir (`.claude-plugin/plugin.json` + `hooks/hooks.json` →
-`${CLAUDE_PLUGIN_ROOT}/hooks/ccc-stop-hook.sh`, plus the `branchfs-commit` skill)
-is a read-only bwrap mount of the package asset. `--bare` disables plugins/hooks,
-so a contained `--bare` run skips injection and falls back to session-end review.
+`${CLAUDE_PLUGIN_ROOT}/hooks/ccc-stop-hook.sh`, plus `ccc-commit` and the
+`/ccc:*` command skills) is a read-only bwrap mount of the package asset. `--bare`
+disables plugins/hooks, so a contained `--bare` run skips injection and falls back
+to session-end review.
 
 **Codex** — the plugin (`.codex-plugin/plugin.json` + `hooks/hooks.json` →
-`./hooks/ccc-stop-hook.sh`, plus the `branchfs-commit` skill) is mounted
-read-only at the in-sandbox Codex plugin path (`~/.codex/plugins/ccc-agent`). The
-generated `argv` includes `--dangerously-bypass-approvals-and-sandbox` so Codex
-does not start its own nested Linux/bwrap sandbox inside the existing ccc-agent
-BranchFS/bwrap containment boundary.
+`./hooks/ccc-stop-hook.sh`, plus `ccc-commit` and the `/ccc:*` command
+skills) is mounted read-only at Codex's in-sandbox plugin cache path
+(`~/.codex/plugins/cache/ccc-agent/ccc/0.2.0`) and enabled as
+`ccc@ccc-agent`. The generated `argv` includes
+`--dangerously-bypass-approvals-and-sandbox` so Codex does not start its own
+nested Linux/bwrap sandbox inside the existing ccc-agent BranchFS/bwrap
+containment boundary.
 
 **Hermes** — the bundled plugin (`plugin.yaml` + a `register()` module) is
 mounted under a read-only bundle root and activated with

@@ -1004,8 +1004,8 @@ class TestMainCtl(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertTrue(seen["default_keep"])
-        self.assertIn("committed 1 change(s)", out.getvalue())
-        self.assertIn("kept 1 in branch", out.getvalue())
+        self.assertIn("committed (1), kept local (1)", out.getvalue())
+        self.assertNotIn("outside.txt", out.getvalue())
 
     def test_turn_finalize_cli_prompts_then_keeps_after_timeout(self):
         seen = {}
@@ -1122,6 +1122,7 @@ class TestMainCtl(unittest.TestCase):
 
             def kept_status(self):
                 return {"verdict": "kept-status",
+                        "committed": ["/storage/user/Projects/proj-a/ok.txt"],
                         "kept": ["/storage/user/outside.txt"],
                         "stale": [], "count": 1}
 
@@ -1133,6 +1134,8 @@ class TestMainCtl(unittest.TestCase):
                 code = main_ctl(["turn-kept-status"], env=env)
 
         self.assertEqual(code, 0)
+        self.assertIn("committed this live BranchFS session", out.getvalue())
+        self.assertIn("ok.txt", out.getvalue())
         self.assertIn("kept non-workspace paths", out.getvalue())
         self.assertIn("outside.txt", out.getvalue())
         self.assertIn("turn-resolve commit", out.getvalue())

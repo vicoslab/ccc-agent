@@ -252,19 +252,28 @@ class TurnController(object):
         self._mark_paths(paths, DECISION_DISCARDED)
         return paths
 
-    def _kept_path_view(self):
+    def _decision_path_view(self, decision):
         live_paths = {c.path for c in self._live_changes()}
-        remembered = self._paths_with_decisions(DECISION_KEPT)
-        kept = sorted(remembered & live_paths)
+        remembered = self._paths_with_decisions(decision)
+        current = sorted(remembered & live_paths)
         stale = sorted(remembered - live_paths)
-        return kept, stale
+        return current, stale
+
+    def _kept_path_view(self):
+        return self._decision_path_view(DECISION_KEPT)
 
     def kept_status(self):
-        """Read-only status for non-workspace paths kept in the live branch."""
+        """Read-only status for per-turn decisions in the live branch."""
         with self._lock:
             kept, stale = self._kept_path_view()
+            committed, committed_stale = self._decision_path_view(
+                DECISION_COMMITTED)
             return {"verdict": VERDICT_KEPT_STATUS, "kept": kept,
-                    "stale": stale, "count": len(kept)}
+                    "committed": committed,
+                    "stale": stale,
+                    "committed_stale": committed_stale,
+                    "count": len(kept),
+                    "committed_count": len(committed)}
 
     def review_kept(self):
         """Final/idle check: ask the user only if kept paths still exist."""

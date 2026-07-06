@@ -219,7 +219,8 @@ class TestTurnController(unittest.TestCase):
         self.assertIn("/storage/user/escape.txt",
                       persisted2.policy["allowed_scopes"])
 
-    def test_kept_status_lists_live_kept_paths(self):
+    def test_kept_status_lists_live_committed_and_kept_paths(self):
+        self.h.write("Projects/proj-a/ok.txt", "ok")
         self.h.write("escape.txt", "x")
         resp = self.h.tc.finalize_turn(default_keep=True)
         self.assertEqual(resp["kept"], ["/storage/user/escape.txt"])
@@ -227,6 +228,8 @@ class TestTurnController(unittest.TestCase):
         status = self.h.tc.kept_status()
 
         self.assertEqual(status["verdict"], "kept-status")
+        self.assertEqual(status["committed"],
+                         ["/storage/user/Projects/proj-a/ok.txt"])
         self.assertEqual(status["kept"], ["/storage/user/escape.txt"])
         self.assertEqual(status["count"], 1)
 
