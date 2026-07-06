@@ -17,10 +17,17 @@ import time
 
 from . import artifacts
 from .branchfs import StatusReport
+from .commit_failures import (clear_permission_failures,
+                              has_permission_failures,
+                              is_permission_denied,
+                              permission_failure_record,
+                              prune_backend_change,
+                              remember_permission_failures,
+                              store_paths)
 from .policy import (Change, IgnoredChange, PolicyConfig, classify,
                      filter_ignored, net_final_changes,
                      net_final_ignored_changes, split_ignored)
-from .runner import finalize_session
+from .runner import finalize_session, _rewrite_review_for_permission_failures
 from .paths import is_within
 from .session import TERMINAL_STATES
 
@@ -756,16 +763,47 @@ class Controller(object):
         # explicitly opts in with include_ignored.
         changes = self._changes(session, include_ignored=include_ignored)
         commit_reports = []
+        permission_denied = []
+        applied = []
+        clear_permission_failures(session)
         try:
             for root, change in changes:
-                report = self._apply_change_from_store(root, change)
+                try:
+                    report = self._apply_change_from_store(root, change)
+                except Exception as exc:
+                    if not is_permission_denied(exc):
+                        raise
+                    rel, _delta, _base = self._store_paths(root, change)
+                    record = permission_failure_record(root, change, rel, exc)
+                    permission_denied.append(record)
+                    session.add_event("commit-permission-denied",
+                                      "%s: %s" % (change.path, exc))
+                    continue
                 if report:
                     commit_reports.append(report)
+                rel, _delta, _base = self._store_paths(root, change)
+                applied.append((root, rel))
         except Exception as exc:
             session.add_event("error", "commit failed, branch preserved: %s" % exc)
             self.store.save(session)
             raise ControlError("commit failed, branch preserved: %s" % exc)
         self._write_commit_conflict_report(session, commit_reports)
+        if permission_denied:
+            for root, rel in applied:
+                prune_backend_change(self.backend, root, rel)
+            remember_permission_failures(session, permission_denied,
+                                        applied_count=len(applied))
+            _rewrite_review_for_permission_failures(
+                session, self.store, self.backend, self.alias_map,
+                permission_denied)
+            session.add_event(
+                "pending",
+                "%d permission-denied path(s) remain in BranchFS" %
+                len(permission_denied))
+            if session.state == "frozen":
+                session.transition("pending-review")
+            self.store.save(session)
+            return session
         for name, root in sorted(session.protected_roots.items()):
             self._discard_branch(session, name, root, "commit cleanup",
                                  strict=False)
@@ -788,18 +826,22 @@ class Controller(object):
                                % (session_id, session.state))
         for name, root in sorted(session.protected_roots.items()):
             self._discard_branch(session, name, root, "abort", strict=True)
-            session.add_event("aborted-root", name)
-        session.transition("aborted")
+            if has_permission_failures(session):
+                session.add_event("discarded-permission-denied-remainder", name)
+            else:
+                session.add_event("aborted-root", name)
+        if has_permission_failures(session):
+            clear_permission_failures(session)
+            session.transition("committed")
+        else:
+            session.transition("aborted")
         self.store.save(session)
         return session
 
     # -- selective / line-level review (post-session, branch unmounted) -----
     def _store_paths(self, root, change):
         """(rel, delta-file-in-store, base-file) for a change."""
-        visible = self.alias_map.canonicalize(root.visible)
-        rel = os.path.relpath(self.alias_map.canonicalize(change.path), visible)
-        delta = os.path.join(root.store, "branches", root.branch, "files", rel)
-        return rel, delta, os.path.join(root.base, rel)
+        return store_paths(root, change, self.alias_map)
 
     def _touch_record_for_rel(self, root, rel):
         touches = _load_touch_records(root)

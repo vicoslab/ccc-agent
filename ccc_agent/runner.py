@@ -22,10 +22,16 @@ import subprocess
 
 from . import artifacts
 from .branchfs import StatusReport, _mountinfo_entry
+from .commit_failures import (clear_permission_failures,
+                              is_permission_denied,
+                              permission_failure_record,
+                              prune_backend_change,
+                              remember_permission_failures,
+                              store_paths)
 from .control import ControlServer
 from .paths import is_within, normalize
 from .policy import (ABORT, AUTO_COMMIT, NO_CHANGES, PENDING_REVIEW,
-                     PolicyConfig, evaluate, split_ignored)
+                     PolicyConfig, PolicyDecision, evaluate, split_ignored)
 from .session import ProtectedRoot
 from .turn import TurnController
 
@@ -936,10 +942,7 @@ def apply_change_from_store(root, change, alias_map):
     is *selective*: only the changes we pass get applied, so ignored noise and
     out-of-scope deltas left in the branch are never written to base — unlike
     branchfs ``commit-branch`` which would apply the whole branch."""
-    visible = alias_map.canonicalize(root.visible)
-    rel = os.path.relpath(alias_map.canonicalize(change.path), visible)
-    delta = os.path.join(root.store, "branches", root.branch, "files", rel)
-    base = os.path.join(root.base, rel)
+    rel, delta, base = store_paths(root, change, alias_map)
     if change.op == "D":
         if os.path.islink(base) or os.path.isfile(base):
             os.unlink(base)
@@ -960,6 +963,43 @@ def apply_change_from_store(root, change, alias_map):
         elif os.path.isdir(base):
             shutil.rmtree(base)
         shutil.copy2(delta, base, follow_symlinks=False)
+
+
+def _pending_decision_for_permission_failures(failures, changes_by_root):
+    count = len(failures)
+    noun = "change" if count == 1 else "changes"
+    total = sum(len(changes) for changes in changes_by_root.values())
+    return PolicyDecision(
+        PENDING_REVIEW,
+        total,
+        [],
+        [],
+        ["%d %s could not be committed because the real underlay returned "
+         "permission denied; writable changes were committed and these paths "
+         "remain in BranchFS for discard or manual handling" % (count, noun)],
+    )
+
+
+def _rewrite_review_for_permission_failures(session, store, backend, alias_map,
+                                           failures):
+    policy_config = PolicyConfig.from_dict(session.policy)
+    status_reports = collect_status_reports(session, backend)
+    changes_by_root = {}
+    ignored_by_root = {}
+    for name, report in status_reports.items():
+        changes, ignored = split_ignored(report.changes, policy_config,
+                                         alias_map)
+        changes_by_root[name] = changes
+        ignored_by_root[name] = ignored
+    warnings_by_root = {name: list(report.warnings)
+                        for name, report in status_reports.items()
+                        if report.warnings}
+    decision = _pending_decision_for_permission_failures(failures,
+                                                         changes_by_root)
+    review = artifacts.write_review(store, session, changes_by_root, decision,
+                                    warnings_by_root=warnings_by_root,
+                                    ignored_by_root=ignored_by_root)
+    session.add_event("review-artifacts", review)
 
 
 def finalize_session(session, store, backend, alias_map):
@@ -1028,18 +1068,48 @@ def finalize_session(session, store, backend, alias_map):
         # branchfs commit-branch applying the *whole* branch — which would
         # commit ignored config-dir churn and choke (ENOTEMPTY) on stale .nfs
         # deltas the agent left in non-workspace areas.
+        permission_denied = []
+        applied = []
+        clear_permission_failures(session)
         try:
             for name, root in sorted(session.protected_roots.items()):
                 for change in changes_by_root.get(name, ()):
-                    apply_change_from_store(root, change, alias_map)
-                backend.abort(root)  # discard the branch + any unreviewed noise
-                session.add_event("committed-root", name)
+                    try:
+                        apply_change_from_store(root, change, alias_map)
+                    except Exception as exc:
+                        if not is_permission_denied(exc):
+                            raise
+                        rel, _delta, _base = store_paths(root, change, alias_map)
+                        record = permission_failure_record(root, change, rel, exc)
+                        permission_denied.append(record)
+                        session.add_event(
+                            "commit-permission-denied",
+                            "%s: %s" % (change.path, exc))
+                        continue
+                    rel, _delta, _base = store_paths(root, change, alias_map)
+                    applied.append((root, rel))
         except Exception as exc:  # failure must never lose the branch
             _fail(store, session,
                   "commit failed, branch preserved for manual recovery: %s"
                   % exc)
             return decision
-        session.transition("auto-committed")
+        if permission_denied:
+            for root, rel in applied:
+                prune_backend_change(backend, root, rel)
+            remember_permission_failures(session, permission_denied,
+                                        applied_count=len(applied))
+            _rewrite_review_for_permission_failures(
+                session, store, backend, alias_map, permission_denied)
+            session.add_event(
+                "pending",
+                "%d permission-denied path(s) remain in BranchFS" %
+                len(permission_denied))
+            session.transition("pending-review")
+        else:
+            for name, root in sorted(session.protected_roots.items()):
+                backend.abort(root)  # discard the branch + any unreviewed noise
+                session.add_event("committed-root", name)
+            session.transition("auto-committed")
     else:  # PENDING_REVIEW: branches stay frozen for human review
         session.add_event("pending", "; ".join(decision.reasons))
         session.transition("pending-review")

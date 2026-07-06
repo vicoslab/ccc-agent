@@ -217,6 +217,56 @@ class TestController(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.h.base, ".cache", "pip", "wheel.txt")))
 
+    def test_review_accept_permission_denied_commits_others_and_keeps_blocked(self):
+        readonly = os.path.join(self.h.base, "Projects", "proj-a", "readonly")
+        os.makedirs(readonly, exist_ok=True)
+        os.chmod(readonly, 0o555)
+        try:
+            session = self.h.run_agent([
+                "sh", "-c",
+                "echo ok > ok.txt; mkdir -p readonly; "
+                "echo blocked > readonly/no.txt",
+            ], mode="manual")
+
+            updated = self.h.controller().review(session.session_id, accept=True)
+        finally:
+            os.chmod(readonly, 0o755)
+
+        self.assertEqual(updated.state, "pending-review")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, "Projects", "proj-a", "ok.txt")))
+        self.assertFalse(os.path.exists(os.path.join(readonly, "no.txt")))
+        root = updated.protected_roots["storage_user"]
+        remaining = sorted(change.path for change in self.h.backend.status(root))
+        self.assertEqual(remaining,
+                         ["/storage/user/Projects/proj-a/readonly/no.txt"])
+        failures = updated.policy.get("commit_permission_denied", [])
+        self.assertEqual([f["path"] for f in failures],
+                         ["/storage/user/Projects/proj-a/readonly/no.txt"])
+
+    def test_abort_after_permission_denied_partial_commit_discards_remainder_as_committed(self):
+        readonly = os.path.join(self.h.base, "Projects", "proj-a", "readonly")
+        os.makedirs(readonly, exist_ok=True)
+        os.chmod(readonly, 0o555)
+        try:
+            session = self.h.run_agent([
+                "sh", "-c",
+                "echo ok > ok.txt; mkdir -p readonly; "
+                "echo blocked > readonly/no.txt",
+            ], mode="manual")
+            updated = self.h.controller().review(session.session_id, accept=True)
+        finally:
+            os.chmod(readonly, 0o755)
+
+        finished = self.h.controller().abort(updated.session_id)
+
+        self.assertEqual(finished.state, "committed")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, "Projects", "proj-a", "ok.txt")))
+        self.assertFalse(os.path.exists(os.path.join(readonly, "no.txt")))
+        self.assertTrue(any(e["event"] == "discarded-permission-denied-remainder"
+                            for e in finished.events))
+
     def test_diff_with_empty_review_status_does_not_fallback_to_live_branch(self):
         session = self.h.run_agent(["true"])
         self.assertEqual(session.state, "auto-committed")

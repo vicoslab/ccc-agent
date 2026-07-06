@@ -40,6 +40,7 @@ from importlib import resources
 
 from . import __version__
 from .branchfs import BranchfsCli, FakeBranchFS
+from .commit_failures import has_permission_failures, permission_failures
 from .control import (ControlClient, VERDICT_COMMITTED, VERDICT_HELD,
                       VERDICT_KEPT_STATUS, VERDICT_NEEDS_APPROVAL,
                       VERDICT_NEEDS_KEPT_REVIEW)
@@ -764,10 +765,50 @@ def _selective_accept_review(controller, session, stream=None,
     return updated
 
 
+def _prompt_permission_denied_remainder(controller, session, stream=None):
+    """Prompt after a partial commit left only permission-denied paths."""
+    stream = sys.stderr if stream is None else stream
+    _ensure_foreground_for_prompt()
+    failures = permission_failures(session)
+    stream.write(
+        "ccc-agent: %d path(s) could not be written to real storage due to "
+        "permission denied and remain only in BranchFS:\n" % len(failures))
+    for item in failures:
+        stream.write("  - %s\n" % item.get("path", "(unknown path)"))
+    while True:
+        stream.write(
+            "ccc-agent: Discard those remaining branch-only files and finish? "
+            "discard/d=yes / manual/m/later=keep pending-review [manual]: ")
+        stream.flush()
+        try:
+            raw_choice = _read_review_choice()
+        except EOFError:
+            raw_choice = "manual"
+        if len(raw_choice) == 1 and raw_choice not in ("\n", "\r"):
+            stream.write("\n")
+        choice = raw_choice.strip().lower()
+        if choice in ("d", "discard", "y", "yes"):
+            updated = controller.abort(session.session_id)
+            stream.write(
+                "ccc-agent: discarded permission-denied branch remainder; "
+                "session %s finished as %s\n" %
+                (updated.session_id, updated.state))
+            return updated
+        if choice in ("", "m", "manual", "l", "later", "keep", "\x1b", "esc"):
+            stream.write(
+                "ccc-agent: kept permission-denied paths in BranchFS for "
+                "manual handling: %s\n" % session.session_id)
+            return session
+        stream.write("ccc-agent: please answer discard/d or manual/m/later.\n")
+
+
 def _prompt_pending_review_decision(controller, session, stream=None,
                                     include_ignored=False,
                                     selector_changes=None):
     stream = sys.stderr if stream is None else stream
+    if has_permission_failures(session):
+        return _prompt_permission_denied_remainder(controller, session,
+                                                   stream=stream)
     _ensure_foreground_for_prompt()
     while True:
         stream.write(
@@ -1236,6 +1277,13 @@ def _ctl_socket(args, env):
             "out of policy and were NOT committed:\n" % len(paths))
         for path in paths:
             sys.stderr.write("  - %s\n" % path)
+        if resp.get("permission_denied"):
+            sys.stderr.write(
+                "ccc-agent: additionally, these in-scope path(s) could not "
+                "be written due to permission denied and were kept in "
+                "BranchFS only:\n")
+            for path in resp["permission_denied"]:
+                sys.stderr.write("  - %s\n" % path)
         sys.stderr.write(
             "ccc-agent: ask the user how to handle these, then run ONE of:\n"
             "    ccc-agent turn-approve %s            # commit all\n"
@@ -1272,6 +1320,10 @@ def _ctl_socket(args, env):
         elif resp.get("held"):
             msg += " (held %d for review)" % len(resp["held"])
         sys.stdout.write(msg + "\n")
+        if resp.get("permission_denied"):
+            sys.stdout.write("could not write due to permission denied:\n")
+            for path in resp["permission_denied"]:
+                sys.stdout.write("  - %s\n" % path)
         if resp.get("kept"):
             _write_kept_paths(resp["kept"])
         if resp.get("revert"):
@@ -1279,6 +1331,10 @@ def _ctl_socket(args, env):
             for path in resp["revert"]:
                 sys.stdout.write("  - %s\n" % path)
     elif verdict == VERDICT_HELD:
+        if resp.get("permission_denied"):
+            sys.stdout.write("could not write due to permission denied:\n")
+            for path in resp["permission_denied"]:
+                sys.stdout.write("  - %s\n" % path)
         if resp.get("kept"):
             sys.stdout.write("kept %d path(s) in branch (not committed)\n"
                              % len(resp["kept"]))

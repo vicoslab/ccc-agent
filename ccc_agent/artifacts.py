@@ -9,6 +9,8 @@ import json
 import os
 from collections import Counter
 
+from .commit_failures import COMMIT_PERMISSION_DENIED_KEY
+
 
 def _write_json(path, data):
     tmp = path + ".tmp"
@@ -19,7 +21,8 @@ def _write_json(path, data):
 
 
 def _is_review_cache_file(name):
-    if name in ("session.json", "policy-decision.json", "summary.md"):
+    if name in ("session.json", "policy-decision.json", "summary.md",
+                "commit-permission-denied.json"):
         return True
     return ((name.startswith("status.") or name.startswith("ignored.") or
              name.startswith("warnings.")) and name.endswith(".json"))
@@ -57,6 +60,10 @@ def write_review(store, session, changes_by_root, decision,
     for root_name, warnings in warnings_by_root.items():
         _write_json(os.path.join(review, "warnings.%s.json" % root_name),
                     [w.to_dict() for w in warnings])
+    failures = session.policy.get(COMMIT_PERMISSION_DENIED_KEY) or []
+    if failures:
+        _write_json(os.path.join(review, "commit-permission-denied.json"),
+                    failures)
     _write_json(os.path.join(review, "policy-decision.json"),
                 decision.to_dict())
 
@@ -123,6 +130,19 @@ def render_summary(session, changes_by_root, decision, warnings_by_root=None,
         out("")
         for match in decision.deny_matches:
             out("- `%s` (rule `%s`)" % (match.path, match.pattern))
+        out("")
+    failures = session.policy.get(COMMIT_PERMISSION_DENIED_KEY) or []
+    if failures:
+        out("## Permission denied during commit")
+        out("")
+        out("Writable changes were applied to the real underlay. The paths below could not be written and remain only in the BranchFS branch.")
+        out("")
+        for item in failures:
+            out("- `%s` `%s`: %s" % (
+                item.get("root", ""), item.get("path", ""),
+                item.get("error", "permission denied")))
+        out("")
+        out("Choose `abort`/discard to drop these remaining branch-only files and finish, or keep the session pending and `resume` it to copy/move them elsewhere manually.")
         out("")
     warning_total = sum(len(warnings)
                         for warnings in warnings_by_root.values())

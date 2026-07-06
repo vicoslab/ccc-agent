@@ -204,6 +204,45 @@ class TestRunSession(unittest.TestCase):
         self.assertEqual(session.exit_status, 3)
         self.assertEqual(session.state, "auto-committed")
 
+    def test_auto_commit_permission_denied_keeps_only_blocked_paths_for_review(self):
+        readonly = os.path.join(self.h.base, "Projects", "proj-a", "readonly")
+        os.makedirs(readonly, exist_ok=True)
+        os.chmod(readonly, 0o555)
+        try:
+            session = run_session(self.h.config([
+                "sh", "-c",
+                "echo ok > ok.txt; mkdir -p readonly; "
+                "echo blocked > readonly/no.txt",
+            ]))
+        finally:
+            os.chmod(readonly, 0o755)
+
+        self.assertEqual(session.state, "pending-review")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.base, "Projects", "proj-a", "ok.txt")))
+        self.assertFalse(os.path.exists(os.path.join(readonly, "no.txt")))
+
+        root = session.protected_roots["storage_user"]
+        remaining = sorted(change.path for change in self.h.backend.status(root))
+        self.assertEqual(remaining,
+                         ["/storage/user/Projects/proj-a/readonly/no.txt"])
+        failures = session.policy.get("commit_permission_denied", [])
+        self.assertEqual([f["path"] for f in failures],
+                         ["/storage/user/Projects/proj-a/readonly/no.txt"])
+        self.assertTrue(any(e["event"] == "commit-permission-denied"
+                            for e in session.events))
+
+        review = self.h.store.review_dir(session.session_id)
+        with open(os.path.join(review, "policy-decision.json")) as fh:
+            decision = json.load(fh)
+        self.assertEqual(decision["decision"], "pending-review")
+        self.assertTrue(any("permission denied" in reason.lower()
+                            for reason in decision["reasons"]))
+        with open(os.path.join(review, "summary.md")) as fh:
+            summary = fh.read()
+        self.assertIn("Permission denied", summary)
+        self.assertIn("readonly/no.txt", summary)
+
     def test_resume_running_session_reuses_existing_branch(self):
         class NoCreateOnResume(FakeBranchFS):
             def __init__(self):

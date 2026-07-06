@@ -95,6 +95,36 @@ class TestTurnController(unittest.TestCase):
         self.assertIn("/storage/user/Projects/proj-a/ok.txt",
                       resp["committed"])
 
+    def test_in_scope_permission_denied_turn_commits_others_and_keeps_blocked(self):
+        readonly = os.path.join(self.h.base, "Projects", "proj-a", "readonly")
+        os.makedirs(readonly, exist_ok=True)
+        os.chmod(readonly, 0o555)
+        try:
+            self.h.write("Projects/proj-a/ok.txt", "ok")
+            self.h.write("Projects/proj-a/readonly/no.txt", "blocked")
+
+            resp = self.h.tc.finalize_turn()
+            resp2 = self.h.tc.finalize_turn()
+        finally:
+            os.chmod(readonly, 0o755)
+
+        self.assertEqual(resp["verdict"], VERDICT_COMMITTED)
+        self.assertIn("/storage/user/Projects/proj-a/ok.txt",
+                      resp["committed"])
+        self.assertEqual(resp["kept"],
+                         ["/storage/user/Projects/proj-a/readonly/no.txt"])
+        self.assertEqual(resp["permission_denied"], resp["kept"])
+        self.assertTrue(self.h.base_has("Projects/proj-a/ok.txt"))
+        self.assertFalse(self.h.base_has("Projects/proj-a/readonly/no.txt"))
+        decisions = self.h.store.load(
+            self.h.session.session_id).policy["turn_path_decisions"]
+        self.assertEqual(
+            decisions["/storage/user/Projects/proj-a/readonly/no.txt"],
+            "kept")
+        self.assertEqual(resp2.get("permission_denied", []), [])
+        self.assertNotIn("/storage/user/Projects/proj-a/readonly/no.txt",
+                         resp2.get("committed", []))
+
     def test_approve_yes_commits_the_out_of_scope_changes(self):
         self.h.write("escape.txt", "x")
         token = self.h.tc.finalize_turn()["approval_token"]

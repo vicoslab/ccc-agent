@@ -19,6 +19,7 @@ import stat
 import subprocess
 import time
 
+from .commit_failures import prune_store_change
 from .policy import Change
 
 
@@ -722,6 +723,16 @@ class FakeBranchFS(object):
 
     def abort(self, root):
         self._cleanup(root)
+
+    def prune_change(self, root, rel):
+        """Remove one successful change from the fake store/status state."""
+        prune_store_change(root, rel)
+        key = self._key(root)
+        deletes = self._deletes.setdefault(key, set())
+        rel = rel.strip("/")
+        deletes.difference_update(
+            item for item in list(deletes)
+            if item == rel or item.startswith(rel.rstrip("/") + "/"))
 
     def _cleanup(self, root):
         files = self._files_dir(root)

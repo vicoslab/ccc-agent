@@ -38,6 +38,7 @@ import os
 import shutil
 import threading
 
+from .commit_failures import is_permission_denied
 from .control import (VERDICT_COMMITTED, VERDICT_HELD, VERDICT_KEPT_STATUS,
                       VERDICT_NEEDS_APPROVAL, VERDICT_NEEDS_KEPT_REVIEW,
                       VERDICT_NOOP)
@@ -110,6 +111,7 @@ class TurnController(object):
         """
         roots = self._roots()
         applied = []
+        denied = []
         for ch in changes:
             root = roots.get(ch.root)
             if root is None:
@@ -117,22 +119,28 @@ class TurnController(object):
             visible = self.alias_map.canonicalize(root.visible)
             rel = os.path.relpath(self.alias_map.canonicalize(ch.path), visible)
             dst = os.path.join(root.base, rel)
-            if ch.op == "D":
-                if os.path.islink(dst) or os.path.isfile(dst):
-                    os.unlink(dst)
-                elif os.path.isdir(dst):
-                    shutil.rmtree(dst)
-            elif ch.kind == "dir":
-                os.makedirs(dst, exist_ok=True)
-            else:
-                src = os.path.join(root.mount, rel)
-                if os.path.exists(src):
-                    parent = os.path.dirname(dst)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    shutil.copy2(src, dst)
+            try:
+                if ch.op == "D":
+                    if os.path.islink(dst) or os.path.isfile(dst):
+                        os.unlink(dst)
+                    elif os.path.isdir(dst):
+                        shutil.rmtree(dst)
+                elif ch.kind == "dir":
+                    os.makedirs(dst, exist_ok=True)
+                else:
+                    src = os.path.join(root.mount, rel)
+                    if os.path.exists(src):
+                        parent = os.path.dirname(dst)
+                        if parent:
+                            os.makedirs(parent, exist_ok=True)
+                        shutil.copy2(src, dst)
+            except Exception as exc:
+                if not is_permission_denied(exc):
+                    raise
+                denied.append(ch.path)
+                continue
             applied.append(ch.path)
-        return applied
+        return applied, denied
 
     # -- control ops -------------------------------------------------------
     def finalize_turn(self, default_keep=False):
@@ -152,23 +160,35 @@ class TurnController(object):
             resolved_paths = self._paths_with_decisions(
                 DECISION_COMMITTED, DECISION_KEPT, DECISION_DISCARDED)
             new_oos = oos - resolved_paths
-            # commit in-scope changes + any previously approved out-of-scope
+            # commit in-scope changes + any previously approved out-of-scope;
+            # keep remembered/rejected in-scope paths out of repeated retries
+            # until the user explicitly resolves them.
+            held_paths = self._paths_with_decisions(
+                DECISION_KEPT, DECISION_DISCARDED)
             to_apply = [c for c in changes
-                        if c.path not in oos or c.path in committed_paths]
-            committed = self._apply(to_apply)
+                        if c.path in committed_paths or
+                        (c.path not in oos and c.path not in held_paths)]
+            committed, permission_denied = self._apply(to_apply)
+            permission_kept = []
+            if permission_denied:
+                permission_kept = self._keep_paths(permission_denied)
+                self.session.add_event(
+                    "turn-permission-denied",
+                    "%d path(s) kept in branch" % len(permission_kept))
 
             if new_oos:
                 if default_keep:
-                    kept = self._keep_paths(new_oos)
+                    kept = self._keep_paths(set(new_oos) | set(permission_kept))
                     self.session.add_event(
                         "turn-default-kept",
                         "%d new out-of-scope path(s) kept in branch" %
-                        len(kept))
+                        len(new_oos))
                     self.store.save(self.session)
                     return {"verdict": (VERDICT_COMMITTED if committed
                                         else VERDICT_HELD),
                             "committed": committed, "kept": kept,
-                            "held": kept, "default_keep": True}
+                            "held": kept, "default_keep": True,
+                            "permission_denied": permission_kept}
                 token = _new_token()
                 self._pending[token] = frozenset(new_oos)
                 self.session.add_event(
@@ -178,7 +198,17 @@ class TurnController(object):
                 return {"verdict": VERDICT_NEEDS_APPROVAL,
                         "out_of_scope": sorted(new_oos),
                         "approval_token": token,
-                        "committed": committed}
+                        "committed": committed,
+                        "kept": permission_kept,
+                        "permission_denied": permission_kept}
+
+            if permission_kept:
+                self.store.save(self.session)
+                return {"verdict": (VERDICT_COMMITTED if committed
+                                    else VERDICT_HELD),
+                        "committed": committed, "kept": permission_kept,
+                        "held": permission_kept,
+                        "permission_denied": permission_kept}
 
             self.session.add_event("turn-committed",
                                    "%d change(s) applied" % len(committed))
@@ -199,8 +229,13 @@ class TurnController(object):
         if not paths:
             return []
         changes = [c for c in self._live_changes() if c.path in paths]
-        committed = self._apply(changes)
+        committed, denied = self._apply(changes)
         self._mark_paths(committed, DECISION_COMMITTED)
+        if denied:
+            self._keep_paths(denied)
+            self.session.add_event(
+                "turn-permission-denied",
+                "%d approved path(s) kept in branch" % len(denied))
         scopes = self.session.policy.setdefault("allowed_scopes", [])
         for path in committed:
             if path not in scopes:
