@@ -33,13 +33,13 @@ fi
 
 # Per-turn control: inside a contained session the agent cannot reach the
 # BranchFS store, so signal end-of-turn to the supervisor over the control
-# socket.  It commits the turn's in-scope changes and exits 0 (the stop
-# proceeds); on out-of-scope changes it exits 2 with the offending paths and an
-# approval token on stderr, which Claude Code feeds back to the agent so it can
-# ask the user and then run `ccc-agent turn-approve <token>`.
+# socket. It commits the turn's in-scope changes and default-keeps new
+# out-of-scope paths in the BranchFS branch, so intermediate autonomous loops do
+# not become approval gates. Final process/session review can still ask the user
+# whether kept paths should be committed or discarded.
 if [ -n "${CCC_AGENT_CONTROL_SOCK:-}" ]; then
     rc=0
-    "$CTL" turn-finalize || rc=$?
+    "$CTL" turn-finalize --default-keep || rc=$?
     exit "$rc"
 fi
 

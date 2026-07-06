@@ -33,13 +33,15 @@ import signal
 import subprocess
 import sys
 import termios
+import time
 import tty
 from importlib import resources
 
 from . import __version__
 from .branchfs import BranchfsCli, FakeBranchFS
 from .control import (ControlClient, VERDICT_COMMITTED, VERDICT_HELD,
-                      VERDICT_NEEDS_APPROVAL)
+                      VERDICT_KEPT_STATUS, VERDICT_NEEDS_APPROVAL,
+                      VERDICT_NEEDS_KEPT_REVIEW)
 from .control import ControlError as ChannelError
 from .ctl import CHECK_REPAIR, Controller, ControlError
 from .paths import AliasMap
@@ -1130,47 +1132,158 @@ def _ctl_socket(args, env):
     client = ControlClient(sock, token)
     try:
         if args.cmd == "turn-finalize":
-            resp = client.finalize_turn()
-        else:  # turn-approve
-            paths = ([p for p in args.paths.split(",") if p]
-                     if getattr(args, "paths", None) else None)
+            resp = client.finalize_turn(
+                default_keep=getattr(args, "default_keep", False))
+        elif args.cmd == "turn-kept-status":
+            resp = client.kept_status()
+        elif args.cmd == "turn-review-kept":
+            resp = client.review_kept()
+        elif args.cmd == "turn-approve":
+            paths = _split_csv_paths(getattr(args, "paths", None))
+            commit_paths = _split_csv_paths(getattr(args, "commit_paths", None))
+            keep_paths = _split_csv_paths(getattr(args, "keep_paths", None))
+            discard_paths = _split_csv_paths(getattr(args, "discard_paths", None))
             resp = client.approve_turn(args.approval_token, args.decision,
-                                       paths=paths)
+                                       paths=paths,
+                                       commit_paths=commit_paths,
+                                       keep_paths=keep_paths,
+                                       discard_paths=discard_paths)
+        else:  # turn-resolve
+            resp = client.resolve_turn(args.decision,
+                                       _split_csv_paths(args.paths) or [])
     except ChannelError as exc:
         sys.stderr.write("ccc-agent: control error: %s\n" % exc)
         return 0
     verdict = resp.get("verdict")
+    if verdict == VERDICT_KEPT_STATUS:
+        _write_kept_status(resp, sys.stdout)
+        return 0
+    if verdict == VERDICT_NEEDS_KEPT_REVIEW:
+        _write_kept_review_prompt(resp, sys.stderr)
+        return 2
     if verdict == VERDICT_NEEDS_APPROVAL:
         paths = resp.get("out_of_scope", [])
         token2 = resp.get("approval_token")
         sys.stderr.write(
-            "ccc-agent: %d change(s) are OUTSIDE the agent workspace and were "
-            "NOT committed:\n" % len(paths))
+            "ccc-agent: %d change(s) are outside the agent workspace or "
+            "out of policy and were NOT committed:\n" % len(paths))
         for path in paths:
             sys.stderr.write("  - %s\n" % path)
         sys.stderr.write(
             "ccc-agent: ask the user how to handle these, then run ONE of:\n"
             "    ccc-agent turn-approve %s            # commit all\n"
-            "    ccc-agent turn-approve %s keep       # keep, don't commit\n"
-            "    ccc-agent turn-approve %s revert     # discard (you undo)\n"
-            "    ccc-agent turn-approve %s --paths a,b # commit only a,b\n"
-            % (token2, token2, token2, token2))
-        return 2
+            "    ccc-agent turn-approve %s keep       # keep in branch, don't commit\n"
+            "    ccc-agent turn-approve %s discard    # discard all (you undo)\n"
+            "    ccc-agent turn-approve %s --paths a,b # commit a,b; keep the rest\n"
+            "    ccc-agent turn-approve %s --commit a --keep b --discard c\n"
+            "ccc-agent: if the user is unavailable and work should continue, run:\n"
+            "    ccc-agent turn-approve %s keep\n"
+            "ccc-agent: kept paths can later be resolved with:\n"
+            "    ccc-agent turn-resolve commit --paths a,b\n"
+            "    ccc-agent turn-resolve discard --paths c\n"
+            % (token2, token2, token2, token2, token2, token2))
+        default_keep_after = getattr(args, "default_keep_after", None)
+        if default_keep_after is None:
+            return 2
+        if default_keep_after > 0:
+            sys.stderr.write(
+                "ccc-agent: no decision within %.1f second(s) will default "
+                "to keep-in-branch/non-commit\n" % default_keep_after)
+            time.sleep(default_keep_after)
+        try:
+            resp = client.approve_turn(token2, "keep")
+        except ChannelError as exc:
+            sys.stderr.write(
+                "ccc-agent: pending turn was not auto-kept, possibly already "
+                "resolved: %s\n" % exc)
+            return 0
+        verdict = resp.get("verdict")
     if verdict == VERDICT_COMMITTED:
         msg = "committed %d change(s)" % len(resp.get("committed", []))
-        if resp.get("held"):
+        if resp.get("kept"):
+            msg += " (kept %d in branch)" % len(resp["kept"])
+        elif resp.get("held"):
             msg += " (held %d for review)" % len(resp["held"])
         sys.stdout.write(msg + "\n")
-    elif verdict == VERDICT_HELD:
+        if resp.get("kept"):
+            _write_kept_paths(resp["kept"])
         if resp.get("revert"):
             sys.stdout.write("rejected; revert these in your workspace:\n")
             for path in resp["revert"]:
                 sys.stdout.write("  - %s\n" % path)
-        else:
+    elif verdict == VERDICT_HELD:
+        if resp.get("kept"):
+            sys.stdout.write("kept %d path(s) in branch (not committed)\n"
+                             % len(resp["kept"]))
+            _write_kept_paths(resp["kept"])
+        if resp.get("revert"):
+            sys.stdout.write("rejected; revert these in your workspace:\n")
+            for path in resp["revert"]:
+                sys.stdout.write("  - %s\n" % path)
+        if not resp.get("kept") and not resp.get("revert"):
             sys.stdout.write("changes held for review (not committed)\n")
     else:
         sys.stdout.write("%s\n" % (verdict or "ok"))
     return 0
+
+
+def _write_kept_status(resp, stream):
+    paths = list(resp.get("kept") or [])
+    stale = list(resp.get("stale") or [])
+    if not paths:
+        stream.write("no kept non-workspace paths are currently live\n")
+    else:
+        stream.write("kept non-workspace paths (not committed to real storage):\n")
+        for path in paths:
+            stream.write("  - %s\n" % path)
+        joined = ",".join(paths)
+        stream.write(
+            "resolve with: ccc-agent turn-resolve commit --paths %s\n"
+            "or: ccc-agent turn-resolve discard --paths %s\n"
+            "or inspect again: ccc-agent turn-kept-status\n"
+            % (joined, joined))
+    if stale:
+        stream.write("remembered kept paths no longer present as live changes:\n")
+        for path in stale:
+            stream.write("  - %s\n" % path)
+
+
+def _write_kept_review_prompt(resp, stream):
+    paths = list(resp.get("kept") or [])
+    if not paths:
+        stream.write("ccc-agent: no kept non-workspace paths need review\n")
+        return
+    stream.write(
+        "ccc-agent: ask the user what to do with kept non-workspace paths "
+        "(still only in BranchFS, not committed):\n")
+    for path in paths:
+        stream.write("  - %s\n" % path)
+    joined = ",".join(paths)
+    stream.write(
+        "ccc-agent: then run one of:\n"
+        "    ccc-agent turn-resolve commit --paths %s\n"
+        "    ccc-agent turn-resolve discard --paths %s\n"
+        "    ccc-agent turn-resolve keep --paths %s\n"
+        "ccc-agent: status only: ccc-agent turn-kept-status\n"
+        % (joined, joined, joined))
+
+
+def _write_kept_paths(paths):
+    sys.stdout.write("kept in branch only (not committed to real storage):\n")
+    for path in paths:
+        sys.stdout.write("  - %s\n" % path)
+    joined = ",".join(paths)
+    if joined:
+        sys.stdout.write(
+            "resolve later with: ccc-agent turn-resolve commit --paths %s\n"
+            "or: ccc-agent turn-resolve discard --paths %s\n"
+            % (joined, joined))
+
+
+def _split_csv_paths(value):
+    if not value:
+        return None
+    return [p for p in str(value).split(",") if p]
 
 
 _SESSION_ID_CTL_OPS = (
@@ -1199,6 +1312,12 @@ _CTL_COMMAND_HELP = {
                       "via socket"),
     "turn-approve": ("inside-session plugin op: answer a pending turn "
                      "approval token"),
+    "turn-resolve": ("inside-session plugin op: resolve remembered "
+                     "kept/discarded turn paths"),
+    "turn-kept-status": ("inside-session plugin op: show remembered kept "
+                         "non-workspace paths"),
+    "turn-review-kept": ("inside-session plugin op: ask about remembered "
+                         "kept non-workspace paths"),
 }
 
 
@@ -1210,6 +1329,16 @@ def _nonnegative_days(value):
     if days < 0:
         raise argparse.ArgumentTypeError("must be a non-negative day count")
     return days
+
+
+def _nonnegative_seconds(value):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a non-negative second count")
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative second count")
+    return seconds
 
 
 def _add_session_id_arg(parser, multiple=False):
@@ -1325,17 +1454,38 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                     help="apply a (possibly pruned) patch to base for "
                          "line-level commit")
     # per-turn socket ops (no session_id; identified by the socket+token)
-    _add_ctl_parser(sub, "turn-finalize")
+    fp = _add_ctl_parser(sub, "turn-finalize")
+    fp.add_argument("--default-keep", action="store_true",
+                    help="do not block for new out-of-scope paths; keep them "
+                         "in the branch and continue")
+    fp.add_argument("--default-keep-after", metavar="SECONDS",
+                    type=_nonnegative_seconds,
+                    help="first emit the approval prompt; if no external "
+                         "approval arrives within SECONDS, keep the flagged "
+                         "paths in the branch and continue")
     ap = _add_ctl_parser(sub, "turn-approve")
     ap.add_argument("approval_token")
     ap.add_argument("decision", nargs="?", default="yes",
                     help="yes (commit all, default) | keep (don't commit) | "
                          "revert (discard)")
     ap.add_argument("--paths", help="comma-separated subset to commit "
-                                    "file-by-file; the rest are held")
+                                    "file-by-file; the rest are kept")
+    ap.add_argument("--commit", dest="commit_paths",
+                    help="comma-separated paths to commit")
+    ap.add_argument("--keep", dest="keep_paths",
+                    help="comma-separated paths to keep in the branch only")
+    ap.add_argument("--discard", dest="discard_paths",
+                    help="comma-separated paths to discard/revert")
+    rp = _add_ctl_parser(sub, "turn-resolve")
+    rp.add_argument("decision", help="commit | keep | discard")
+    rp.add_argument("--paths", required=True,
+                    help="comma-separated remembered paths to resolve")
+    _add_ctl_parser(sub, "turn-kept-status")
+    _add_ctl_parser(sub, "turn-review-kept")
     args = parser.parse_args(argv)
 
-    if args.cmd in ("turn-finalize", "turn-approve"):
+    if args.cmd in ("turn-finalize", "turn-approve", "turn-resolve",
+                    "turn-kept-status", "turn-review-kept"):
         return _ctl_socket(args, env)
 
     config = load_config(args.config, env=env)
@@ -1411,7 +1561,8 @@ def main_softsandbox(argv=None, env=None):
 
 _CTL_OPS = (set(_SESSION_ID_CTL_OPS) | {
     "list", "ls", "cleanup", "diff", "review", "turn-finalize",
-    "turn-approve",
+    "turn-approve", "turn-resolve", "turn-kept-status",
+    "turn-review-kept",
 })
 _SESSION_ID_COMPLETION_OPS = (
     set(_SESSION_ID_CTL_OPS) | {"diff", "review", "list", "ls", "resume"}
@@ -1558,6 +1709,8 @@ def _options_for_completion(op):
         return _RESUME_OPTIONS
     if op == "run":
         return _RUN_OPTIONS
+    if op == "turn-finalize":
+        return ("--default-keep", "--default-keep-after", "--config", "--help")
     if op in _CTL_OPS or op in ("launch", "setup", "softsandbox",
                                 "completion"):
         return ("--config", "--help")
@@ -1673,6 +1826,8 @@ def _print_main_help(stream=None):
         "control socket\n"
         "  turn-approve    inside session: answer a pending per-turn approval "
         "token\n"
+        "  turn-resolve    inside session: commit/keep/discard a previously "
+        "remembered path\n"
         "  turn-check      hook adapter: ask a running session to repair "
         "policy/conflict issues before finalizing\n"
         "  turn-record     hook adapter: record a turn-boundary event for a "

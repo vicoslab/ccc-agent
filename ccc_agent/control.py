@@ -15,7 +15,7 @@ changes without a relayed user approval; an agent can at worst spoof its OWN
 approval (accepted) but can never escape the in-scope policy.
 
 Protocol: one JSON object per line, request then response, connection per call.
-  request : {"version":1, "token":..., "op":"turn-finalize"|"turn-approve", ...}
+  request : {"version":1, "token":..., "op":"turn-finalize"|"turn-approve"|"turn-resolve"|"turn-kept-status"|"turn-review-kept", ...}
   response: {"ok":true, "verdict":..., ...} | {"ok":false, "error":...}
 """
 
@@ -31,6 +31,8 @@ VERDICT_COMMITTED = "committed"          # in-scope (or approved): applied to ba
 VERDICT_NEEDS_APPROVAL = "needs-approval"  # out-of-scope: relay to the user
 VERDICT_NOOP = "noop"                    # nothing changed this turn
 VERDICT_HELD = "held"                    # approval denied: left uncommitted
+VERDICT_KEPT_STATUS = "kept-status"      # read-only remembered kept-path view
+VERDICT_NEEDS_KEPT_REVIEW = "needs-kept-review"  # final idle ask is needed
 
 
 class ControlError(Exception):
@@ -173,21 +175,44 @@ class ControlClient(object):
             raise ControlError(resp.get("error", "unknown control error"))
         return resp
 
-    def finalize_turn(self):
+    def finalize_turn(self, default_keep=False):
         """Signal end-of-turn (Stop boundary). Returns the supervisor verdict."""
-        return self._request({"op": "turn-finalize"})
+        req = {"op": "turn-finalize", "default_keep": bool(default_keep)}
+        return self._request(req)
 
-    def approve_turn(self, approval_token, decision, paths=None):
+    def approve_turn(self, approval_token, decision, paths=None,
+                     commit_paths=None, keep_paths=None, discard_paths=None):
         """Relay the user's decision for an out-of-scope turn.
 
         ``decision`` is "yes" (commit all flagged), "no"/"keep" (leave
         uncommitted, session continues), or "revert" (hold + ask the agent to
-        undo).  ``paths`` (optional) selects a file-level subset to commit; the
-        rest are held.
+        undo).  ``paths`` (optional legacy form) selects a file-level subset to
+        commit; the rest are kept.  ``commit_paths``, ``keep_paths``, and
+        ``discard_paths`` provide explicit per-file decisions in one response.
         """
         req = {"op": "turn-approve",
                "approval_token": approval_token,
                "decision": decision}
         if paths:
             req["paths"] = list(paths)
+        if commit_paths:
+            req["commit_paths"] = list(commit_paths)
+        if keep_paths:
+            req["keep_paths"] = list(keep_paths)
+        if discard_paths:
+            req["discard_paths"] = list(discard_paths)
         return self._request(req)
+
+    def resolve_turn(self, decision, paths):
+        """Resolve already-kept paths later in a live contained session."""
+        req = {"op": "turn-resolve", "decision": decision,
+               "paths": list(paths)}
+        return self._request(req)
+
+    def kept_status(self):
+        """Read remembered kept paths that are still live branch changes."""
+        return self._request({"op": "turn-kept-status"})
+
+    def review_kept(self):
+        """Ask whether remembered kept paths need a final user decision."""
+        return self._request({"op": "turn-review-kept"})

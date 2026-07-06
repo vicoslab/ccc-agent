@@ -5,9 +5,10 @@ Loaded only inside a bwrap-contained CCC session (ccc-agent run points
 ``HERMES_ACCEPT_HOOKS=1``). A direct ``hermes`` run does not see this plugin.
 
 The hooks are best-effort turn/session-boundary SIGNALS: they shell out to
-``ccc-agent turn-finalize``, which reaches the trusted supervisor over the
-per-turn control socket (``CCC_AGENT_CONTROL_SOCK``). The supervisor commits the
-turn's in-scope changes and defers anything out-of-scope to session-end review.
+``ccc-agent turn-finalize --default-keep``, which reaches the trusted supervisor
+over the per-turn control socket (``CCC_AGENT_CONTROL_SOCK``). The supervisor
+commits the turn's in-scope changes and keeps non-workspace/out-of-policy paths
+in the BranchFS branch until final/idle user review.
 This plugin never freezes, commits, or aborts, and every path degrades safely:
 if the control socket or ccc-agent is missing the hook is a silent no-op, and
 process-exit finalization in ccc-agent run remains the authoritative fallback.
@@ -35,7 +36,7 @@ def _signal_turn_boundary(**_):
         return  # no per-turn control channel; session-end review handles it
     ctl = os.environ.get("CCC_AGENT_CLI", "ccc-agent")
     try:
-        subprocess.run([ctl, "turn-finalize"],
+        subprocess.run([ctl, "turn-finalize", "--default-keep"],
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL,
                        timeout=30, check=False)

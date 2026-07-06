@@ -43,6 +43,19 @@ class TestControlChannel(unittest.TestCase):
         self.assertEqual(self.seen[-1]["op"], "turn-finalize")
         self.assertEqual(self.seen[-1]["version"], 1)
 
+    def test_finalize_turn_can_request_default_keep(self):
+        def handler(req):
+            self.seen.append(req)
+            return {"verdict": VERDICT_COMMITTED, "committed": ["ok"],
+                    "kept": ["/storage/user/escape.txt"]}
+
+        self._server(handler)
+        resp = ControlClient(self.sock, self.token).finalize_turn(
+            default_keep=True)
+
+        self.assertEqual(resp["verdict"], VERDICT_COMMITTED)
+        self.assertTrue(self.seen[-1]["default_keep"])
+
     def test_needs_approval_carries_paths_and_token(self):
         def handler(req):
             return {"verdict": VERDICT_NEEDS_APPROVAL,
@@ -65,6 +78,47 @@ class TestControlChannel(unittest.TestCase):
         self.assertEqual(resp["echo_op"], "turn-approve")
         self.assertEqual(resp["echo_decision"], "yes")
         self.assertEqual(resp["echo_appr"], "appr-1")
+
+    def test_approve_turn_passes_granular_path_decisions(self):
+        def handler(req):
+            return {"echo_op": req["op"],
+                    "commit": req.get("commit_paths"),
+                    "keep": req.get("keep_paths"),
+                    "discard": req.get("discard_paths")}
+
+        self._server(handler)
+        resp = ControlClient(self.sock, self.token).approve_turn(
+            "appr-1", "select", commit_paths=["/a"], keep_paths=["/b"],
+            discard_paths=["/c"])
+
+        self.assertEqual(resp["echo_op"], "turn-approve")
+        self.assertEqual(resp["commit"], ["/a"])
+        self.assertEqual(resp["keep"], ["/b"])
+        self.assertEqual(resp["discard"], ["/c"])
+
+    def test_resolve_turn_passes_later_path_decision(self):
+        def handler(req):
+            return {"echo_op": req["op"],
+                    "echo_decision": req.get("decision"),
+                    "echo_paths": req.get("paths")}
+
+        self._server(handler)
+        resp = ControlClient(self.sock, self.token).resolve_turn(
+            "discard", ["/storage/user/held.txt"])
+
+        self.assertEqual(resp["echo_op"], "turn-resolve")
+        self.assertEqual(resp["echo_decision"], "discard")
+        self.assertEqual(resp["echo_paths"], ["/storage/user/held.txt"])
+
+    def test_kept_status_and_review_kept_pass_control_ops(self):
+        def handler(req):
+            return {"echo_op": req["op"], "verdict": "kept-status"}
+
+        self._server(handler)
+        client = ControlClient(self.sock, self.token)
+
+        self.assertEqual(client.kept_status()["echo_op"], "turn-kept-status")
+        self.assertEqual(client.review_kept()["echo_op"], "turn-review-kept")
 
     def test_bad_token_rejected(self):
         self._server(lambda req: {"verdict": VERDICT_COMMITTED})

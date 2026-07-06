@@ -942,7 +942,189 @@ class TestMainCtl(unittest.TestCase):
         self.assertIn("ls", text)
         self.assertIn("finalize the current turn", text)
         self.assertIn("inside-session plugin op: answer a pending turn", text)
+        self.assertIn("resolve remembered", text)
+        self.assertIn("kept/discarded turn paths", text)
+        self.assertIn("turn-kept-status", text)
+        self.assertIn("show remembered kept", text)
+        self.assertIn("turn-review-kept", text)
+        self.assertIn("ask about remembered kept", text)
         self.assertIn("approval token", text)
+
+    def test_turn_finalize_cli_can_default_keep_for_nonblocking_loops(self):
+        seen = {}
+
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                seen["init"] = (sock, token)
+
+            def finalize_turn(self, default_keep=False):
+                seen["default_keep"] = default_keep
+                return {"verdict": "committed", "committed": ["/workspace/ok"],
+                        "kept": ["/storage/user/outside.txt"]}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        out = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stdout(out):
+                code = main_ctl(["turn-finalize", "--default-keep"], env=env)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(seen["default_keep"])
+        self.assertIn("committed 1 change(s)", out.getvalue())
+        self.assertIn("kept 1 in branch", out.getvalue())
+
+    def test_turn_finalize_cli_prompts_then_keeps_after_timeout(self):
+        seen = {}
+
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                seen["init"] = (sock, token)
+
+            def finalize_turn(self, default_keep=False):
+                seen["default_keep"] = default_keep
+                return {"verdict": "needs-approval",
+                        "approval_token": "appr-1",
+                        "out_of_scope": ["/storage/user/outside.txt"],
+                        "committed": ["/storage/user/Projects/proj-a/ok.txt"]}
+
+            def approve_turn(self, approval_token, decision, paths=None,
+                             commit_paths=None, keep_paths=None,
+                             discard_paths=None):
+                seen["approve"] = (approval_token, decision)
+                return {"verdict": "committed",
+                        "committed": [],
+                        "kept": ["/storage/user/outside.txt"]}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with mock.patch("ccc_agent.cli.time.sleep") as sleep:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = main_ctl(["turn-finalize", "--default-keep-after", "0"],
+                                    env=env)
+
+        self.assertEqual(code, 0)
+        self.assertFalse(seen["default_keep"])
+        self.assertEqual(seen["approve"], ("appr-1", "keep"))
+        sleep.assert_not_called()
+        self.assertIn("ask the user", err.getvalue())
+        self.assertIn("outside.txt", err.getvalue())
+        self.assertIn("kept 1 in branch", out.getvalue())
+
+    def test_turn_approve_cli_accepts_granular_file_decisions(self):
+        seen = {}
+
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                seen["init"] = (sock, token)
+
+            def approve_turn(self, approval_token, decision, paths=None,
+                             commit_paths=None, keep_paths=None,
+                             discard_paths=None):
+                seen["approve"] = {
+                    "approval_token": approval_token,
+                    "decision": decision,
+                    "paths": paths,
+                    "commit_paths": commit_paths,
+                    "keep_paths": keep_paths,
+                    "discard_paths": discard_paths,
+                }
+                return {"verdict": "committed", "committed": ["/a"],
+                        "kept": ["/b"], "revert": ["/c"]}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        out = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stdout(out):
+                code = main_ctl([
+                    "turn-approve", "appr-1", "select",
+                    "--commit", "/a", "--keep", "/b", "--discard", "/c",
+                ], env=env)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["init"], ("/tmp/ccc.sock", "tok"))
+        self.assertEqual(seen["approve"], {
+            "approval_token": "appr-1",
+            "decision": "select",
+            "paths": None,
+            "commit_paths": ["/a"],
+            "keep_paths": ["/b"],
+            "discard_paths": ["/c"],
+        })
+        self.assertIn("committed 1 change(s)", out.getvalue())
+        self.assertIn("kept 1", out.getvalue())
+        self.assertIn("revert these", out.getvalue())
+
+    def test_turn_resolve_cli_sends_later_kept_path_decision(self):
+        seen = {}
+
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                seen["init"] = (sock, token)
+
+            def resolve_turn(self, decision, paths):
+                seen["resolve"] = (decision, paths)
+                return {"verdict": "held", "revert": ["/b"]}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        out = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stdout(out):
+                code = main_ctl(["turn-resolve", "discard", "--paths", "/b"],
+                                env=env)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["resolve"], ("discard", ["/b"]))
+        self.assertIn("revert these", out.getvalue())
+
+    def test_turn_kept_status_cli_lists_remembered_kept_paths(self):
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                pass
+
+            def kept_status(self):
+                return {"verdict": "kept-status",
+                        "kept": ["/storage/user/outside.txt"],
+                        "stale": [], "count": 1}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        out = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stdout(out):
+                code = main_ctl(["turn-kept-status"], env=env)
+
+        self.assertEqual(code, 0)
+        self.assertIn("kept non-workspace paths", out.getvalue())
+        self.assertIn("outside.txt", out.getvalue())
+        self.assertIn("turn-resolve commit", out.getvalue())
+
+    def test_turn_review_kept_cli_exits_two_when_user_decision_needed(self):
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                pass
+
+            def review_kept(self):
+                return {"verdict": "needs-kept-review",
+                        "kept": ["/storage/user/outside.txt"],
+                        "stale": [], "message": "ask user"}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        err = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stderr(err):
+                code = main_ctl(["turn-review-kept"], env=env)
+
+        self.assertEqual(code, 2)
+        self.assertIn("ask the user", err.getvalue())
+        self.assertIn("outside.txt", err.getvalue())
+        self.assertIn("turn-resolve commit", err.getvalue())
 
     def test_diff_accepts_optional_path(self):
         base_path = os.path.join(self.h.base, self.h.workspace_rel, "cli.txt")
@@ -1355,7 +1537,7 @@ class TestUnifiedMain(unittest.TestCase):
             code = main(["--version"], env={})
 
         self.assertEqual(code, 0)
-        self.assertEqual(out.getvalue(), "ccc-agent v0.2\n")
+        self.assertEqual(out.getvalue(), "ccc-agent v0.4\n")
 
     def test_top_level_help_groups_commands_by_audience(self):
         out = io.StringIO()
@@ -1382,6 +1564,7 @@ class TestUnifiedMain(unittest.TestCase):
         plugin_text = text[plugin:auxiliary]
         self.assertIn("turn-finalize", plugin_text)
         self.assertIn("turn-approve", plugin_text)
+        self.assertIn("turn-resolve", plugin_text)
         auxiliary_text = text[auxiliary:]
         self.assertIn("setup", auxiliary_text)
         self.assertIn("completion", auxiliary_text)

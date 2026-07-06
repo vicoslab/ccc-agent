@@ -61,6 +61,20 @@ class TestPluginAssets(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(root, "hooks", "ccc-stop-hook.sh")))
 
+    def test_branchfs_commit_skill_is_bundled_for_claude_and_codex(self):
+        bodies = []
+        for plugin in ("claude-ccc-containment", "codex-ccc-containment"):
+            path = os.path.join(PLUGINS, plugin, "skills", "branchfs-commit",
+                                "SKILL.md")
+            self.assertTrue(os.path.isfile(path), path)
+            with open(path) as fh:
+                bodies.append(fh.read())
+        self.assertEqual(len(set(bodies)), 1)
+        self.assertLess(len(bodies[0].split()), 130)
+        self.assertIn("turn-review-kept", bodies[0])
+        self.assertIn("turn-kept-status", bodies[0])
+        self.assertIn("turn-resolve", bodies[0])
+
     def test_hermes_plugin_layout(self):
         root = os.path.join(PLUGINS, "hermes-ccc-containment")
         self.assertTrue(os.path.isfile(os.path.join(root, "plugin.yaml")))
@@ -83,7 +97,7 @@ class TestPluginAssets(unittest.TestCase):
         # carries block/allow semantics.
         with open(PLUGIN_STOP_HOOKS[0]) as fh:
             body = fh.read()
-        self.assertIn('"$CTL" turn-finalize 1>&2 || rc=$?', body)
+        self.assertIn('"$CTL" turn-finalize --default-keep 1>&2 || rc=$?', body)
 
 
 class TestShim(unittest.TestCase):
@@ -272,8 +286,11 @@ class TestStopHookControlSocket(unittest.TestCase):
     def fake_ctl(self, finalize_rc):
         with open(self.ctl, "w") as fh:
             fh.write("#!/bin/sh\n"
-                     "echo \"CALLED $1\" 1>&2\n"
-                     "if [ \"$1\" = turn-finalize ]; then exit %d; fi\n"
+                     "echo \"CALLED $*\" 1>&2\n"
+                     "if [ \"$1\" = turn-finalize ]; then\n"
+                     "  if [ \"${2:-}\" = --default-keep ]; then exit 0; fi\n"
+                     "  exit %d\n"
+                     "fi\n"
                      "exit 0\n" % finalize_rc)
         os.chmod(self.ctl, 0o755)
 
@@ -291,15 +308,15 @@ class TestStopHookControlSocket(unittest.TestCase):
             self.fake_ctl(0)
             proc = self.run_hook(hook)
             self.assertEqual(proc.returncode, 0, "%s: %s" % (hook, proc.stderr))
-            self.assertIn("CALLED turn-finalize", proc.stderr)
+            self.assertIn("CALLED turn-finalize --default-keep", proc.stderr)
             self.assertNotIn("turn-check", proc.stderr)
 
-    def test_needs_approval_blocks_stop(self):
+    def test_default_keep_lets_stop_continue_instead_of_blocking(self):
         for hook in STOP_HOOKS:
             self.fake_ctl(2)
             proc = self.run_hook(hook)
-            self.assertEqual(proc.returncode, 2, "%s: %s" % (hook, proc.stderr))
-            self.assertIn("CALLED turn-finalize", proc.stderr)
+            self.assertEqual(proc.returncode, 0, "%s: %s" % (hook, proc.stderr))
+            self.assertIn("CALLED turn-finalize --default-keep", proc.stderr)
 
 
 class TestHooksAreNoopsOutsideSessions(unittest.TestCase):

@@ -121,6 +121,109 @@ class TestTurnController(unittest.TestCase):
         self.assertEqual(resp["verdict"], VERDICT_HELD)
         self.assertFalse(self.h.base_has("escape.txt"))
 
+    def test_default_keep_commits_in_scope_and_keeps_oos_without_prompt(self):
+        self.h.write("Projects/proj-a/ok.txt", "ok")
+        self.h.write("escape.txt", "x")
+
+        resp = self.h.tc.finalize_turn(default_keep=True)
+
+        self.assertEqual(resp["verdict"], VERDICT_COMMITTED)
+        self.assertIn("/storage/user/Projects/proj-a/ok.txt",
+                      resp["committed"])
+        self.assertEqual(resp["kept"], ["/storage/user/escape.txt"])
+        self.assertNotIn("approval_token", resp)
+        self.assertTrue(self.h.base_has("Projects/proj-a/ok.txt"))
+        self.assertFalse(self.h.base_has("escape.txt"))
+        persisted = self.h.store.load(self.h.session.session_id)
+        self.assertEqual(
+            persisted.policy["turn_path_decisions"]["/storage/user/escape.txt"],
+            "kept")
+
+    def test_keep_decision_is_persisted_and_not_reprompted(self):
+        self.h.write("escape.txt", "x")
+        token = self.h.tc.finalize_turn()["approval_token"]
+        self.h.tc.approve_turn(token, "keep")
+
+        persisted = self.h.store.load(self.h.session.session_id)
+        self.assertEqual(
+            persisted.policy["turn_path_decisions"]["/storage/user/escape.txt"],
+            "kept")
+
+        # Reconstruct the controller as a process/control-server restart would.
+        tc2 = TurnController(persisted, self.h.store, self.h.backend,
+                             self.h.alias)
+        self.h.write("Projects/proj-a/c.txt", "c")
+        resp2 = tc2.finalize_turn()
+        self.assertEqual(resp2["verdict"], VERDICT_COMMITTED)
+        self.assertNotIn("approval_token", resp2)
+        self.assertTrue(self.h.base_has("Projects/proj-a/c.txt"))
+        self.assertFalse(self.h.base_has("escape.txt"))
+
+    def test_later_commit_of_kept_path_commits_and_stops_prompting(self):
+        self.h.write("escape.txt", "x")
+        token = self.h.tc.finalize_turn()["approval_token"]
+        self.h.tc.approve_turn(token, "keep")
+
+        persisted = self.h.store.load(self.h.session.session_id)
+        tc2 = TurnController(persisted, self.h.store, self.h.backend,
+                             self.h.alias)
+        resp = tc2.resolve_turn("commit", ["/storage/user/escape.txt"])
+
+        self.assertEqual(resp["verdict"], VERDICT_COMMITTED)
+        self.assertTrue(self.h.base_has("escape.txt"))
+        persisted2 = self.h.store.load(self.h.session.session_id)
+        self.assertEqual(
+            persisted2.policy["turn_path_decisions"]["/storage/user/escape.txt"],
+            "committed")
+        self.assertIn("/storage/user/escape.txt",
+                      persisted2.policy["allowed_scopes"])
+
+    def test_kept_status_lists_live_kept_paths(self):
+        self.h.write("escape.txt", "x")
+        resp = self.h.tc.finalize_turn(default_keep=True)
+        self.assertEqual(resp["kept"], ["/storage/user/escape.txt"])
+
+        status = self.h.tc.kept_status()
+
+        self.assertEqual(status["verdict"], "kept-status")
+        self.assertEqual(status["kept"], ["/storage/user/escape.txt"])
+        self.assertEqual(status["count"], 1)
+
+    def test_review_kept_requests_user_decision_only_when_kept_paths_exist(self):
+        self.assertEqual(self.h.tc.review_kept()["verdict"], VERDICT_NOOP)
+        self.h.write("escape.txt", "x")
+        self.h.tc.finalize_turn(default_keep=True)
+
+        review = self.h.tc.review_kept()
+
+        self.assertEqual(review["verdict"], "needs-kept-review")
+        self.assertEqual(review["kept"], ["/storage/user/escape.txt"])
+        self.assertIn("turn-resolve", review["message"])
+
+    def test_granular_approval_can_commit_discard_and_keep_paths(self):
+        self.h.write("commit-me.txt", "a")
+        self.h.write("discard-me.txt", "b")
+        self.h.write("keep-me.txt", "c")
+        token = self.h.tc.finalize_turn()["approval_token"]
+
+        resp = self.h.tc.approve_turn(
+            token, "select",
+            commit_paths=["/storage/user/commit-me.txt"],
+            discard_paths=["/storage/user/discard-me.txt"],
+            keep_paths=["/storage/user/keep-me.txt"])
+
+        self.assertEqual(resp["verdict"], VERDICT_COMMITTED)
+        self.assertTrue(self.h.base_has("commit-me.txt"))
+        self.assertFalse(self.h.base_has("discard-me.txt"))
+        self.assertFalse(self.h.base_has("keep-me.txt"))
+        self.assertEqual(resp["revert"], ["/storage/user/discard-me.txt"])
+        self.assertEqual(resp["kept"], ["/storage/user/keep-me.txt"])
+        decisions = self.h.store.load(
+            self.h.session.session_id).policy["turn_path_decisions"]
+        self.assertEqual(decisions["/storage/user/commit-me.txt"], "committed")
+        self.assertEqual(decisions["/storage/user/discard-me.txt"], "discarded")
+        self.assertEqual(decisions["/storage/user/keep-me.txt"], "kept")
+
     def test_approve_revert_holds_and_asks_agent_to_undo(self):
         self.h.write("escape.txt", "x")
         token = self.h.tc.finalize_turn()["approval_token"]

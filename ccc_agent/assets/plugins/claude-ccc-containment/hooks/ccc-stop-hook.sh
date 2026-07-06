@@ -30,13 +30,13 @@ fi
 
 # Per-turn control: inside the sandbox the agent cannot reach the BranchFS
 # store, so signal end-of-turn to the supervisor over the control socket. It
-# commits the turn's in-scope changes and exits 0 (the stop proceeds); on
-# out-of-scope changes it exits 2 with the offending paths and an approval
-# token on stderr, which the agent feeds back to the user before running
-# `ccc-agent turn-approve <token>`.
+# commits the turn's in-scope changes and default-keeps new out-of-scope paths
+# in the BranchFS branch, so intermediate autonomous loops do not become
+# approval gates. Final process/session review can still ask the user whether
+# kept paths should be committed or discarded.
 if [ -n "${CCC_AGENT_CONTROL_SOCK:-}" ]; then
     rc=0
-    "$CTL" turn-finalize 1>&2 || rc=$?
+    "$CTL" turn-finalize --default-keep 1>&2 || rc=$?
     exit "$rc"
 fi
 

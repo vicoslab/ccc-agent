@@ -5,4 +5,4 @@ inside arbitrary CCC containers and must not depend on site-packages the
 container may not have.
 """
 
-__version__ = "0.3"
+__version__ = "0.4"

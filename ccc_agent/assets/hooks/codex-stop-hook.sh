@@ -15,11 +15,13 @@ command -v "$CTL" >/dev/null 2>&1 || exit 0
 
 # Per-turn control: signal end-of-turn to the supervisor over the control
 # socket (the in-sandbox agent can't reach the store). It commits in-scope
-# changes and exits 0; on out-of-scope it exits 2 with the paths + approval
-# token on stderr so the agent asks the user, then runs turn-approve.
+# changes and default-keeps new out-of-scope paths in the BranchFS branch, so
+# intermediate autonomous loops do not become approval gates. Final process /
+# session review can still ask the user whether kept paths should be committed
+# or discarded.
 if [ -n "${CCC_AGENT_CONTROL_SOCK:-}" ]; then
     rc=0
-    "$CTL" turn-finalize || rc=$?
+    "$CTL" turn-finalize --default-keep || rc=$?
     exit "$rc"
 fi
 

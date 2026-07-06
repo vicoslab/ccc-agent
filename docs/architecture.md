@@ -29,11 +29,15 @@ inspect, commit, or abort them. This holds because:
    mountpoints, and per-turn control sockets are grouped under one
    `<state_dir>/<session-id>/` bundle outside the view and additionally covered
    by the `.ccc-agent` deny pattern;
-4. hooks invoke `ccc-agent turn-record` (records an event) and
-   `ccc-agent turn-check` (reads live status; exit 2 asks the
-   agent to revert policy violations, bounded by
-   `max_policy_repair_attempts`) — there is no hook path that freezes or
-   commits.
+4. plugin hooks report turn boundaries to the trusted supervisor: the legacy
+   store-based path invokes `turn-record`/`turn-check` only, while the bwrap
+   control-socket path invokes `turn-finalize --default-keep` so the supervisor
+   can commit in-scope workspace changes and keep non-workspace/out-of-policy
+   paths in the branch without turning intermediate autonomous loops into
+   approval gates. A bundled `branchfs-commit` skill tells the agent to run
+   `turn-review-kept` only when it is actually finished/idle; users can inspect
+   the live kept set with `turn-kept-status`. The hook itself never gets direct
+   BranchFS commit/abort authority.
 
 ## Session lifecycle (process-exit completion, first milestone)
 
@@ -54,10 +58,11 @@ created -> mounting -> running -> finalizing -> frozen
   because abort has already discarded the branch delta, resume recreates an
   empty branch from the current base. Custom resume commands do not overwrite the
   stored original exec.
-- Freeze happens **after** completion — and, for harnesses with blocking
-  Stop hooks, after the bounded self-repair loop (`turn-check`) has
-  allowed the stop — then `branchfs status --json` per root feeds the policy
-  engine.
+- Freeze happens **after** completion; per-turn control-socket hooks may already
+  have committed ordinary workspace changes and default-kept non-workspace data
+  in the live branch. The legacy blocking self-repair path (`turn-check`) can
+  still ask the agent to repair policy/conflict issues before finalization, then
+  `branchfs status --json` per root feeds the policy engine.
 - `pending-review` keeps branches frozen; the branchfs daemon may exit (it
   auto-exits with its last mount) — `ccc-agent commit/abort SESSION [SESSION ...]`
   re-ensures it from session metadata (`branchfs start-daemon --base ... --storage ...`).

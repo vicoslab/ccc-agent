@@ -36,6 +36,7 @@ version = { attr = "ccc_agent.__version__" }
     "assets/plugins/codex-ccc-containment/.codex-plugin/*.json",
     "assets/plugins/**/*.sh",
     "assets/plugins/**/*.yaml",
+    "assets/plugins/**/*.md",
     "assets/plugins/**/*.py",
 ]
 
