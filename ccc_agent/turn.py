@@ -43,10 +43,9 @@ from .control import (VERDICT_COMMITTED, VERDICT_HELD, VERDICT_KEPT_STATUS,
                       VERDICT_NEEDS_APPROVAL, VERDICT_NEEDS_KEPT_REVIEW,
                       VERDICT_NOOP)
 from .policy import PolicyConfig, classify, filter_ignored
+from .previous_commits import DECISION_COMMITTED, TURN_PATH_DECISIONS
 
 
-TURN_PATH_DECISIONS = "turn_path_decisions"
-DECISION_COMMITTED = "committed"
 DECISION_KEPT = "kept"
 DECISION_DISCARDED = "discarded"
 
@@ -169,6 +168,7 @@ class TurnController(object):
                         if c.path in committed_paths or
                         (c.path not in oos and c.path not in held_paths)]
             committed, permission_denied = self._apply(to_apply)
+            self._mark_paths(committed, DECISION_COMMITTED)
             permission_kept = []
             if permission_denied:
                 permission_kept = self._keep_paths(permission_denied)

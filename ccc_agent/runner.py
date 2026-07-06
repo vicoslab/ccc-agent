@@ -32,6 +32,7 @@ from .control import ControlServer
 from .paths import is_within, normalize
 from .policy import (ABORT, AUTO_COMMIT, NO_CHANGES, PENDING_REVIEW,
                      PolicyConfig, PolicyDecision, evaluate, split_ignored)
+from .previous_commits import split_previously_committed_changes
 from .session import ProtectedRoot
 from .turn import TurnController
 
@@ -1025,6 +1026,12 @@ def finalize_session(session, store, backend, alias_map):
     warnings_by_root = {name: list(report.warnings)
                         for name, report in status_reports.items()
                         if report.warnings}
+    previously_committed_by_root = {}
+    for name, changes in changes_by_root.items():
+        already, _new = split_previously_committed_changes(
+            changes, session, session.protected_roots, alias_map)
+        if already:
+            previously_committed_by_root[name] = already
     flat_changes = [c for changes in changes_by_root.values()
                     for c in changes]
     flat_warnings = [w for warnings in warnings_by_root.values()
@@ -1040,7 +1047,9 @@ def finalize_session(session, store, backend, alias_map):
             decision.decision = PENDING_REVIEW
     review = artifacts.write_review(store, session, changes_by_root, decision,
                                     warnings_by_root=warnings_by_root,
-                                    ignored_by_root=ignored_by_root)
+                                    ignored_by_root=ignored_by_root,
+                                    previously_committed_by_root=(
+                                        previously_committed_by_root))
     session.add_event("review-artifacts", review)
 
     # Apply the decision against unmounted branches.  The real branchfs binary

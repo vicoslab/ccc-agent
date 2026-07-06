@@ -77,6 +77,17 @@ class TestTurnController(unittest.TestCase):
         self.assertEqual(resp2["verdict"], VERDICT_COMMITTED)
         self.assertTrue(self.h.base_has("Projects/proj-a/b.txt"))
 
+    def test_in_scope_turn_records_committed_paths_for_review_display(self):
+        self.h.write("Projects/proj-a/a.txt", "one")
+
+        self.h.tc.finalize_turn()
+
+        persisted = self.h.store.load(self.h.session.session_id)
+        self.assertEqual(
+            persisted.policy["turn_path_decisions"][
+                "/storage/user/Projects/proj-a/a.txt"],
+            "committed")
+
     def test_out_of_scope_turn_needs_approval_and_does_not_commit(self):
         self.h.write("escape.txt", "x")          # /storage/user/escape.txt
         resp = self.h.tc.finalize_turn()

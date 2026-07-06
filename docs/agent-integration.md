@@ -23,6 +23,13 @@ intermediate autonomous loops do not become approval gates. The user can resolve
 those kept paths later during final/session review, or explicitly while the
 session is still live with `turn-resolve`.
 
+Per-turn commits leave the live BranchFS deltas in place until final cleanup. To
+avoid making already-applied files look like fresh work, `ccc-agent diff`,
+`ccc-agent review`, and `reviews/summary.md` split matching remembered paths into
+`already commited previously:` first, followed by `new commits:` for remaining
+branch changes. If a remembered path is edited again after it was copied to the
+real underlay, it moves back to `new commits:`.
+
 **Codex interactive** loads a CCC plugin whose `hooks/hooks.json` registers the
 `Stop` event. Whether a given Codex build honours Stop hooks is
 version-dependent; treat per-turn Codex handling as **best-effort**. If the hook
