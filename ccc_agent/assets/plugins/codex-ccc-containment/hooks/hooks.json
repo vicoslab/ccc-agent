@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "./hooks/ccc-stop-hook.sh"
+            "command": "${PLUGIN_ROOT}/hooks/ccc-stop-hook.sh"
           }
         ]
       }

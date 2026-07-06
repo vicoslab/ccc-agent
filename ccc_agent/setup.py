@@ -19,6 +19,7 @@ import argparse
 import getpass
 import json
 import os
+import pwd
 import stat
 import sys
 from importlib import resources
@@ -36,8 +37,9 @@ def plugins_dir():
     These directories (codex-/claude-/hermes-ccc-containment) are root-owned and
     read-only in a system install; ccc-agent run bind-mounts the matching one
     read-only into the bwrap sandbox so a contained agent loads the CCC
-    lifecycle hooks through its NATIVE plugin mechanism -- no edit of the user's
-    ~/.codex/config.toml or ~/.claude/settings.json."""
+    lifecycle hooks through its NATIVE plugin mechanism.  Codex additionally
+    needs a persistent enabled-plugin entry in ~/.codex/config.toml; the plugin
+    files themselves are still injected read-only only inside ccc-agent."""
     return os.path.join(assets_dir(), "plugins")
 
 
@@ -131,34 +133,132 @@ SANDBOX_PLUGIN_ROOT = "/ccc-agent/plugins"
 # Codex sessions; ccc-agent remains the write-protection boundary.
 CODEX_DISABLE_INNER_SANDBOX_ARG = "--dangerously-bypass-approvals-and-sandbox"
 
+CODEX_PLUGIN_NAME = "ccc-agent"
+CODEX_PLUGIN_MARKETPLACE = "ccc-agent"
+CODEX_PLUGIN_VERSION = "0.1.0"
+CODEX_PLUGIN_ID = "%s@%s" % (CODEX_PLUGIN_NAME, CODEX_PLUGIN_MARKETPLACE)
+
+CODEX_CONFIG_BEGIN = "# BEGIN ccc-agent Codex plugin"
+CODEX_CONFIG_END = "# END ccc-agent Codex plugin"
+
+
+def codex_plugin_cache_path(home):
+    """In-sandbox path where Codex expects an installed plugin version."""
+    return os.path.join(home, ".codex", "plugins", "cache",
+                        CODEX_PLUGIN_MARKETPLACE, CODEX_PLUGIN_NAME,
+                        CODEX_PLUGIN_VERSION)
+
+
+def codex_plugin_config_block():
+    """Managed TOML snippet enabling the ccc-agent Codex plugin.
+
+    Use a top-level dotted key rather than a [plugins."..."] table so the block
+    can safely be prepended without changing the table context of the user's
+    existing config.
+    """
+    return "\n".join((
+        CODEX_CONFIG_BEGIN,
+        "# Codex 0.136+ loads hooks only from enabled plugins. ccc-agent keeps",
+        "# this plugin enabled so contained `ccc-agent run -- codex` sessions",
+        "# can load the CCC Stop hook from a read-only plugin cache bind.",
+        "# It is safe to leave enabled in normal Codex runs: if the plugin cache",
+        "# is absent Codex skips it, and if present the hook exits unless",
+        "# CCC_AGENT_SESSION is set.",
+        'plugins."%s".enabled = true' % CODEX_PLUGIN_ID,
+        CODEX_CONFIG_END,
+        "",
+    ))
+
+
+def _strip_managed_codex_plugin_block(text):
+    """Remove any previous ccc-agent-managed Codex config block."""
+    while True:
+        start = text.find(CODEX_CONFIG_BEGIN)
+        if start < 0:
+            return text
+        line_start = text.rfind("\n", 0, start) + 1
+        end = text.find(CODEX_CONFIG_END, start)
+        if end < 0:
+            return text[:line_start] + text[start:].lstrip("\n")
+        line_end = text.find("\n", end)
+        if line_end < 0:
+            line_end = len(text)
+        else:
+            line_end += 1
+        text = text[:line_start] + text[line_end:]
+
+
+def ensure_codex_plugin_enabled(home, user=None):
+    """Persist Codex config needed for ccc-agent's Codex plugin hooks.
+
+    The plugin files are still supplied by ccc-agent's bwrap bind. Keeping only
+    the enabled-plugin setting in the user's config is safe outside ccc-agent:
+    current Codex tolerates a missing plugin cache, and the bundled hook exits
+    immediately when CCC_AGENT_SESSION is absent.
+    """
+    codex_dir = os.path.join(home, ".codex")
+    config_path = os.path.join(codex_dir, "config.toml")
+    created_dir = not os.path.exists(codex_dir)
+    os.makedirs(codex_dir, mode=0o700, exist_ok=True)
+    try:
+        with open(config_path) as fh:
+            existing = fh.read()
+    except OSError:
+        existing = ""
+    existing = _strip_managed_codex_plugin_block(existing).lstrip("\n")
+    content = codex_plugin_config_block() + existing
+    if existing and not existing.endswith("\n"):
+        content += "\n"
+    with open(config_path, "w") as fh:
+        fh.write(content)
+    os.chmod(config_path, 0o644)
+
+    # If setup runs as root in a system install and creates the user's Codex
+    # config, do not leave it root-owned.
+    if user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            return config_path
+        try:
+            if created_dir:
+                os.chown(codex_dir, pw.pw_uid, pw.pw_gid)
+            os.chown(config_path, pw.pw_uid, pw.pw_gid)
+        except OSError:
+            pass
+    return config_path
+
 
 def build_agent_plugins(home, src_dir=None):
     """Describe per-agent CCC plugin injection (replaces the old config-file
     overlay ``agent_hooks``).  Each entry is consumed by ccc-agent run, which
     bind-mounts ``src`` read-only at ``sandbox_path`` for a matching contained
     agent, inserts ``argv`` right after the agent executable, and exports
-    ``setenv`` into the sandbox.  Direct codex/claude/hermes runs get none of
-    this; nothing under the user's real config is touched.
+    ``setenv`` into the sandbox.  Direct claude/hermes runs get none of this;
+    Codex keeps only a persistent enabled-plugin config entry and receives the
+    plugin files through this read-only cache bind when contained.
 
       claude  -- native ``--plugin-dir`` session-only plugin load (verified).
-      codex   -- plugin dropped at the in-sandbox Codex plugin scan path; the
-                 blocking Stop hook comes from the plugin's hooks/hooks.json.
-                 ``argv`` disables Codex's nested Linux sandbox because
-                 ccc-agent is already the containment boundary; per-turn hooks
-                 are best-effort and fall back to session-end review.
+      codex   -- plugin mounted at Codex's installed-plugin cache path, paired
+                 with a persistent enabled-plugin entry in ~/.codex/config.toml;
+                 the blocking Stop hook comes from hooks/hooks.json.  ``argv``
+                 disables Codex's nested Linux sandbox because ccc-agent is
+                 already the containment boundary; per-turn hooks are
+                 best-effort and fall back to session-end review.
       hermes  -- native bundled-plugin dir via HERMES_BUNDLED_PLUGINS, with
                  HERMES_ACCEPT_HOOKS=1 to skip the interactive consent prompt.
     """
     src = src_dir or plugins_dir()
-    codex_user_plugins = os.path.join(home, ".codex", "plugins")
+    codex_cache_path = codex_plugin_cache_path(home)
+    codex_cache_parent = os.path.dirname(codex_cache_path)
     claude_sandbox = os.path.join(SANDBOX_PLUGIN_ROOT, "claude-ccc-containment")
     hermes_bundle_root = os.path.join(SANDBOX_PLUGIN_ROOT, "hermes")
     return {
         "codex": {
             "src": os.path.join(src, "codex-ccc-containment"),
-            "sandbox_path": os.path.join(codex_user_plugins,
-                                         "ccc-agent"),
-            "ensure_dirs": [codex_user_plugins],
+            "sandbox_path": codex_cache_path,
+            "ensure_dirs": [codex_cache_parent],
+            "plugin_id": CODEX_PLUGIN_ID,
             "argv": [CODEX_DISABLE_INNER_SANDBOX_ARG],
         },
         "claude": {
@@ -384,9 +484,13 @@ def main(argv=None, prog="ccc-agent setup"):
         config["agent_plugins"] = {}
         config["agent_hook_mode"] = "disabled"
     else:
+        codex_config = ensure_codex_plugin_enabled(home, user=user)
         sys.stderr.write(
             "ccc-agent setup: agent plugins reference bundled assets under %s "
             "(read-only, injected per contained run)\n" % plugins_dir())
+        sys.stderr.write(
+            "ccc-agent setup: ensured Codex plugin enablement in %s\n"
+            % codex_config)
 
     _write_json(config_file, config)
     sys.stderr.write("ccc-agent setup: wrote %s\n" % config_file)

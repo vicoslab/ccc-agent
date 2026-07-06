@@ -1,9 +1,11 @@
 #!/bin/sh
 # CCC contained-session Stop-hook adapter (Claude Code / Codex plugin).
 #
-# Loaded ONLY inside a bwrap-contained CCC session: ccc-agent run injects the
-# enclosing plugin read-only and points the agent at it (Claude --plugin-dir,
-# Codex sandbox plugin scan). A direct `claude`/`codex` run never sees it.
+# Loaded for contained CCC sessions: ccc-agent run injects the enclosing
+# plugin read-only and points the agent at it (Claude --plugin-dir, Codex
+# installed-plugin cache bind). Codex also keeps a persistent enabled-plugin
+# config entry; direct Codex runs are safe because this hook exits immediately
+# unless CCC_AGENT_SESSION is set.
 #
 # Hooks are best-effort turn-boundary SIGNALS. They never freeze, commit, or
 # abort -- commit authority lives in the trusted supervisor outside the
@@ -34,7 +36,7 @@ fi
 # `ccc-agent turn-approve <token>`.
 if [ -n "${CCC_AGENT_CONTROL_SOCK:-}" ]; then
     rc=0
-    "$CTL" turn-finalize || rc=$?
+    "$CTL" turn-finalize 1>&2 || rc=$?
     exit "$rc"
 fi
 

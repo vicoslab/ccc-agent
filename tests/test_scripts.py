@@ -77,6 +77,14 @@ class TestPluginAssets(unittest.TestCase):
                 bodies.add(fh.read())
         self.assertEqual(len(bodies), 1, "plugin stop hooks have drifted")
 
+    def test_bundled_stop_hook_keeps_codex_stdout_json_clean(self):
+        # Codex treats command-hook stdout as JSON. ccc-agent's human-readable
+        # turn-finalize text must therefore go to stderr, while exit status still
+        # carries block/allow semantics.
+        with open(PLUGIN_STOP_HOOKS[0]) as fh:
+            body = fh.read()
+        self.assertIn('"$CTL" turn-finalize 1>&2 || rc=$?', body)
+
 
 class TestShim(unittest.TestCase):
     def setUp(self):
