@@ -38,7 +38,7 @@
       "src": "/usr/lib/python3/dist-packages/ccc_agent/assets/plugins/codex-ccc-containment",
       "sandbox_path": "/home/domen/.codex/plugins/ccc-agent",
       "ensure_dirs": ["/home/domen/.codex/plugins"],
-      "argv": []
+      "argv": ["--dangerously-bypass-approvals-and-sandbox"]
     },
     "claude": {
       "src": "/usr/lib/python3/dist-packages/ccc_agent/assets/plugins/claude-ccc-containment",

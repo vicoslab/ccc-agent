@@ -139,6 +139,47 @@ class TestShim(unittest.TestCase):
     def test_nested_session_runs_real_binary_directly(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"})
         self.assertIn("REAL:", proc.stdout)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox do thing",
+                      proc.stdout)
+        self.assertIn("disabling Codex inner sandbox", proc.stderr)
+        self.assertNotIn("LAUNCH:", proc.stdout)
+
+    def test_nested_session_respects_explicit_codex_no_sandbox_arg(self):
+        proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"},
+                             args=("--sandbox", "danger-full-access", "do"))
+        self.assertIn("REAL:", proc.stdout)
+        self.assertIn("--sandbox danger-full-access do", proc.stdout)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
+                         proc.stdout)
+
+    def test_nested_session_rejects_explicit_codex_sandbox_arg(self):
+        proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"},
+                             args=("--sandbox", "workspace-write", "do"))
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("REAL:", proc.stdout)
+        self.assertIn("refusing nested Codex sandbox", proc.stderr)
+
+    def test_nested_session_respects_explicit_codex_yolo_arg(self):
+        proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"},
+                             args=("--yolo", "do"))
+        self.assertIn("REAL:", proc.stdout)
+        self.assertIn("--yolo do", proc.stdout)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
+                         proc.stdout)
+
+    def test_nested_non_codex_agent_runs_without_codex_sandbox_arg(self):
+        real_claude = os.path.join(self.realdir, "claude")
+        with open(real_claude, "w") as fh:
+            fh.write("#!/bin/sh\necho CLAUDE-REAL:$0:$*\n")
+        os.chmod(real_claude, 0o755)
+        proc = subprocess.run(["claude", "do", "thing"],
+                              env=dict(self.env, CCC_AGENT_SESSION="agent-x"),
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("CLAUDE-REAL:", proc.stdout)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
+                         proc.stdout)
         self.assertNotIn("LAUNCH:", proc.stdout)
 
     def test_bypass_env(self):

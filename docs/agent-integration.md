@@ -74,8 +74,10 @@ injection and falls back to session-end review.
 
 **Codex** — the plugin (`.codex-plugin/plugin.json` + `hooks/hooks.json` →
 `./hooks/ccc-stop-hook.sh`) is mounted read-only at the in-sandbox Codex plugin
-path (`~/.codex/plugins/ccc-agent`). The `argv` field is left tunable
-for the installed Codex version's enable/trust flags.
+path (`~/.codex/plugins/ccc-agent`). The generated `argv` includes
+`--dangerously-bypass-approvals-and-sandbox` so Codex does not start its own
+nested Linux/bwrap sandbox inside the existing ccc-agent BranchFS/bwrap
+containment boundary.
 
 **Hermes** — the bundled plugin (`plugin.yaml` + a `register()` module) is
 mounted under a read-only bundle root and activated with

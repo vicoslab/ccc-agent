@@ -16,6 +16,35 @@ set -eu
 
 AGENT_NAME="$(basename "$0")"
 SHIM_PATH="$(command -v -- "$AGENT_NAME" || true)"
+CODEX_DISABLE_INNER_SANDBOX_ARG="--dangerously-bypass-approvals-and-sandbox"
+
+codex_inner_sandbox_state() {
+    # Return codes:
+    #   0: nested Codex should receive CODEX_DISABLE_INNER_SANDBOX_ARG
+    #   1: no change needed (non-Codex, --yolo, explicit no-sandbox mode)
+    #   2: explicit nested Codex sandbox requested; refuse before it hangs
+    [ "$AGENT_NAME" = "codex" ] || return 1
+    expect_sandbox_value=0
+    for arg in "$@"; do
+        if [ "$expect_sandbox_value" = "1" ]; then
+            [ "$arg" = "danger-full-access" ] && return 1
+            return 2
+        fi
+        case "$arg" in
+            "$CODEX_DISABLE_INNER_SANDBOX_ARG"|--yolo|--sandbox=danger-full-access|-s=danger-full-access)
+                return 1
+                ;;
+            --sandbox|-s)
+                expect_sandbox_value=1
+                ;;
+            --sandbox=*|-s=*)
+                return 2
+                ;;
+        esac
+    done
+    [ "$expect_sandbox_value" = "1" ] && return 2
+    return 0
+}
 
 # Find the real binary: first PATH entry whose $AGENT_NAME is not this shim.
 # Also check ~/.local/bin because Codex/Claude are commonly installed there,
@@ -52,6 +81,17 @@ fi
 
 if [ -n "${CCC_AGENT_SESSION:-}" ]; then
     # already inside a contained session: run directly, stay in the branch
+    set +e
+    codex_inner_sandbox_state "$@"
+    codex_sandbox_state=$?
+    set -e
+    if [ "$codex_sandbox_state" = "0" ]; then
+        echo "ccc-agent-shim: nested codex inside ccc-agent; disabling Codex inner sandbox (outer containment active)" >&2
+        exec "$REAL_BIN" "$CODEX_DISABLE_INNER_SANDBOX_ARG" "$@"
+    elif [ "$codex_sandbox_state" = "2" ]; then
+        echo "ccc-agent-shim: refusing nested Codex sandbox inside ccc-agent; use --yolo/--sandbox danger-full-access or omit --sandbox so the shim can disable Codex's inner sandbox" >&2
+        exit 2
+    fi
     exec "$REAL_BIN" "$@"
 fi
 

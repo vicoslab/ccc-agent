@@ -118,6 +118,8 @@ class TestSetupConfig(unittest.TestCase):
             "/plugins/claude-ccc-containment"))
         self.assertEqual(plugins["codex"]["sandbox_path"],
                          "/home/domen/.codex/plugins/ccc-agent")
+        self.assertEqual(plugins["codex"]["argv"],
+                         [setup_mod.CODEX_DISABLE_INNER_SANDBOX_ARG])
         self.assertEqual(
             plugins["hermes"]["setenv"]["HERMES_BUNDLED_PLUGINS"],
             "/ccc-agent/plugins/hermes")
@@ -155,6 +157,8 @@ class TestSetupConfig(unittest.TestCase):
         plugins = cfg["agent_plugins"]
         self.assertEqual(plugins["codex"]["sandbox_path"],
                          "/home/domen/.codex/plugins/ccc-agent")
+        self.assertEqual(plugins["codex"]["argv"],
+                         [setup_mod.CODEX_DISABLE_INNER_SANDBOX_ARG])
         self.assertEqual(plugins["claude"]["argv"],
                          ["--plugin-dir",
                           "/ccc-agent/plugins/claude-ccc-containment"])

@@ -124,6 +124,13 @@ _SECRETS = [".ssh", ".gnupg", ".netrc", ".aws", ".kube", ".docker/config.json"]
 # so bwrap does not mkdir mountpoints into the FUSE view).
 SANDBOX_PLUGIN_ROOT = "/ccc-agent/plugins"
 
+# Codex already runs inside ccc-agent's BranchFS/bwrap boundary.  Its own Linux
+# command sandbox nests another bwrap which is incompatible with CCC containers
+# that bind outer /proc into an unshared PID namespace (and may be forbidden
+# from mounting a fresh procfs).  Disable Codex's inner sandbox for contained
+# Codex sessions; ccc-agent remains the write-protection boundary.
+CODEX_DISABLE_INNER_SANDBOX_ARG = "--dangerously-bypass-approvals-and-sandbox"
+
 
 def build_agent_plugins(home, src_dir=None):
     """Describe per-agent CCC plugin injection (replaces the old config-file
@@ -136,9 +143,9 @@ def build_agent_plugins(home, src_dir=None):
       claude  -- native ``--plugin-dir`` session-only plugin load (verified).
       codex   -- plugin dropped at the in-sandbox Codex plugin scan path; the
                  blocking Stop hook comes from the plugin's hooks/hooks.json.
-                 ``argv`` is left tunable for the installed Codex version's
-                 enable/trust flags; per-turn hooks are best-effort and fall
-                 back to session-end review.
+                 ``argv`` disables Codex's nested Linux sandbox because
+                 ccc-agent is already the containment boundary; per-turn hooks
+                 are best-effort and fall back to session-end review.
       hermes  -- native bundled-plugin dir via HERMES_BUNDLED_PLUGINS, with
                  HERMES_ACCEPT_HOOKS=1 to skip the interactive consent prompt.
     """
@@ -152,7 +159,7 @@ def build_agent_plugins(home, src_dir=None):
             "sandbox_path": os.path.join(codex_user_plugins,
                                          "ccc-agent"),
             "ensure_dirs": [codex_user_plugins],
-            "argv": [],
+            "argv": [CODEX_DISABLE_INNER_SANDBOX_ARG],
         },
         "claude": {
             "src": os.path.join(src, "claude-ccc-containment"),
