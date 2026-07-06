@@ -47,7 +47,7 @@ Conflict records are **review signals**, not generic commit failures. Normal
 latest-session-wins policy lets commit proceed while recording the conflict. The
 same records must be usable in two paths:
 
-- **LLM-handled:** `check-before-final` / turn hooks print concise conflict
+- **LLM-handled:** `turn-check` / turn hooks print concise conflict
   summaries so the agent can reconcile in the still-running branch before
   finalization.
 - **Human-handled:** review artifacts and CLI output list conflicts separately
@@ -128,10 +128,10 @@ touched).
 | `training-run` | scopes = declared artifact dirs (checkpoints, logs) |
 | `throwaway` | exploration; discard at completion unless a human commits first |
 
-## Bounded self-repair (`ccc-agent check-before-final`)
+## Bounded self-repair (`ccc-agent turn-check`)
 
 When a harness supports a blocking Stop hook (Claude Code, Codex), the hook
-runs `ccc-agent check-before-final <session>` before reporting the turn.
+runs `ccc-agent turn-check <session>` before reporting the turn.
 The check classifies **live** status — no freeze, no commit — and only looks
 at scope and deny/hide hygiene; mode semantics (`manual`,
 `read-only-review`, ...) still apply at finalize:

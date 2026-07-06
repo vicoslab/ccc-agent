@@ -9,16 +9,16 @@ mechanism**, how the plugin is injected, and how credentials are handled.
 |---|---|---|---|
 | `codex exec "…"` | process exit (1 turn) | supervisor **process-exit finalize** (no hook) | session-end review |
 | `claude -p "…"` | process exit (1 turn) | supervisor **process-exit finalize** (no hook) | session-end review |
-| `claude` (interactive) | each Stop | plugin **Stop hook** → `ccc-agent finalize-turn` | **blocking** per-turn (exit 2) |
-| `codex` (interactive) | each Stop | plugin **Stop hook** → `ccc-agent finalize-turn` | best-effort per-turn (see below) |
-| `hermes` (interactive) | each turn / session end | plugin **`post_llm_call` / `on_session_end`** → `ccc-agent finalize-turn` | report-only (see below) |
+| `claude` (interactive) | each Stop | plugin **Stop hook** → `ccc-agent turn-finalize` | **blocking** per-turn (exit 2) |
+| `codex` (interactive) | each Stop | plugin **Stop hook** → `ccc-agent turn-finalize` | best-effort per-turn (see below) |
+| `hermes` (interactive) | each turn / session end | plugin **`post_llm_call` / `on_session_end`** → `ccc-agent turn-finalize` | report-only (see below) |
 
 **Non-interactive (`exec`/`-p`) needs no hook** — one turn per process, so the
 supervisor's existing end-of-process finalize is the per-turn commit.
 
 **Claude interactive** loads a CCC plugin whose Stop hook can *block* the stop
 (exit 2), so out-of-scope changes prompt the user mid-turn and commit only on
-`approve-turn`.
+`turn-approve`.
 
 **Codex interactive** loads a CCC plugin whose `hooks/hooks.json` registers the
 blocking `Stop` event. Whether a given Codex build honours the hook's exit code
@@ -131,7 +131,7 @@ files, so those files must remain readable through the shared agent-state bind.
 A session that exits with un-committed deltas stays as a reviewable branch:
 
 ```bash
-ccc-agent list                       # sessions + states
+ccc-agent list                       # sessions + states (alias: ccc-agent ls)
 ccc-agent review <session>           # browse, then accept/select/reject/later on a TTY
 ccc-agent diff <session>             # read-only commit-set + ignored-change summary
 ccc-agent diff <session> --show-ignored    # include full ignored/cache/runtime list

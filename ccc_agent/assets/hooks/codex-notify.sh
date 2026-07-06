@@ -28,7 +28,7 @@ event="${1:-}"
 case "$event" in
     *'agent-turn-complete'*|*'turn-complete'*|*'turn_complete'*)
         # report-only: commit in-scope changes; out-of-scope defers to review
-        "$CTL" finalize-turn 1>&2 || true
+        "$CTL" turn-finalize 1>&2 || true
         ;;
 esac
 exit 0

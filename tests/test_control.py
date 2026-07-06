@@ -40,7 +40,7 @@ class TestControlChannel(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["verdict"], VERDICT_COMMITTED)
         self.assertEqual(resp["committed"], ["a.txt"])
-        self.assertEqual(self.seen[-1]["op"], "finalize-turn")
+        self.assertEqual(self.seen[-1]["op"], "turn-finalize")
         self.assertEqual(self.seen[-1]["version"], 1)
 
     def test_needs_approval_carries_paths_and_token(self):
@@ -62,7 +62,7 @@ class TestControlChannel(unittest.TestCase):
 
         self._server(handler)
         resp = ControlClient(self.sock, self.token).approve_turn("appr-1", "yes")
-        self.assertEqual(resp["echo_op"], "approve-turn")
+        self.assertEqual(resp["echo_op"], "turn-approve")
         self.assertEqual(resp["echo_decision"], "yes")
         self.assertEqual(resp["echo_appr"], "appr-1")
 
@@ -92,7 +92,7 @@ class TestControlChannel(unittest.TestCase):
         def worker(n):
             try:
                 c = ControlClient(self.sock, self.token)
-                r = c._request({"op": "finalize-turn", "n": n})
+                r = c._request({"op": "turn-finalize", "n": n})
                 if r.get("n") != n:
                     errors.append((n, r))
             except Exception as exc:  # noqa

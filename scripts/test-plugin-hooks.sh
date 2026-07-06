@@ -6,7 +6,7 @@
 #
 #   1. plugin assets are packaged and well-formed;
 #   2. a CONTAINED run loads the CCC plugin (the hook sees CCC_AGENT_SESSION /
-#      CCC_AGENT_CONTROL_SOCK and a finalize-turn event appears);
+#      CCC_AGENT_CONTROL_SOCK and a turn-finalize event appears);
 #   3. a DIRECT run loads no CCC plugin (no CCC session is created);
 #   4. if the plugin is missing/broken, ccc-agent run STILL finalizes the
 #      session at process exit (graceful degradation), never auto-committing
@@ -44,7 +44,7 @@ for s in claude-ccc-containment/hooks/ccc-stop-hook.sh \
 done
 
 echo "== 2. contained run loads the plugin (per agent) =="
-echo "   Run manually, then check the session events for a finalize-turn:"
+echo "   Run manually, then check the session events for a turn-finalize:"
 echo "     ${CTL} run --agent claude -- claude -p 'create file ccc_probe.txt'"
 echo "     ${CTL} run --agent codex  -- codex exec 'create file ccc_probe.txt'"
 echo "     ${CTL} run --agent hermes -- hermes -z 'create file ccc_probe.txt'"

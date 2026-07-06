@@ -7,11 +7,11 @@ and can see both the live BranchFS view and the real base) commits a turn by
 applying in-scope deletes.  This needs no branchfs teardown and never disturbs
 the agent's live mount, so the session simply continues:
 
-  finalize-turn  in-scope changes -> copied to base, agent continues (committed)
+  turn-finalize  in-scope changes -> copied to base, agent continues (committed)
                  out-of-scope     -> held; needs-approval (+ token) relayed to
                                      the user via the agent UI
                  nothing changed  -> noop
-  approve-turn   yes -> copy the approved out-of-scope paths to base
+  turn-approve   yes -> copy the approved out-of-scope paths to base
                  no  -> record as denied (left in the branch for session-end
                         review; not re-prompted)
 
@@ -221,9 +221,9 @@ class TurnController(object):
     # -- ControlServer entrypoint -----------------------------------------
     def handle(self, request):
         op = request.get("op")
-        if op == "finalize-turn":
+        if op == "turn-finalize":
             return self.finalize_turn()
-        if op == "approve-turn":
+        if op == "turn-approve":
             return self.approve_turn(request.get("approval_token"),
                                      request.get("decision", "no"),
                                      paths=request.get("paths"))

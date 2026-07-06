@@ -16,17 +16,17 @@ command -v "$CTL" >/dev/null 2>&1 || exit 0
 # Per-turn control: signal end-of-turn to the supervisor over the control
 # socket (the in-sandbox agent can't reach the store). It commits in-scope
 # changes and exits 0; on out-of-scope it exits 2 with the paths + approval
-# token on stderr so the agent asks the user, then runs approve-turn.
+# token on stderr so the agent asks the user, then runs turn-approve.
 if [ -n "${CCC_AGENT_CONTROL_SOCK:-}" ]; then
     rc=0
-    "$CTL" finalize-turn || rc=$?
+    "$CTL" turn-finalize || rc=$?
     exit "$rc"
 fi
 
 # Fallback (no control socket — dev/none mode): store-based bounded self-repair.
 rc=0
-"$CTL" check-before-final "$CCC_AGENT_SESSION" 1>&2 || rc=$?
+"$CTL" turn-check "$CCC_AGENT_SESSION" 1>&2 || rc=$?
 [ "$rc" -ne 2 ] || exit 2   # dirty + budget left: agent should repair
 
-"$CTL" finish-turn "$CCC_AGENT_SESSION" || true
+"$CTL" turn-record "$CCC_AGENT_SESSION" || true
 exit 0

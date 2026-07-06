@@ -29,8 +29,8 @@ inspect, commit, or abort them. This holds because:
    mountpoints, and per-turn control sockets are grouped under one
    `<state_dir>/<session-id>/` bundle outside the view and additionally covered
    by the `.ccc-agent` deny pattern;
-4. hooks invoke `ccc-agent finish-turn` (records an event) and
-   `ccc-agent check-before-final` (reads live status; exit 2 asks the
+4. hooks invoke `ccc-agent turn-record` (records an event) and
+   `ccc-agent turn-check` (reads live status; exit 2 asks the
    agent to revert policy violations, bounded by
    `max_policy_repair_attempts`) — there is no hook path that freezes or
    commits.
@@ -55,7 +55,7 @@ created -> mounting -> running -> finalizing -> frozen
   empty branch from the current base. Custom resume commands do not overwrite the
   stored original exec.
 - Freeze happens **after** completion — and, for harnesses with blocking
-  Stop hooks, after the bounded self-repair loop (`check-before-final`) has
+  Stop hooks, after the bounded self-repair loop (`turn-check`) has
   allowed the stop — then `branchfs status --json` per root feeds the policy
   engine.
 - `pending-review` keeps branches frozen; the branchfs daemon may exit (it
