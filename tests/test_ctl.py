@@ -14,6 +14,7 @@ from ccc_agent.paths import AliasMap
 from ccc_agent.policy import Change
 from ccc_agent.runner import RootSpec, RunnerConfig, run_session
 from ccc_agent.session import ProtectedRoot, SessionStore
+from ccc_agent.turn import TurnController
 
 
 class CtlHarness(object):
@@ -109,6 +110,59 @@ class TestController(unittest.TestCase):
         out = io.StringIO()
         self.h.controller().diff(session.session_id, out=out)
         self.assertIn("/storage/user/outside.txt", out.getvalue())
+
+    def test_diff_splits_already_commited_previous_paths_from_new_commits(self):
+        session, root = self.h.running_session(mode="manual")
+        already = os.path.join(root.mount, "Projects", "proj-a", "already.txt")
+        os.makedirs(os.path.dirname(already), exist_ok=True)
+        with open(already, "w") as fh:
+            fh.write("already\n")
+        turn = TurnController(session, self.h.store, self.h.backend,
+                              self.h.alias_map)
+        turn.finalize_turn()
+        with open(os.path.join(root.mount, "Projects", "proj-a", "new.txt"), "w") as fh:
+            fh.write("new\n")
+        self.h.controller().finish(session.session_id)
+
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, out=out)
+
+        text = out.getvalue()
+        self.assertIn("already commited previously:", text)
+        self.assertIn("new commits:", text)
+        self.assertLess(text.index("already commited previously:"),
+                        text.index("new commits:"))
+        self.assertLess(text.index("/storage/user/Projects/proj-a/already.txt"),
+                        text.index("new commits:"))
+        self.assertGreater(text.index("/storage/user/Projects/proj-a/new.txt"),
+                           text.index("new commits:"))
+        with open(os.path.join(self.h.store.review_dir(session.session_id),
+                               "summary.md")) as fh:
+            summary = fh.read()
+        self.assertIn("already commited previously:", summary)
+        self.assertIn("new commits:", summary)
+
+    def test_diff_treats_rewritten_previously_commited_path_as_new_commit(self):
+        session, root = self.h.running_session(mode="manual")
+        rel = os.path.join("Projects", "proj-a", "again.txt")
+        path = os.path.join(root.mount, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("first\n")
+        turn = TurnController(session, self.h.store, self.h.backend,
+                              self.h.alias_map)
+        turn.finalize_turn()
+        with open(path, "w") as fh:
+            fh.write("second\n")
+        self.h.controller().finish(session.session_id)
+
+        out = io.StringIO()
+        self.h.controller().diff(session.session_id, out=out)
+
+        text = out.getvalue()
+        self.assertNotIn("already commited previously:", text)
+        self.assertIn("Changes to be committed:", text)
+        self.assertIn("/storage/user/Projects/proj-a/again.txt", text)
 
     def test_diff_prints_collapsed_delete_summary(self):
         session = self.pending_session()

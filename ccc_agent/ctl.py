@@ -27,6 +27,7 @@ from .commit_failures import (clear_permission_failures,
 from .policy import (Change, IgnoredChange, PolicyConfig, classify,
                      filter_ignored, net_final_changes,
                      net_final_ignored_changes, split_ignored)
+from .previous_commits import split_previously_committed_changes
 from .runner import finalize_session, _rewrite_review_for_permission_failures
 from .paths import is_within
 from .session import TERMINAL_STATES
@@ -302,17 +303,32 @@ class Controller(object):
         for warning in warnings:
             out.write("WARNING %s: %s\n" % (warning.path, warning.message))
 
-    def _write_change_sections(self, out, changes, ignored, show_ignored,
-                               session_id):
+    def _write_change_list(self, out, changes):
+        for change in changes:
+            out.write("  %s\n" % _change_line(change))
+
+    def _write_change_sections(self, out, session, changes, ignored,
+                               show_ignored, session_id):
         """Render a git-status-like split of commit vs ignored changes."""
         if not changes and not ignored:
             return False
-        out.write("Changes to be committed:\n")
-        if changes:
-            for change in _normalized_change_view(changes):
-                out.write("  %s\n" % _change_line(change))
+        changes = _normalized_change_view(changes)
+        already, new_changes = split_previously_committed_changes(
+            changes, session, session.protected_roots, self.alias_map)
+        if already:
+            out.write("already commited previously:\n")
+            self._write_change_list(out, already)
+            out.write("new commits:\n")
+            if new_changes:
+                self._write_change_list(out, new_changes)
+            else:
+                out.write("  (none)\n")
         else:
-            out.write("  (none)\n")
+            out.write("Changes to be committed:\n")
+            if changes:
+                self._write_change_list(out, changes)
+            else:
+                out.write("  (none)\n")
         if ignored:
             out.write("\nIgnored by policy (not committed):\n")
             if show_ignored:
@@ -510,7 +526,7 @@ class Controller(object):
             saw_status, changes, ignored = self._stored_review_changes(
                 session, review)
             if saw_status:
-                self._write_change_sections(out, changes, ignored,
+                self._write_change_sections(out, session, changes, ignored,
                                             show_ignored, session_id)
                 return session
 
@@ -530,8 +546,8 @@ class Controller(object):
             if show_ignored:
                 file_diff_changes.extend((root, item.change)
                                          for item in root_ignored)
-        self._write_change_sections(out, all_changes, ignored, show_ignored,
-                                    session_id)
+        self._write_change_sections(out, session, all_changes, ignored,
+                                    show_ignored, session_id)
         if show_file_diffs:
             self._write_file_diffs(file_diff_changes, out)
         return session

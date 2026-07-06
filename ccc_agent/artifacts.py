@@ -41,10 +41,12 @@ def clear_review_cache(review):
 
 
 def write_review(store, session, changes_by_root, decision,
-                 warnings_by_root=None, ignored_by_root=None):
+                 warnings_by_root=None, ignored_by_root=None,
+                 previously_committed_by_root=None):
     """Write session, status, ignored, warning, and decision artifacts."""
     warnings_by_root = warnings_by_root or {}
     ignored_by_root = ignored_by_root or {}
+    previously_committed_by_root = previously_committed_by_root or {}
     review = store.review_dir(session.session_id)
     os.makedirs(review, exist_ok=True)
     clear_review_cache(review)
@@ -70,7 +72,9 @@ def write_review(store, session, changes_by_root, decision,
     with open(os.path.join(review, "summary.md"), "w") as fh:
         fh.write(render_summary(session, changes_by_root, decision,
                                 warnings_by_root=warnings_by_root,
-                                ignored_by_root=ignored_by_root))
+                                ignored_by_root=ignored_by_root,
+                                previously_committed_by_root=(
+                                    previously_committed_by_root)))
     return review
 
 
@@ -82,10 +86,23 @@ def _ignored_pattern_counts(ignored_by_root):
     return counts
 
 
+def _change_key(change):
+    return (change.root, change.op, change.path, change.kind, change.bytes,
+            getattr(change, "summary", ""))
+
+
+def _render_change_item(out, change):
+    summary = getattr(change, "summary", "")
+    suffix = "; %s" % summary if summary else ""
+    out("- `%s` `%s` (%s, %d bytes%s)"
+        % (change.op, change.path, change.kind, change.bytes, suffix))
+
+
 def render_summary(session, changes_by_root, decision, warnings_by_root=None,
-                   ignored_by_root=None):
+                   ignored_by_root=None, previously_committed_by_root=None):
     warnings_by_root = warnings_by_root or {}
     ignored_by_root = ignored_by_root or {}
+    previously_committed_by_root = previously_committed_by_root or {}
     lines = []
     out = lines.append
     out("# Agent session %s" % session.session_id)
@@ -158,16 +175,34 @@ def render_summary(session, changes_by_root, decision, warnings_by_root=None,
         out("")
     out("## Changed paths")
     out("")
-    total = 0
-    for name, changes in sorted(changes_by_root.items()):
-        for change in changes:
-            summary = getattr(change, "summary", "")
-            suffix = "; %s" % summary if summary else ""
-            out("- `%s` `%s` (%s, %d bytes%s)"
-                % (change.op, change.path, change.kind, change.bytes, suffix))
-            total += 1
-    if not total:
-        out("(none)")
+    previous_total = sum(len(changes)
+                         for changes in previously_committed_by_root.values())
+    if previous_total:
+        previous_keys = set()
+        out("already commited previously:")
+        for name, changes in sorted(previously_committed_by_root.items()):
+            for change in changes:
+                previous_keys.add(_change_key(change))
+                _render_change_item(out, change)
+        out("")
+        out("new commits:")
+        new_total = 0
+        for name, changes in sorted(changes_by_root.items()):
+            for change in changes:
+                if _change_key(change) in previous_keys:
+                    continue
+                _render_change_item(out, change)
+                new_total += 1
+        if not new_total:
+            out("(none)")
+    else:
+        total = 0
+        for name, changes in sorted(changes_by_root.items()):
+            for change in changes:
+                _render_change_item(out, change)
+                total += 1
+        if not total:
+            out("(none)")
     out("")
     ignored_counts = _ignored_pattern_counts(ignored_by_root)
     ignored_total = sum(ignored_counts.values())
