@@ -11,13 +11,15 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from ccc_agent.branchfs import FakeBranchFS, StatusReport, StatusWarning
 from ccc_agent.paths import AliasMap
-from ccc_agent.runner import (ResumeError, RootSpec, RunnerConfig,
+from ccc_agent.runner import (BWRAP_AGENT_RUNNER, BWRAP_AGENT_RUNNER_ARG0,
+                              ResumeError, RootSpec, RunnerConfig,
                               resume_session, run_session)
 from ccc_agent.session import SessionStore
 
@@ -571,6 +573,13 @@ class TestBwrapConfinement(unittest.TestCase):
         return self.h.config(argv, confinement="bwrap",
                              bwrap_bin="/opt/ccc-agent/bin/bwrap", **kw)
 
+    def _wrapped_agent_command(self, argv):
+        sep = argv.index("--")
+        self.assertEqual(argv[sep + 1:sep + 3], ["/usr/bin/python3", "-c"])
+        self.assertIn("child = subprocess.Popen", argv[sep + 3])
+        self.assertEqual(argv[sep + 4], "ccc-agent-runner")
+        return argv[sep + 5:]
+
     def test_bwrap_needs_no_script_or_uid(self):
         # Unlike chroot, bwrap is rootless: it must not require uid/gid/script.
         cfg = self.h.config(["true"], confinement="bwrap")
@@ -580,6 +589,33 @@ class TestBwrapConfinement(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.h.config(["true"], confinement="bwrap",
                           bwrap_proc_mode="magic")
+
+    def test_bwrap_uses_pid1_lifecycle_wrapper_for_agent_command(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["my-agent", "--flag"]))
+
+        argv = seen["argv"]
+        self.assertIn("--as-pid-1", argv)
+        sep = argv.index("--")
+        self.assertEqual(argv[sep + 1:sep + 3], ["/usr/bin/python3", "-c"])
+        self.assertIn("child = subprocess.Popen", argv[sep + 3])
+        self.assertIn("returncode = child.wait()", argv[sep + 3])
+        self.assertEqual(argv[sep + 4], "ccc-agent-runner")
+        self.assertEqual(self._wrapped_agent_command(argv),
+                         ["my-agent", "--flag"])
+
+    def test_bwrap_lifecycle_wrapper_preserves_agent_exit_status(self):
+        proc = subprocess.run(
+            [sys.executable, "-c", BWRAP_AGENT_RUNNER,
+             BWRAP_AGENT_RUNNER_ARG0, "sh", "-c", "exit 7"])
+
+        self.assertEqual(proc.returncode, 7)
 
     def test_bwrap_mode_builds_sandbox_and_wraps_command(self):
         seen = {}
@@ -618,9 +654,9 @@ class TestBwrapConfinement(unittest.TestCase):
         # from the launch directory instead of canonicalizing to /storage.
         ci = argv.index("--chdir")
         self.assertEqual(argv[ci + 1], "/home/domen/Projects/proj-a")
-        # the real agent command follows the -- separator
-        sep = argv.index("--")
-        self.assertEqual(argv[sep + 1:], ["my-agent", "--flag"])
+        # the real agent command is run by the lifecycle wrapper after --
+        self.assertEqual(self._wrapped_agent_command(argv),
+                         ["my-agent", "--flag"])
         # no host-side cwd is forced (bwrap --chdir handles it)
         self.assertIsNone(seen["cwd"])
         self.assertTrue(any(e.get("kind") == "bwrap-launch"
@@ -885,8 +921,7 @@ class TestBwrapConfinement(unittest.TestCase):
         # plugin source mounted read-only at the neutral sandbox path
         self.assertIn(("--ro-bind", src, sandbox), triples)
         # --plugin-dir inserted right after the claude executable, user args kept
-        sep = argv.index("--")
-        self.assertEqual(argv[sep + 1:],
+        self.assertEqual(self._wrapped_agent_command(argv),
                          ["claude", "--plugin-dir", sandbox, "-p", "x"])
 
         # a non-claude command never receives the claude plugin
@@ -909,8 +944,7 @@ class TestBwrapConfinement(unittest.TestCase):
                             argv[k + 1] == "/home/domen/.codex/plugins/cache/ccc-agent/ccc-agent"
                             for k in range(len(argv) - 1)))
         # no argv flags configured -> command is unchanged
-        sep = argv.index("--")
-        self.assertEqual(argv[sep + 1:], ["codex"])
+        self.assertEqual(self._wrapped_agent_command(argv), ["codex"])
 
     def test_bwrap_shared_agent_state_dirs_are_rw_binds_by_default(self):
         paths, binds = self._agent_state_binds()
@@ -1307,8 +1341,8 @@ class TestBwrapConfinement(unittest.TestCase):
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
         self.assertIn(("--ro-bind", src, sandbox), triples)
-        sep = argv.index("--")
-        self.assertEqual(argv[sep + 1:], [absolute_codex, "exec", "x"])
+        self.assertEqual(self._wrapped_agent_command(argv),
+                         [absolute_codex, "exec", "x"])
 
     def test_explicit_agent_kind_wins_over_executable_basename(self):
         codex_src = self._make_plugin("codex-ccc-containment")
@@ -1332,8 +1366,8 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertIn(("--ro-bind", codex_src, codex_sandbox), triples)
         self.assertNotIn(("--ro-bind", claude_src, claude_sandbox), triples)
         self.assertNotIn("--plugin-dir", argv)
-        sep = argv.index("--")
-        self.assertEqual(argv[sep + 1:], [misleading_claude_path, "-p", "x"])
+        self.assertEqual(self._wrapped_agent_command(argv),
+                         [misleading_claude_path, "-p", "x"])
 
     def test_bwrap_sets_plugin_env_for_hermes(self):
         src = self._make_plugin("hermes-ccc-containment")
@@ -1361,8 +1395,7 @@ class TestBwrapConfinement(unittest.TestCase):
         argv = self._capture_argv(["claude", "-p", "x"], "claude", plugins)
         self.assertNotIn(missing, argv)
         self.assertNotIn("--plugin-dir", argv)
-        sep = argv.index("--")
-        self.assertEqual(argv[sep + 1:], ["claude", "-p", "x"])
+        self.assertEqual(self._wrapped_agent_command(argv), ["claude", "-p", "x"])
 
     def test_bwrap_skips_plugin_for_bare_agent(self):
         # --bare disables Claude hooks/plugins, so injection would be a no-op;
@@ -1405,9 +1438,8 @@ class TestBwrapConfinement(unittest.TestCase):
         control_events = [e for e in session.events
                           if e.get("event") == "control-server"]
         self.assertEqual(control_events[-1].get("detail"), expected_host_sock)
-        # everything is before the -- command separator
-        sep = argv.index("--")
-        self.assertEqual(argv[sep + 1:], ["my-agent"])
+        # everything is before the -- command separator except the supervised command
+        self.assertEqual(self._wrapped_agent_command(argv), ["my-agent"])
         self.assertTrue(any(e.get("kind") == "control-server"
                             or e.get("event") == "control-server"
                             for e in session.events))

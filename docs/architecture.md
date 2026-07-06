@@ -96,9 +96,12 @@ not real deletes.
 
 `ccc_agent.runner._bwrap_command` builds a bubblewrap invocation that assembles
 a rootless user+mount+pid namespace — no container `CAP_SYS_ADMIN`, just
-unprivileged user namespaces. The agent runs as the calling uid mapped to 0
-inside the namespace; the namespace (and all its mounts) disappears with the
-agent process. Layout the agent sees:
+unprivileged user namespaces. The sandbox command is a small PID-1 lifecycle
+wrapper that starts the real agent as a normal child process and exits with the
+agent's status. This makes process-exit finalization depend on the foreground
+agent, not on bubblewrap's default reaper waiting forever for lingering helper
+processes. The namespace (and all its mounts/processes) disappears when that
+wrapper exits after the agent. Layout the agent sees:
 
 ```text
 /usr /etc /opt                    read-only binds of the container image

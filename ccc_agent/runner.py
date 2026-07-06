@@ -41,6 +41,69 @@ ENV_CONTROL_TOKEN = "CCC_AGENT_CONTROL_TOKEN"
 # /run/ccc-agent as an unprivileged user.
 SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 
+# Run the sandbox command under a tiny PID-1 lifecycle wrapper.  Without this,
+# bubblewrap's default PID-1 reaper keeps the namespace alive until every helper
+# process exits.  Interactive agents such as Claude Code can leave short-lived or
+# stuck helper processes behind after the foreground UI exits; then ccc-agent
+# remains blocked in subprocess.run(bwrap ...) and never reaches finalization.
+# With --as-pid-1 below, this wrapper is namespace init; when the foreground
+# agent child exits, the wrapper exits with the same status and the kernel tears
+# down any remaining processes in that PID namespace.
+BWRAP_AGENT_RUNNER_ARG0 = "ccc-agent-runner"
+BWRAP_AGENT_RUNNER = r"""
+import errno
+import signal
+import subprocess
+import sys
+
+command = sys.argv[2:]
+if not command:
+    sys.exit(127)
+
+
+def set_signal(sig, handler):
+    try:
+        signal.signal(sig, handler)
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        pass
+
+
+# This wrapper is PID 1.  Keep terminal Ctrl-C / Ctrl-\\ for the foreground
+# agent child; the wrapper only owns namespace teardown after that child exits.
+set_signal(signal.SIGINT, signal.SIG_IGN)
+set_signal(signal.SIGQUIT, signal.SIG_IGN)
+
+
+def restore_child_signals():
+    set_signal(signal.SIGINT, signal.SIG_DFL)
+    set_signal(signal.SIGQUIT, signal.SIG_DFL)
+    set_signal(signal.SIGTERM, signal.SIG_DFL)
+    set_signal(signal.SIGHUP, signal.SIG_DFL)
+
+
+try:
+    child = subprocess.Popen(command, preexec_fn=restore_child_signals)
+except OSError as exc:
+    print("ccc-agent-runner: failed to exec %s: %s" % (command[0], exc),
+          file=sys.stderr)
+    sys.exit(127 if exc.errno == errno.ENOENT else 126)
+
+
+def forward_signal(sig, _frame):
+    try:
+        child.send_signal(sig)
+    except Exception:
+        pass
+
+
+set_signal(signal.SIGTERM, forward_signal)
+set_signal(signal.SIGHUP, forward_signal)
+returncode = child.wait()
+if returncode < 0:
+    returncode = 128 - returncode
+sys.exit(returncode)
+""".strip()
+
 
 class ResumeError(Exception):
     """Raised when an existing session cannot be resumed safely."""
@@ -685,6 +748,7 @@ def _bwrap_command(session, config, control=None):
     gid = str(_bwrap_gid(config))
     argv = [config.bwrap_bin,
             "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--as-pid-1",
             "--uid", uid, "--gid", gid,
             "--die-with-parent", "--clearenv"]
 
@@ -809,7 +873,9 @@ def _bwrap_command(session, config, control=None):
     for key, value in sorted(config.bwrap_setenv.items()):
         argv += ["--setenv", key, str(value)]
     argv += ["--chdir", workdir, "--"]
-    argv += _agent_command_with_plugin(config.agent_command, plugin_spec)
+    command = _agent_command_with_plugin(config.agent_command, plugin_spec)
+    argv += ["/usr/bin/python3", "-c", BWRAP_AGENT_RUNNER,
+             BWRAP_AGENT_RUNNER_ARG0] + command
     return argv
 
 
