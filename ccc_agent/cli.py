@@ -812,9 +812,12 @@ def _prompt_pending_review_decision(controller, session, stream=None,
     _ensure_foreground_for_prompt()
     while True:
         stream.write(
-            "ccc-agent: Accept changes? "
-            "yes/y=commit / select/s=selective accept / no/n=discard / "
-            "later/l/Esc=keep for review [later]: ")
+            "ccc-agent: Accept changes?\n"
+            "  [c] commit all changes       (aliases: y, yes, commit)\n"
+            "  [s] selective accept        (aliases: select, selective)\n"
+            "  [d] discard all changes     (aliases: n, no, discard)\n"
+            "  [l] keep for later review   (aliases: Enter, Esc, later)\n"
+            "choice [l]: ")
         stream.flush()
         try:
             raw_choice = _read_review_choice()
@@ -823,7 +826,7 @@ def _prompt_pending_review_decision(controller, session, stream=None,
         if len(raw_choice) == 1 and raw_choice not in ("\n", "\r"):
             stream.write("\n")
         choice = raw_choice.strip().lower()
-        if choice in ("y", "yes"):
+        if choice in ("c", "commit", "y", "yes"):
             updated = controller.commit(session.session_id,
                                         include_ignored=include_ignored)
             stream.write("ccc-agent: committed session %s\n"
@@ -837,7 +840,7 @@ def _prompt_pending_review_decision(controller, session, stream=None,
             if updated is not None:
                 return updated
             continue
-        if choice in ("n", "no"):
+        if choice in ("d", "discard", "n", "no"):
             updated = controller.abort(session.session_id)
             stream.write("ccc-agent: discarded session %s\n"
                          % updated.session_id)
@@ -846,7 +849,9 @@ def _prompt_pending_review_decision(controller, session, stream=None,
             stream.write("ccc-agent: kept for later review: %s\n"
                          % session.session_id)
             return session
-        stream.write("ccc-agent: please answer yes/y, select/s, no/n, or later/l/Esc.\n")
+        stream.write(
+            "ccc-agent: please choose c=commit, s=select, "
+            "d/n=discard, or l/Enter/Esc=later.\n")
 
 
 def _review_pending_session(controller, session, display_stream=None,
@@ -1461,7 +1466,7 @@ _CTL_COMMAND_HELP = {
     "status": "read live BranchFS status for each protected root",
     "diff": "show changed paths, or a unified diff for one changed file",
     "review": ("browse pending/frozen changes and choose "
-               "commit/select/reject/later"),
+               "commit/select/discard/later"),
     "commit": "commit pending/frozen session deltas to the real underlay",
     "abort": "discard session branch deltas and mark the session aborted",
     "thaw": "reopen a pending-review branch for more work",

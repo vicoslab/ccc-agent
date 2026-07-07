@@ -330,7 +330,8 @@ class TestMainRun(unittest.TestCase):
         store = SessionStore(os.path.join(self.h.tmp, "state"))
         self.assertEqual(store.load(sid).state, "committed")
         self.assertIn("Accept changes?", stderr.getvalue())
-        self.assertIn("yes/y=commit", stderr.getvalue())
+        self.assertIn("[c] commit all changes", stderr.getvalue())
+        self.assertIn("aliases: y, yes, commit", stderr.getvalue())
         self.assertIn("committed session", stderr.getvalue())
 
     def test_pending_review_quick_no_discards(self):
@@ -392,7 +393,8 @@ class TestMainRun(unittest.TestCase):
         sid = self.h.sessions()[0]
         store = SessionStore(os.path.join(self.h.tmp, "state"))
         self.assertEqual(store.load(sid).state, "pending-review")
-        self.assertIn("later/l/Esc=keep for review", stderr.getvalue())
+        self.assertIn("[l] keep for later review", stderr.getvalue())
+        self.assertIn("aliases: Enter, Esc, later", stderr.getvalue())
 
     def test_review_choice_reads_single_escape_key_from_tty(self):
         class FakeStdin(object):
