@@ -15,16 +15,15 @@ the agent's live mount, so the session simply continues:
   turn-approve   yes -> copy the approved out-of-scope paths to base
                  keep/no -> remember as kept in the branch only (not committed,
                             not re-prompted)
-                 discard/revert -> remember as rejected and ask the agent to
-                                   undo it (not re-prompted)
+                 discard/revert -> drop the selected BranchFS deltas/tombstones
                  per-file -> commit some, keep some, discard some
   turn-resolve   later user request -> commit/keep/discard previously remembered
                                       paths by name
 
 The branch's deltas are intentionally left in place (commit-in-place under a
 live FUSE mount churns inodes -> ESTALE on NFS); re-applying an unchanged path
-is idempotent, and the supervisor records per-path decisions in the session so
-out-of-scope paths that were already committed, kept, or discarded are not
+is idempotent, and the supervisor records per-path commit/keep decisions in the
+session so out-of-scope paths that were already committed or kept are not
 re-prompted after controller restarts.
 
 Threat model is naive/accidental (see docs/architecture.md): the supervisor
@@ -39,15 +38,14 @@ import shutil
 import threading
 
 from .commit_failures import is_permission_denied
-from .control import (VERDICT_COMMITTED, VERDICT_HELD, VERDICT_KEPT_STATUS,
-                      VERDICT_NEEDS_APPROVAL, VERDICT_NEEDS_KEPT_REVIEW,
-                      VERDICT_NOOP)
+from .control import (VERDICT_COMMITTED, VERDICT_DISCARDED, VERDICT_HELD,
+                      VERDICT_KEPT_STATUS, VERDICT_NEEDS_APPROVAL,
+                      VERDICT_NEEDS_KEPT_REVIEW, VERDICT_NOOP)
 from .policy import PolicyConfig, classify, filter_ignored
 from .previous_commits import DECISION_COMMITTED, TURN_PATH_DECISIONS
 
 
 DECISION_KEPT = "kept"
-DECISION_DISCARDED = "discarded"
 
 
 def _new_token():
@@ -101,6 +99,15 @@ class TurnController(object):
         paths.update(m.path for m in deny)
         return paths
 
+    def _change_root_rel(self, ch):
+        roots = self._roots()
+        root = roots.get(ch.root)
+        if root is None:
+            return None, None
+        visible = self.alias_map.canonicalize(root.visible)
+        rel = os.path.relpath(self.alias_map.canonicalize(ch.path), visible)
+        return root, rel
+
     def _apply(self, changes):
         """Copy each change from the live view into the base (or delete it).
 
@@ -108,15 +115,12 @@ class TurnController(object):
         bytes.  Reads come from the FUSE view (root.mount) so they reflect the
         agent's latest content; writes go straight to the real underlay.
         """
-        roots = self._roots()
         applied = []
         denied = []
         for ch in changes:
-            root = roots.get(ch.root)
-            if root is None:
+            root, rel = self._change_root_rel(ch)
+            if root is None or rel is None:
                 continue
-            visible = self.alias_map.canonicalize(root.visible)
-            rel = os.path.relpath(self.alias_map.canonicalize(ch.path), visible)
             dst = os.path.join(root.base, rel)
             try:
                 if ch.op == "D":
@@ -157,13 +161,12 @@ class TurnController(object):
             oos = self._out_of_scope_paths(changes)
             committed_paths = self._paths_with_decisions(DECISION_COMMITTED)
             resolved_paths = self._paths_with_decisions(
-                DECISION_COMMITTED, DECISION_KEPT, DECISION_DISCARDED)
+                DECISION_COMMITTED, DECISION_KEPT)
             new_oos = oos - resolved_paths
             # commit in-scope changes + any previously approved out-of-scope;
             # keep remembered/rejected in-scope paths out of repeated retries
             # until the user explicitly resolves them.
-            held_paths = self._paths_with_decisions(
-                DECISION_KEPT, DECISION_DISCARDED)
+            held_paths = self._paths_with_decisions(DECISION_KEPT)
             to_apply = [c for c in changes
                         if c.path in committed_paths or
                         (c.path not in oos and c.path not in held_paths)]
@@ -247,10 +250,37 @@ class TurnController(object):
         self._mark_paths(paths, DECISION_KEPT)
         return paths
 
+    def _unmark_paths(self, paths):
+        decisions = self._decision_map()
+        for path in sorted(set(paths)):
+            decisions.pop(path, None)
+
     def _discard_paths(self, paths):
         paths = sorted(set(paths))
-        self._mark_paths(paths, DECISION_DISCARDED)
-        return paths
+        if not paths:
+            return [], []
+        live_by_path = {c.path: c for c in self._live_changes()}
+        discarded = []
+        stale = []
+        for path in paths:
+            change = live_by_path.get(path)
+            if change is None:
+                stale.append(path)
+                continue
+            root, rel = self._change_root_rel(change)
+            if root is None or rel is None:
+                stale.append(path)
+                continue
+            self.backend.revert_path(root, rel)
+            discarded.append(path)
+
+        remaining = {c.path for c in self._live_changes()}
+        failed = sorted(set(discarded) & remaining)
+        if failed:
+            raise RuntimeError("discard did not remove live BranchFS change(s): %s"
+                               % ", ".join(failed))
+        self._unmark_paths(discarded + stale)
+        return discarded, stale
 
     def _decision_path_view(self, decision):
         live_paths = {c.path for c in self._live_changes()}
@@ -324,19 +354,17 @@ class TurnController(object):
 
         committed = self._commit_paths(commit_now)
         kept = self._keep_paths(keep_now)
-        revert = self._discard_paths(discard_now)
-        return committed, kept, revert
+        discarded, discard_stale = self._discard_paths(discard_now)
+        return committed, kept, discarded, discard_stale
 
     def approve_turn(self, approval_token, decision, paths=None,
                      commit_paths=None, keep_paths=None, discard_paths=None):
         """Resolve an out-of-scope turn with one of the four review actions:
 
           accept-all   decision in _YES                -> commit every flagged path
-          reject/revert decision in _REVERT            -> remember + tell the agent to
-                                                          undo them (naive model:
-                                                          the supervisor cannot
-                                                          safely strip deltas under
-                                                          a live mount)
+          reject/revert decision in _REVERT            -> remove selected branch
+                                                          deltas/tombstones via
+                                                          BranchFS revert-path
           keep          decision = "no"/"keep" (default)-> leave deltas uncommitted,
                                                           session continues
           file-level    paths=[...]                    -> commit only that subset,
@@ -353,18 +381,20 @@ class TurnController(object):
             decision = str(decision or "").strip().lower()
 
             if commit_paths or keep_paths or discard_paths:
-                committed, kept, revert = self._resolve_granular(
+                committed, kept, discarded, discard_stale = self._resolve_granular(
                     pending, commit_paths=commit_paths, keep_paths=keep_paths,
                     discard_paths=discard_paths)
                 self.session.add_event(
                     "turn-approved-granular",
-                    "committed %d, kept %d, discard-requested %d" %
-                    (len(committed), len(kept), len(revert)))
+                    "committed %d, kept %d, discarded %d" %
+                    (len(committed), len(kept), len(discarded)))
                 self.store.save(self.session)
-                return {"verdict": (VERDICT_COMMITTED if committed
-                                    else VERDICT_HELD),
-                        "committed": committed, "kept": kept,
-                        "held": kept, "revert": revert}
+                verdict = (VERDICT_COMMITTED if committed else
+                           VERDICT_HELD if kept else
+                           VERDICT_DISCARDED if discarded else VERDICT_NOOP)
+                return {"verdict": verdict, "committed": committed,
+                        "kept": kept, "held": kept,
+                        "discarded": discarded, "stale": discard_stale}
 
             if paths:
                 chosen = set(paths) & pending
@@ -386,14 +416,13 @@ class TurnController(object):
                 return {"verdict": VERDICT_COMMITTED, "committed": committed}
 
             if decision in self._REVERT:
-                revert = self._discard_paths(pending)
-                self.session.add_event("turn-revert-requested",
-                                       "%d path(s)" % len(pending))
+                discarded, stale = self._discard_paths(pending)
+                self.session.add_event("turn-discarded",
+                                       "%d path(s)" % len(discarded))
                 self.store.save(self.session)
-                return {"verdict": VERDICT_HELD, "revert": revert,
-                        "message": "the user rejected these changes; revert "
-                                   "them in your workspace (restore original "
-                                   "content or delete files you created)"}
+                return {"verdict": (VERDICT_DISCARDED if discarded
+                                    else VERDICT_NOOP),
+                        "discarded": discarded, "stale": stale}
 
             # default: keep deltas, do not commit, session continues
             kept = self._keep_paths(pending)
@@ -424,14 +453,13 @@ class TurnController(object):
                 return {"verdict": VERDICT_COMMITTED,
                         "committed": committed}
             if decision in self._REVERT:
-                revert = self._discard_paths(paths)
+                discarded, stale = self._discard_paths(paths)
                 self.session.add_event("turn-resolved-discard",
-                                       "%d path(s)" % len(revert))
+                                       "%d path(s)" % len(discarded))
                 self.store.save(self.session)
-                return {"verdict": VERDICT_HELD, "revert": revert,
-                        "message": "the user rejected these changes; revert "
-                                   "them in your workspace (restore original "
-                                   "content or delete files you created)"}
+                return {"verdict": (VERDICT_DISCARDED if discarded
+                                    else VERDICT_NOOP),
+                        "discarded": discarded, "stale": stale}
             if decision in self._KEEP:
                 kept = self._keep_paths(paths)
                 self.session.add_event("turn-resolved-keep",

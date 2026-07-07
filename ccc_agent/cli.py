@@ -41,9 +41,9 @@ from importlib import resources
 from . import __version__
 from .branchfs import BranchfsCli, FakeBranchFS
 from .commit_failures import has_permission_failures, permission_failures
-from .control import (ControlClient, VERDICT_COMMITTED, VERDICT_HELD,
-                      VERDICT_KEPT_STATUS, VERDICT_NEEDS_APPROVAL,
-                      VERDICT_NEEDS_KEPT_REVIEW)
+from .control import (ControlClient, VERDICT_COMMITTED, VERDICT_DISCARDED,
+                      VERDICT_HELD, VERDICT_KEPT_STATUS,
+                      VERDICT_NEEDS_APPROVAL, VERDICT_NEEDS_KEPT_REVIEW)
 from .control import ControlError as ChannelError
 from .ctl import CHECK_REPAIR, Controller, ControlError
 from .paths import AliasMap
@@ -1293,7 +1293,7 @@ def _ctl_socket(args, env):
             "ccc-agent: ask the user how to handle these, then run ONE of:\n"
             "    ccc-agent turn-approve %s            # commit all\n"
             "    ccc-agent turn-approve %s keep       # keep in branch, don't commit\n"
-            "    ccc-agent turn-approve %s discard    # discard all (you undo)\n"
+            "    ccc-agent turn-approve %s discard    # discard all from BranchFS\n"
             "    ccc-agent turn-approve %s --paths a,b # commit a,b; keep the rest\n"
             "    ccc-agent turn-approve %s --commit a --keep b --discard c\n"
             "ccc-agent: if the user is unavailable and work should continue, run:\n"
@@ -1331,10 +1331,8 @@ def _ctl_socket(args, env):
                 sys.stdout.write("  - %s\n" % path)
         if resp.get("kept"):
             _write_kept_paths(resp["kept"])
-        if resp.get("revert"):
-            sys.stdout.write("rejected; revert these in your workspace:\n")
-            for path in resp["revert"]:
-                sys.stdout.write("  - %s\n" % path)
+        if resp.get("discarded"):
+            _write_discarded_paths(resp["discarded"], resp.get("stale"))
     elif verdict == VERDICT_HELD:
         if resp.get("permission_denied"):
             sys.stdout.write("could not write due to permission denied:\n")
@@ -1344,12 +1342,12 @@ def _ctl_socket(args, env):
             sys.stdout.write("kept %d path(s) in branch (not committed)\n"
                              % len(resp["kept"]))
             _write_kept_paths(resp["kept"])
-        if resp.get("revert"):
-            sys.stdout.write("rejected; revert these in your workspace:\n")
-            for path in resp["revert"]:
-                sys.stdout.write("  - %s\n" % path)
-        if not resp.get("kept") and not resp.get("revert"):
+        if resp.get("discarded"):
+            _write_discarded_paths(resp["discarded"], resp.get("stale"))
+        if not resp.get("kept") and not resp.get("discarded"):
             sys.stdout.write("changes held for review (not committed)\n")
+    elif verdict == VERDICT_DISCARDED:
+        _write_discarded_paths(resp.get("discarded") or [], resp.get("stale"))
     else:
         sys.stdout.write("%s\n" % (verdict or "ok"))
     return 0
@@ -1362,6 +1360,22 @@ def _write_default_keep_summary(resp, stream):
         kept_paths = resp.get("held")
     kept = len(kept_paths or [])
     stream.write("committed (%d), kept local (%d)\n" % (committed, kept))
+
+
+def _write_discarded_paths(paths, stale=None, stream=None):
+    stream = sys.stdout if stream is None else stream
+    paths = list(paths or [])
+    stale = list(stale or [])
+    if paths:
+        stream.write("discarded %d path(s) from BranchFS:\n" % len(paths))
+        for path in paths:
+            stream.write("  - %s\n" % path)
+    if stale:
+        stream.write("already absent/stale path(s):\n")
+        for path in stale:
+            stream.write("  - %s\n" % path)
+    if not paths and not stale:
+        stream.write("no matching live BranchFS changes to discard\n")
 
 
 def _write_kept_status(resp, stream):

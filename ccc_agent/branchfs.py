@@ -610,6 +610,11 @@ class BranchfsCli(object):
         except ValueError as exc:
             raise BranchfsError("unparseable commit outcome: %s" % exc)
 
+    def revert_path(self, root, relpath):
+        self.start_daemon(root)
+        self._invoke("revert-path", root.branch, relpath,
+                     "--storage", root.store)
+
     def abort(self, root):
         self.start_daemon(root)
         try:
@@ -733,6 +738,10 @@ class FakeBranchFS(object):
         deletes.difference_update(
             item for item in list(deletes)
             if item == rel or item.startswith(rel.rstrip("/") + "/"))
+
+    def revert_path(self, root, rel):
+        """Drop one path's fake branch delta/tombstone without touching base."""
+        self.prune_change(root, rel)
 
     def _cleanup(self, root):
         files = self._files_dir(root)

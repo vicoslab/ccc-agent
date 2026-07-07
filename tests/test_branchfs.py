@@ -531,6 +531,20 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertIn("--json", runner.calls[1])
         self.assertEqual(outcome["parent"], "main")
 
+    def test_revert_path_uses_trusted_branch_command(self):
+        runner = RecordingRunner()
+        cli = BranchfsCli(run=runner)
+
+        cli.revert_path(self.root, "Projects/proj-a/scratch.txt")
+
+        subcommands = [c[1] for c in runner.calls]
+        self.assertEqual(subcommands, ["start-daemon", "revert-path"])
+        call = runner.calls[-1]
+        self.assertIn(self.root.branch, call)
+        self.assertIn("Projects/proj-a/scratch.txt", call)
+        self.assertIn("--storage", call)
+        self.assertIn(self.root.store, call)
+
     def test_abort_treats_missing_branch_with_no_store_dir_as_idempotent(self):
         class MissingBranchRunner(object):
             def __init__(self, branch):
@@ -665,6 +679,19 @@ class TestFakeBranchFS(unittest.TestCase):
         self.assertEqual(self.fake.status(self.root), [])
         self.assertFalse(os.path.exists(os.path.join(self.root.base,
                                                      "junk.txt")))
+
+    def test_revert_path_drops_delta_and_tombstone(self):
+        self.fake.start_daemon(self.root)
+        self.fake.create_branch(self.root)
+        self.fake.mount(self.root)
+        with open(os.path.join(self.root.mount, "junk.txt"), "w") as fh:
+            fh.write("discard me\n")
+        self.fake.record_delete(self.root, "existing.txt")
+
+        self.fake.revert_path(self.root, "junk.txt")
+        self.fake.revert_path(self.root, "existing.txt")
+
+        self.assertEqual(self.fake.status(self.root), [])
 
 
 if __name__ == "__main__":

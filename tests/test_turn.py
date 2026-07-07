@@ -12,8 +12,9 @@ import tempfile
 import unittest
 
 from ccc_agent.branchfs import FakeBranchFS
-from ccc_agent.control import (VERDICT_COMMITTED, VERDICT_HELD,
-                               VERDICT_NEEDS_APPROVAL, VERDICT_NOOP)
+from ccc_agent.control import (VERDICT_COMMITTED, VERDICT_DISCARDED,
+                               VERDICT_HELD, VERDICT_NEEDS_APPROVAL,
+                               VERDICT_NOOP)
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import RootSpec
 from ccc_agent.session import SessionStore
@@ -219,6 +220,39 @@ class TestTurnController(unittest.TestCase):
         self.assertIn("/storage/user/escape.txt",
                       persisted2.policy["allowed_scopes"])
 
+    def test_later_discard_of_kept_path_removes_branch_delta(self):
+        self.h.write("escape.txt", "x")
+        token = self.h.tc.finalize_turn()["approval_token"]
+        self.h.tc.approve_turn(token, "keep")
+
+        persisted = self.h.store.load(self.h.session.session_id)
+        tc2 = TurnController(persisted, self.h.store, self.h.backend,
+                             self.h.alias)
+        resp = tc2.resolve_turn("discard", ["/storage/user/escape.txt"])
+
+        self.assertEqual(resp["verdict"], "discarded")
+        self.assertEqual(resp["discarded"], ["/storage/user/escape.txt"])
+        self.assertEqual(tc2.kept_status()["kept"], [])
+        self.assertNotIn("/storage/user/escape.txt",
+                         {c.path for c in self.h.backend.status(self.h.root)})
+        persisted2 = self.h.store.load(self.h.session.session_id)
+        self.assertNotIn("/storage/user/escape.txt",
+                         persisted2.policy.get("turn_path_decisions", {}))
+
+    def test_later_discard_of_kept_delete_removes_tombstone(self):
+        with open(os.path.join(self.h.base, "escape.txt"), "w") as fh:
+            fh.write("base\n")
+        self.h.backend.record_delete(self.h.root, "escape.txt")
+        resp = self.h.tc.finalize_turn(default_keep=True)
+        self.assertEqual(resp["kept"], ["/storage/user/escape.txt"])
+
+        resp2 = self.h.tc.resolve_turn("discard", ["/storage/user/escape.txt"])
+
+        self.assertEqual(resp2["verdict"], "discarded")
+        self.assertEqual(resp2["discarded"], ["/storage/user/escape.txt"])
+        self.assertEqual(self.h.backend.status(self.h.root), [])
+        self.assertTrue(self.h.base_has("escape.txt"))
+
     def test_kept_status_lists_live_committed_and_kept_paths(self):
         self.h.write("Projects/proj-a/ok.txt", "ok")
         self.h.write("escape.txt", "x")
@@ -260,21 +294,24 @@ class TestTurnController(unittest.TestCase):
         self.assertTrue(self.h.base_has("commit-me.txt"))
         self.assertFalse(self.h.base_has("discard-me.txt"))
         self.assertFalse(self.h.base_has("keep-me.txt"))
-        self.assertEqual(resp["revert"], ["/storage/user/discard-me.txt"])
+        self.assertEqual(resp["discarded"], ["/storage/user/discard-me.txt"])
         self.assertEqual(resp["kept"], ["/storage/user/keep-me.txt"])
+        self.assertNotIn("/storage/user/discard-me.txt",
+                         {c.path for c in self.h.backend.status(self.h.root)})
         decisions = self.h.store.load(
             self.h.session.session_id).policy["turn_path_decisions"]
         self.assertEqual(decisions["/storage/user/commit-me.txt"], "committed")
-        self.assertEqual(decisions["/storage/user/discard-me.txt"], "discarded")
+        self.assertNotIn("/storage/user/discard-me.txt", decisions)
         self.assertEqual(decisions["/storage/user/keep-me.txt"], "kept")
 
-    def test_approve_revert_holds_and_asks_agent_to_undo(self):
+    def test_approve_revert_discards_from_branchfs(self):
         self.h.write("escape.txt", "x")
         token = self.h.tc.finalize_turn()["approval_token"]
         resp = self.h.tc.approve_turn(token, "revert")
-        self.assertEqual(resp["verdict"], VERDICT_HELD)
-        self.assertIn("/storage/user/escape.txt", resp["revert"])
+        self.assertEqual(resp["verdict"], VERDICT_DISCARDED)
+        self.assertIn("/storage/user/escape.txt", resp["discarded"])
         self.assertFalse(self.h.base_has("escape.txt"))
+        self.assertEqual(self.h.backend.status(self.h.root), [])
 
     def test_approve_file_level_subset_commits_only_chosen(self):
         self.h.write("escape1.txt", "a")

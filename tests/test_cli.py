@@ -1066,7 +1066,7 @@ class TestMainCtl(unittest.TestCase):
                     "discard_paths": discard_paths,
                 }
                 return {"verdict": "committed", "committed": ["/a"],
-                        "kept": ["/b"], "revert": ["/c"]}
+                        "kept": ["/b"], "discarded": ["/c"]}
 
         env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
                cli_mod.ENV_CONTROL_TOKEN: "tok"}
@@ -1090,7 +1090,7 @@ class TestMainCtl(unittest.TestCase):
         })
         self.assertIn("committed 1 change(s)", out.getvalue())
         self.assertIn("kept 1", out.getvalue())
-        self.assertIn("revert these", out.getvalue())
+        self.assertIn("discarded 1 path(s) from BranchFS", out.getvalue())
 
     def test_turn_resolve_cli_sends_later_kept_path_decision(self):
         seen = {}
@@ -1101,7 +1101,7 @@ class TestMainCtl(unittest.TestCase):
 
             def resolve_turn(self, decision, paths):
                 seen["resolve"] = (decision, paths)
-                return {"verdict": "held", "revert": ["/b"]}
+                return {"verdict": "discarded", "discarded": ["/b"]}
 
         env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
                cli_mod.ENV_CONTROL_TOKEN: "tok"}
@@ -1113,7 +1113,7 @@ class TestMainCtl(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(seen["resolve"], ("discard", ["/b"]))
-        self.assertIn("revert these", out.getvalue())
+        self.assertIn("discarded 1 path(s) from BranchFS", out.getvalue())
 
     def test_turn_kept_status_cli_lists_remembered_kept_paths(self):
         class FakeControlClient(object):

@@ -31,6 +31,7 @@ VERDICT_COMMITTED = "committed"          # in-scope (or approved): applied to ba
 VERDICT_NEEDS_APPROVAL = "needs-approval"  # out-of-scope: relay to the user
 VERDICT_NOOP = "noop"                    # nothing changed this turn
 VERDICT_HELD = "held"                    # approval denied: left uncommitted
+VERDICT_DISCARDED = "discarded"          # selected paths were removed from branch
 VERDICT_KEPT_STATUS = "kept-status"      # read-only remembered kept-path view
 VERDICT_NEEDS_KEPT_REVIEW = "needs-kept-review"  # final idle ask is needed
 

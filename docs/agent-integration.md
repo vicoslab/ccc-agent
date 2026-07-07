@@ -96,10 +96,12 @@ ccc-agent turn-resolve discard --paths c
 ccc-agent turn-resolve keep --paths d
 ```
 
-For live sessions, `discard` records the user's rejection and asks the agent to
-undo the listed paths in its workspace; the supervisor does not surgically edit a
-running FUSE branch under the agent. At process exit, any still-kept branch deltas
-remain available through normal `pending-review` session review.
+For live sessions, `discard` is active. The supervisor asks BranchFS to
+`revert-path` each selected path, dropping matching branch deltas and tombstones:
+added files disappear from the branch, modified inherited files fall back to the
+base view, and deleted inherited files/directories reappear. At process exit, any
+still-kept branch deltas remain available through normal `pending-review` session
+review.
 
 **Hermes** loads a CCC bundled plugin (`HERMES_BUNDLED_PLUGINS`) whose
 `post_llm_call` / `on_session_end` hooks report turn boundaries with
