@@ -290,9 +290,10 @@ class TestClaudeContextHook(unittest.TestCase):
 
     def test_stop_review_kept_continues_with_user_decision_context(self):
         calls = os.path.join(self._tmp.name, "calls")
-        prompt = ("ccc-agent: ask the user whether to commit, discard, or keep\n"
-                  "  - /storage/user/outside.txt\n"
-                  "    ccc-agent turn-resolve commit --paths /storage/user/outside.txt")
+        prompt = ("ccc-agent: 1 kept non-workspace path(s) pending.\n"
+                  "ccc-agent: ask user: commit, discard, or keep pending; then run "
+                  "ccc-agent turn-resolve <commit|discard|keep> --all-kept\n"
+                  "ccc-agent: list paths only if needed: ccc-agent turn-kept-status --details")
         self.fake_ctl_review(2, prompt)
 
         proc = self.run_hook(
@@ -304,7 +305,8 @@ class TestClaudeContextHook(unittest.TestCase):
         out = data["hookSpecificOutput"]
         self.assertEqual(out["hookEventName"], "Stop")
         self.assertIn("review is pending", out["additionalContext"])
-        self.assertIn("outside.txt", out["additionalContext"])
+        self.assertIn("--all-kept", out["additionalContext"])
+        self.assertNotIn("outside.txt", out["additionalContext"])
         with open(calls) as fh:
             self.assertIn("turn-review-kept", fh.read())
 
@@ -354,9 +356,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
 
     def fake_ctl_review(self, rc=2, text=None):
         text = text or (
-            "ccc-agent: ask the user whether to commit, discard, or keep\n"
-            "  - /storage/user/outside.txt\n"
-            "    ccc-agent turn-resolve discard --paths /storage/user/outside.txt")
+            "ccc-agent: 1 kept non-workspace path(s) pending.\n"
+            "ccc-agent: ask user: commit, discard, or keep pending; then run "
+            "ccc-agent turn-resolve <commit|discard|keep> --all-kept\n"
+            "ccc-agent: list paths only if needed: ccc-agent turn-kept-status --details")
         with open(self.ctl, "w") as fh:
             fh.write("#!/bin/sh\n"
                      "echo \"$*\" >> %r\n"
@@ -405,8 +408,9 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             self.restore_env(old)
         self.assertIn("Done.", result)
         self.assertIn("CCC contained-session review is pending", result)
-        self.assertIn("outside.txt", result)
-        self.assertIn("turn-resolve discard", result)
+        self.assertIn("--all-kept", result)
+        self.assertIn("turn-kept-status --details", result)
+        self.assertNotIn("outside.txt", result)
         with open(self.calls) as fh:
             call_log = fh.read()
         self.assertIn("turn-finalize --default-keep", call_log)

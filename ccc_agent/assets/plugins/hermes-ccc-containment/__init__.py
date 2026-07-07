@@ -47,17 +47,20 @@ TURN_REMINDER = (
     "CCC contained-session reminder: workspace/in-policy files are written "
     "through by the supervisor, while non-workspace or out-of-policy files stay "
     "separate until the user decides. When work is finished and Hermes would "
-    "otherwise idle, check kept files with ccc-agent turn-kept-status or follow "
-    "the CCC review prompt; if kept files exist, ask the user whether to commit, "
-    "discard, or keep them and then run the exact ccc-agent turn-resolve command "
-    "matching the user's decision."
+    "otherwise idle, check compact kept-file counts with ccc-agent "
+    "turn-kept-status or follow the CCC review prompt; if kept files exist, ask "
+    "the user briefly whether to commit, discard, or keep them and then run "
+    "ccc-agent turn-resolve <commit|discard|keep> --all-kept unless a selective "
+    "path decision is needed. Use ccc-agent turn-kept-status --details only when "
+    "exact paths are needed."
 )
 
 REVIEW_INSTRUCTION = (
     "The supervisor kept non-workspace or out-of-policy files separate and they "
-    "are not committed. Ask the user whether to commit, discard, or keep them, "
-    "then run the exact ccc-agent turn-resolve command that matches the user's "
-    "decision."
+    "are not committed. Ask the user briefly whether to commit, discard, or keep "
+    "them, then run ccc-agent turn-resolve <commit|discard|keep> --all-kept "
+    "unless a selective path decision is needed. Do not paste long path lists; "
+    "use ccc-agent turn-kept-status --details only when exact paths are needed."
 )
 
 

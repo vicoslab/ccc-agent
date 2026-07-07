@@ -1262,8 +1262,12 @@ def _ctl_socket(args, env):
                                        keep_paths=keep_paths,
                                        discard_paths=discard_paths)
         else:  # turn-resolve
-            resp = client.resolve_turn(args.decision,
-                                       _split_csv_paths(args.paths) or [])
+            if getattr(args, "all_kept", False):
+                status = client.kept_status()
+                paths = list(status.get("kept") or [])
+            else:
+                paths = _split_csv_paths(args.paths) or []
+            resp = client.resolve_turn(args.decision, paths)
     except ChannelError as exc:
         sys.stderr.write("ccc-agent: control error: %s\n" % exc)
         return 0
@@ -1274,10 +1278,12 @@ def _ctl_socket(args, env):
         _write_default_keep_summary(resp, sys.stdout)
         return 0
     if verdict == VERDICT_KEPT_STATUS:
-        _write_kept_status(resp, sys.stdout)
+        _write_kept_status(resp, sys.stdout,
+                           details=getattr(args, "details", False))
         return 0
     if verdict == VERDICT_NEEDS_KEPT_REVIEW:
-        _write_kept_review_prompt(resp, sys.stderr)
+        _write_kept_review_prompt(resp, sys.stderr,
+                                  details=getattr(args, "details", False))
         return 2
     if verdict == VERDICT_NEEDS_APPROVAL:
         paths = resp.get("out_of_scope", [])
@@ -1335,9 +1341,10 @@ def _ctl_socket(args, env):
             for path in resp["permission_denied"]:
                 sys.stdout.write("  - %s\n" % path)
         if resp.get("kept"):
-            _write_kept_paths(resp["kept"])
+            _write_kept_paths(resp["kept"], details=getattr(args, "details", False))
         if resp.get("discarded"):
-            _write_discarded_paths(resp["discarded"], resp.get("stale"))
+            _write_discarded_paths(resp["discarded"], resp.get("stale"),
+                                   details=getattr(args, "details", False))
     elif verdict == VERDICT_HELD:
         if resp.get("permission_denied"):
             sys.stdout.write("could not write due to permission denied:\n")
@@ -1346,13 +1353,15 @@ def _ctl_socket(args, env):
         if resp.get("kept"):
             sys.stdout.write("kept %d path(s) in branch (not committed)\n"
                              % len(resp["kept"]))
-            _write_kept_paths(resp["kept"])
+            _write_kept_paths(resp["kept"], details=getattr(args, "details", False))
         if resp.get("discarded"):
-            _write_discarded_paths(resp["discarded"], resp.get("stale"))
+            _write_discarded_paths(resp["discarded"], resp.get("stale"),
+                                   details=getattr(args, "details", False))
         if not resp.get("kept") and not resp.get("discarded"):
             sys.stdout.write("changes held for review (not committed)\n")
     elif verdict == VERDICT_DISCARDED:
-        _write_discarded_paths(resp.get("discarded") or [], resp.get("stale"))
+        _write_discarded_paths(resp.get("discarded") or [], resp.get("stale"),
+                               details=getattr(args, "details", False))
     else:
         sys.stdout.write("%s\n" % (verdict or "ok"))
     return 0
@@ -1367,80 +1376,95 @@ def _write_default_keep_summary(resp, stream):
     stream.write("committed (%d), kept local (%d)\n" % (committed, kept))
 
 
-def _write_discarded_paths(paths, stale=None, stream=None):
+def _write_discarded_paths(paths, stale=None, stream=None, details=False):
     stream = sys.stdout if stream is None else stream
     paths = list(paths or [])
     stale = list(stale or [])
     if paths:
-        stream.write("discarded %d path(s) from BranchFS:\n" % len(paths))
-        for path in paths:
-            stream.write("  - %s\n" % path)
+        stream.write("discarded %d path(s) from BranchFS\n" % len(paths))
+        if details:
+            for path in paths:
+                stream.write("  - %s\n" % path)
     if stale:
-        stream.write("already absent/stale path(s):\n")
-        for path in stale:
-            stream.write("  - %s\n" % path)
+        stream.write("already absent/stale path(s): %d\n" % len(stale))
+        if details:
+            for path in stale:
+                stream.write("  - %s\n" % path)
     if not paths and not stale:
         stream.write("no matching live BranchFS changes to discard\n")
 
 
-def _write_kept_status(resp, stream):
+def _write_kept_status(resp, stream, details=False):
     committed = list(resp.get("committed") or [])
     paths = list(resp.get("kept") or [])
     stale = list(resp.get("stale") or [])
     committed_stale = list(resp.get("committed_stale") or [])
-    if committed:
+    stream.write("ccc-agent: committed=%d kept=%d stale=%d\n" %
+                 (len(committed), len(paths), len(stale) + len(committed_stale)))
+    if committed and details:
         stream.write("committed this live BranchFS session:\n")
         for path in committed:
             stream.write("  - %s\n" % path)
     if not paths:
-        stream.write("no kept non-workspace paths are currently live\n")
+        stream.write("ccc-agent: no kept non-workspace paths are currently live\n")
+    else:
+        stream.write("ccc-agent: resolve all with: ccc-agent turn-resolve <commit|discard|keep> --all-kept\n")
+        if not details:
+            stream.write("ccc-agent: list paths only if needed: ccc-agent turn-kept-status --details\n")
+        else:
+            stream.write("kept non-workspace paths (not committed to real storage):\n")
+            for path in paths:
+                stream.write("  - %s\n" % path)
+            joined = ",".join(paths)
+            stream.write(
+                "resolve selected with: ccc-agent turn-resolve commit --paths %s\n"
+                "or: ccc-agent turn-resolve discard --paths %s\n"
+                % (joined, joined))
+    if committed_stale and details:
+        stream.write("remembered committed paths no longer present as live changes:\n")
+        for path in committed_stale:
+            stream.write("  - %s\n" % path)
+    if stale and details:
+        stream.write("remembered kept paths no longer present as live changes:\n")
+        for path in stale:
+            stream.write("  - %s\n" % path)
+
+
+def _write_kept_review_prompt(resp, stream, details=False):
+    paths = list(resp.get("kept") or [])
+    if not paths:
+        stream.write("ccc-agent: no kept non-workspace paths need review\n")
+        return
+    stream.write(
+        "ccc-agent: %d kept non-workspace path(s) pending.\n" % len(paths))
+    stream.write(
+        "ccc-agent: ask user: commit, discard, or keep pending; then run "
+        "ccc-agent turn-resolve <commit|discard|keep> --all-kept\n")
+    if not details:
+        stream.write("ccc-agent: list paths only if needed: ccc-agent turn-kept-status --details\n")
     else:
         stream.write("kept non-workspace paths (not committed to real storage):\n")
         for path in paths:
             stream.write("  - %s\n" % path)
         joined = ",".join(paths)
         stream.write(
-            "resolve with: ccc-agent turn-resolve commit --paths %s\n"
-            "or: ccc-agent turn-resolve discard --paths %s\n"
-            "or inspect again: ccc-agent turn-kept-status\n"
-            % (joined, joined))
-    if committed_stale:
-        stream.write("remembered committed paths no longer present as live changes:\n")
-        for path in committed_stale:
+            "selected-path commands:\n"
+            "    ccc-agent turn-resolve commit --paths %s\n"
+            "    ccc-agent turn-resolve discard --paths %s\n"
+            "    ccc-agent turn-resolve keep --paths %s\n"
+            % (joined, joined, joined))
+
+
+def _write_kept_paths(paths, stream=None, details=False):
+    stream = sys.stdout if stream is None else stream
+    paths = list(paths or [])
+    stream.write("kept %d path(s) pending (not committed)\n" % len(paths))
+    if details and paths:
+        stream.write("kept in branch only (not committed to real storage):\n")
+        for path in paths:
             stream.write("  - %s\n" % path)
-    if stale:
-        stream.write("remembered kept paths no longer present as live changes:\n")
-        for path in stale:
-            stream.write("  - %s\n" % path)
-
-
-def _write_kept_review_prompt(resp, stream):
-    paths = list(resp.get("kept") or [])
-    if not paths:
-        stream.write("ccc-agent: no kept non-workspace paths need review\n")
-        return
-    stream.write(
-        "ccc-agent: ask the user what to do with kept non-workspace paths "
-        "(still only in BranchFS, not committed):\n")
-    for path in paths:
-        stream.write("  - %s\n" % path)
-    joined = ",".join(paths)
-    stream.write(
-        "ccc-agent: then run one of:\n"
-        "    ccc-agent turn-resolve commit --paths %s\n"
-        "    ccc-agent turn-resolve discard --paths %s\n"
-        "    ccc-agent turn-resolve keep --paths %s\n"
-        "ccc-agent: status only: ccc-agent turn-kept-status\n"
-        % (joined, joined, joined))
-
-
-def _write_kept_paths(paths):
-    sys.stdout.write("kept in branch only (not committed to real storage):\n")
-    for path in paths:
-        sys.stdout.write("  - %s\n" % path)
-    joined = ",".join(paths)
-    if joined:
-        sys.stdout.write(
+        joined = ",".join(paths)
+        stream.write(
             "resolve later with: ccc-agent turn-resolve commit --paths %s\n"
             "or: ccc-agent turn-resolve discard --paths %s\n"
             % (joined, joined))
@@ -1644,11 +1668,22 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
                     help="comma-separated paths to discard/revert")
     rp = _add_ctl_parser(sub, "turn-resolve")
     rp.add_argument("decision", help="commit | keep | discard")
-    rp.add_argument("--paths", required=True,
+    rp.add_argument("--paths",
                     help="comma-separated remembered paths to resolve")
-    _add_ctl_parser(sub, "turn-kept-status")
-    _add_ctl_parser(sub, "turn-review-kept")
+    rp.add_argument("--all-kept", action="store_true",
+                    help="resolve all currently kept non-workspace paths")
+    rp.add_argument("--details", action="store_true",
+                    help="include resolved path lists in output")
+    kp = _add_ctl_parser(sub, "turn-kept-status")
+    kp.add_argument("--details", action="store_true",
+                    help="list exact paths instead of the compact count summary")
+    rvk = _add_ctl_parser(sub, "turn-review-kept")
+    rvk.add_argument("--details", action="store_true",
+                     help="list exact paths instead of the compact user prompt")
     args = parser.parse_args(argv)
+
+    if args.cmd == "turn-resolve" and not args.paths and not args.all_kept:
+        parser.error("turn-resolve requires --paths or --all-kept")
 
     if args.cmd in ("turn-finalize", "turn-approve", "turn-resolve",
                     "turn-kept-status", "turn-review-kept"):

@@ -5,10 +5,10 @@ description: Always use in every session when ${CCC_AGENT_SESSION} env is non em
 
 # CCC commit check
 
-Always use this skill in every session when `${CCC_AGENT_SESSION}` is not empty. The Claude CCC plugin also injects these rules at session start and before each user prompt so they are active even when model-invoked skill loading does not trigger.
+Always use this skill when `${CCC_AGENT_SESSION}` is not empty. The CCC plugin also injects these rules at session/turn boundaries.
 
-You are running in a contained filesystem. At each stop, the hook writes workspace/in-policy files to the underlying filesystem. Files outside the workspace or policy stay separate and are not written there until the user approves.
+You are running in a contained filesystem. At each stop, the hook writes workspace/in-policy files through. Files outside workspace/policy stay separate until the user approves.
 
-When you have finished your work and would otherwise idle, check kept files. The Stop hook runs `ccc-agent turn-review-kept`; if it reports kept files, ask the user whether to commit, discard, or keep them and then run the shown `ccc-agent turn-resolve ...` command. You must run `ccc-agent turn-kept-status` if checking manually.
+When you have finished your work and would otherwise idle, check kept files. The Stop hook runs `ccc-agent turn-review-kept`; if it reports kept files, ask briefly whether to commit, discard, or keep them, then run `ccc-agent turn-resolve <commit|discard|keep> --all-kept` unless a selective path decision is needed. You must run `ccc-agent turn-kept-status` if checking manually; use `--details` only when exact paths are needed.
 
 Do not stop active loops/goals just to ask about commits unless approval is required to continue.

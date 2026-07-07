@@ -5,4 +5,4 @@ disable-model-invocation: true
 argument-hint: [optional filter]
 ---
 
-Run `ccc-agent turn-kept-status` and summarize the output. It shows paths already written to the underlying filesystem and paths still kept separate until user approval. If `$ARGUMENTS` is non-empty, filter or focus the summary on that text, but do not hide kept/uncommitted paths that may need action.
+Use `$ARGUMENTS` as an optional filter. Run `ccc-agent turn-kept-status` and summarize the compact counts. Do not dump long path lists to the user. Run `ccc-agent turn-kept-status --details` only when exact paths are needed for a selective decision or the user explicitly asks for details.

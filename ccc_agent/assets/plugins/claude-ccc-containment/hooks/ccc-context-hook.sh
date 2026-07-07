@@ -79,7 +79,7 @@ case "$EVENT" in
         ;;
     UserPromptSubmit)
         printf '%s\n' \
-            "CCC contained-session reminder: workspace/in-policy files are written through by the supervisor, while non-workspace or out-of-policy files stay separate until the user decides. When work is finished and Claude would otherwise idle, check kept files with ccc-agent turn-kept-status or follow Stop-hook feedback from ccc-agent turn-review-kept; if kept files exist, ask the user whether to commit, discard, or keep them." \
+            "CCC contained-session reminder: workspace/in-policy files are written through by the supervisor, while non-workspace or out-of-policy files stay separate until the user decides. When work is finished and Claude would otherwise idle, check compact kept-file counts with ccc-agent turn-kept-status or follow Stop-hook feedback from ccc-agent turn-review-kept; if kept files exist, ask the user briefly whether to commit, discard, or keep them, then run ccc-agent turn-resolve <commit|discard|keep> --all-kept unless a selective path decision is needed. Use ccc-agent turn-kept-status --details only when exact paths are needed." \
             | emit_context UserPromptSubmit
         ;;
     Stop)
@@ -98,7 +98,7 @@ case "$EVENT" in
         REVIEW=$("$CTL" turn-review-kept 2>&1) || rc=$?
         if [ "$rc" -eq 2 ] && [ -n "$REVIEW" ]; then
             printf '%s\n\n%s\n' \
-                "CCC contained-session review is pending. The supervisor kept non-workspace or out-of-policy files separate and they are not committed. Ask the user whether to commit, discard, or keep them, then run the exact ccc-agent turn-resolve command that matches the user's decision." \
+                "CCC contained-session review is pending. The supervisor kept non-workspace or out-of-policy files separate and they are not committed. Ask the user briefly whether to commit, discard, or keep them, then run ccc-agent turn-resolve <commit|discard|keep> --all-kept unless a selective path decision is needed. Do not paste long path lists; use ccc-agent turn-kept-status --details only when exact paths are needed." \
                 "$REVIEW" | emit_context Stop
         fi
         ;;

@@ -1049,6 +1049,7 @@ class TestMainCtl(unittest.TestCase):
         self.assertIn("ask the user", err.getvalue())
         self.assertIn("outside.txt", err.getvalue())
         self.assertIn("kept 1 in branch", out.getvalue())
+        self.assertNotIn("resolve later with", out.getvalue())
 
     def test_turn_approve_cli_accepts_granular_file_decisions(self):
         seen = {}
@@ -1117,8 +1118,40 @@ class TestMainCtl(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(seen["resolve"], ("discard", ["/b"]))
         self.assertIn("discarded 1 path(s) from BranchFS", out.getvalue())
+        self.assertNotIn("/b", out.getvalue())
 
-    def test_turn_kept_status_cli_lists_remembered_kept_paths(self):
+    def test_turn_resolve_cli_can_apply_to_all_kept_paths_compactly(self):
+        seen = {}
+
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                seen["init"] = (sock, token)
+
+            def kept_status(self):
+                seen["status"] = True
+                return {"verdict": "kept-status",
+                        "kept": ["/storage/user/a", "/storage/user/b"]}
+
+            def resolve_turn(self, decision, paths):
+                seen["resolve"] = (decision, paths)
+                return {"verdict": "held", "kept": list(paths)}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        out = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stdout(out):
+                code = main_ctl(["turn-resolve", "keep", "--all-kept"],
+                                env=env)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(seen["status"])
+        self.assertEqual(seen["resolve"],
+                         ("keep", ["/storage/user/a", "/storage/user/b"]))
+        self.assertIn("kept 2 path(s)", out.getvalue())
+        self.assertNotIn("/storage/user/a", out.getvalue())
+
+    def test_turn_kept_status_cli_is_compact_by_default(self):
         class FakeControlClient(object):
             def __init__(self, sock, token):
                 pass
@@ -1137,11 +1170,37 @@ class TestMainCtl(unittest.TestCase):
                 code = main_ctl(["turn-kept-status"], env=env)
 
         self.assertEqual(code, 0)
+        self.assertIn("committed=1 kept=1 stale=0", out.getvalue())
+        self.assertIn("turn-resolve <commit|discard|keep> --all-kept",
+                      out.getvalue())
+        self.assertIn("turn-kept-status --details", out.getvalue())
+        self.assertNotIn("outside.txt", out.getvalue())
+        self.assertNotIn("ok.txt", out.getvalue())
+
+    def test_turn_kept_status_details_lists_remembered_kept_paths(self):
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                pass
+
+            def kept_status(self):
+                return {"verdict": "kept-status",
+                        "committed": ["/storage/user/Projects/proj-a/ok.txt"],
+                        "kept": ["/storage/user/outside.txt"],
+                        "stale": [], "count": 1}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        out = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stdout(out):
+                code = main_ctl(["turn-kept-status", "--details"], env=env)
+
+        self.assertEqual(code, 0)
         self.assertIn("committed this live BranchFS session", out.getvalue())
         self.assertIn("ok.txt", out.getvalue())
         self.assertIn("kept non-workspace paths", out.getvalue())
         self.assertIn("outside.txt", out.getvalue())
-        self.assertIn("turn-resolve commit", out.getvalue())
+        self.assertIn("turn-resolve commit --paths", out.getvalue())
 
     def test_turn_review_kept_cli_exits_two_when_user_decision_needed(self):
         class FakeControlClient(object):
@@ -1161,9 +1220,33 @@ class TestMainCtl(unittest.TestCase):
                 code = main_ctl(["turn-review-kept"], env=env)
 
         self.assertEqual(code, 2)
-        self.assertIn("ask the user", err.getvalue())
+        self.assertIn("1 kept non-workspace path(s) pending", err.getvalue())
+        self.assertIn("ask user: commit, discard, or keep pending", err.getvalue())
+        self.assertIn("turn-resolve <commit|discard|keep> --all-kept",
+                      err.getvalue())
+        self.assertIn("turn-kept-status --details", err.getvalue())
+        self.assertNotIn("outside.txt", err.getvalue())
+
+    def test_turn_review_kept_details_lists_exact_paths(self):
+        class FakeControlClient(object):
+            def __init__(self, sock, token):
+                pass
+
+            def review_kept(self):
+                return {"verdict": "needs-kept-review",
+                        "kept": ["/storage/user/outside.txt"],
+                        "stale": [], "message": "ask user"}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok"}
+        err = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with contextlib.redirect_stderr(err):
+                code = main_ctl(["turn-review-kept", "--details"], env=env)
+
+        self.assertEqual(code, 2)
         self.assertIn("outside.txt", err.getvalue())
-        self.assertIn("turn-resolve commit", err.getvalue())
+        self.assertIn("turn-resolve commit --paths", err.getvalue())
 
     def test_diff_accepts_optional_path(self):
         base_path = os.path.join(self.h.base, self.h.workspace_rel, "cli.txt")

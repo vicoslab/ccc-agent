@@ -312,12 +312,12 @@ class TurnController(object):
             if not kept:
                 return {"verdict": VERDICT_NOOP, "kept": [], "stale": stale,
                         "message": "no kept non-workspace paths"}
-            joined = ",".join(kept)
             msg = (
-                "kept non-workspace paths remain in BranchFS only; ask the "
-                "user whether to commit, discard, or keep them, then run "
-                "ccc-agent turn-resolve commit --paths %s or "
-                "ccc-agent turn-resolve discard --paths %s" % (joined, joined))
+                "%d kept non-workspace path(s) remain pending; ask the user "
+                "whether to commit, discard, or keep them, then run "
+                "ccc-agent turn-resolve <commit|discard|keep> --all-kept. "
+                "Use ccc-agent turn-kept-status --details only when exact "
+                "paths are needed." % len(kept))
             self.session.add_event("turn-kept-review-requested",
                                    "%d path(s)" % len(kept))
             self.store.save(self.session)
