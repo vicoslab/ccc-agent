@@ -282,7 +282,7 @@ def build_agent_state_binds(home):
     """Default shared direct state for agent tools, outside BranchFS."""
     paths = (
         ".codex", ".claude", ".hermes",
-        ".claude.json",
+        ".claude.json", ".local/bin/claude",
         ".local/share/claude", ".local/state/claude",
         ".cache/claude-cli-nodejs",
     )
@@ -354,8 +354,9 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "bwrap_ro_binds": [],
         "_agent_state_comment": "By default Codex/Hermes state plus Claude "
                                 "Code state (~/.claude, ~/.claude.json, "
-                                "~/.local/share/claude, ~/.local/state/claude, "
-                                "and ~/.cache/claude-cli-nodejs) are shared rw "
+                                "~/.local/bin/claude, ~/.local/share/claude, "
+                                "~/.local/state/claude, and "
+                                "~/.cache/claude-cli-nodejs) are shared rw "
                                 "system state, direct-bound over the BranchFS "
                                 "home view and never committed or rolled back "
                                 "by ccc-agent. Codex/Claude/Hermes own their "
@@ -367,8 +368,8 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "ensure_agent_state_dirs": True,
         "agent_state_binds": build_agent_state_binds(home),
         "_cred_comment": "Agent config/state paths such as ~/.codex, "
-                         "~/.claude, ~/.claude.json, Claude .local state, "
-                         "Claude cache, and ~/.hermes are direct shared rw "
+                         "~/.claude, ~/.claude.json, Claude .local binary/"
+                         "state/cache, and ~/.hermes are direct shared rw "
                          "agent_state_binds by default, so real agents can "
                          "create logs, sessions, caches, config, and refreshed "
                          "tokens without BranchFS merge policy. Use cred_mounts "

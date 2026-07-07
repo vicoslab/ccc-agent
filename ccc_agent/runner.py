@@ -272,11 +272,12 @@ AGENT_STATE_DIRS = (
     ".local/share/claude", ".local/state/claude",
     ".cache/claude-cli-nodejs",
 )
-AGENT_STATE_FILES = (".claude.json",)
+AGENT_STATE_FILES = (".claude.json", ".local/bin/claude")
 AGENT_STATE_PATHS = AGENT_STATE_DIRS + AGENT_STATE_FILES
 CLAUDE_RUNTIME_STATE_PATHS = (
-    ".claude", ".claude.json", ".local/share/claude",
-    ".local/state/claude", ".cache/claude-cli-nodejs",
+    ".claude", ".claude.json", ".local/bin/claude",
+    ".local/share/claude", ".local/state/claude",
+    ".cache/claude-cli-nodejs",
 )
 
 
@@ -577,6 +578,21 @@ def _add_session_infra_ignores(session, config):
             add(directory)
 
 
+def _agent_state_file_path(path):
+    """Return True when path names a known single-file agent-state bind."""
+    if not path:
+        return False
+    normalized = os.path.normpath(str(path))
+    for relpath in AGENT_STATE_FILES:
+        rel = os.path.normpath(relpath)
+        if os.path.basename(rel) == rel:
+            if os.path.basename(normalized) == rel:
+                return True
+        elif normalized.endswith(os.sep + rel):
+            return True
+    return False
+
+
 def _ensure_shared_agent_state_dirs(config):
     """Create real shared agent-state dirs before BranchFS branch creation.
 
@@ -595,9 +611,7 @@ def _ensure_shared_agent_state_dirs(config):
             # Existing files such as ~/.claude.json are shared binds too, but
             # ensure_agent_state_dirs must never turn them into directories.
             continue
-        names = (os.path.basename(os.path.normpath(src)),
-                 os.path.basename(os.path.normpath(dest)))
-        if any(name in AGENT_STATE_FILES for name in names):
+        if _agent_state_file_path(src) or _agent_state_file_path(dest):
             continue
         os.makedirs(resolved, mode=0o700, exist_ok=True)
 

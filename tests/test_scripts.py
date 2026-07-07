@@ -25,11 +25,14 @@ PLUGIN_STOP_HOOKS = [
     os.path.join(PLUGINS, "claude-ccc-containment", "hooks", "ccc-stop-hook.sh"),
     os.path.join(PLUGINS, "codex-ccc-containment", "hooks", "ccc-stop-hook.sh"),
 ]
+CLAUDE_CONTEXT_HOOK = os.path.join(
+    PLUGINS, "claude-ccc-containment", "hooks", "ccc-context-hook.sh")
 
 
 class TestShellSyntax(unittest.TestCase):
     def test_all_scripts_parse(self):
-        for script in [SHIM_SH, SOFTSANDBOX_SH] + HOOKS + PLUGIN_STOP_HOOKS:
+        for script in ([SHIM_SH, SOFTSANDBOX_SH, CLAUDE_CONTEXT_HOOK] +
+                       HOOKS + PLUGIN_STOP_HOOKS):
             proc = subprocess.run(["bash", "-n", script],
                                   stderr=subprocess.PIPE, text=True)
             self.assertEqual(proc.returncode, 0,
@@ -48,11 +51,21 @@ class TestPluginAssets(unittest.TestCase):
         self.assertEqual(manifest["name"], "ccc")
         with open(os.path.join(root, "hooks", "hooks.json")) as fh:
             hooks = json.load(fh)
+        self.assertIn("SessionStart", hooks["hooks"])
+        self.assertIn("UserPromptSubmit", hooks["hooks"])
         self.assertIn("Stop", hooks["hooks"])
-        cmd = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
-        self.assertIn("ccc-stop-hook.sh", cmd)
+        start_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        prompt_cmd = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        stop_cmds = [hook["command"]
+                     for hook in hooks["hooks"]["Stop"][0]["hooks"]]
+        self.assertIn("ccc-context-hook.sh", start_cmd)
+        self.assertIn("ccc-context-hook.sh", prompt_cmd)
+        self.assertTrue(any("ccc-stop-hook.sh" in cmd for cmd in stop_cmds))
+        self.assertTrue(any("ccc-context-hook.sh" in cmd for cmd in stop_cmds))
         self.assertTrue(os.path.isfile(
             os.path.join(root, "hooks", "ccc-stop-hook.sh")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(root, "hooks", "ccc-context-hook.sh")))
 
     def test_codex_plugin_layout(self):
         root = os.path.join(PLUGINS, "codex-ccc-containment")
@@ -138,6 +151,96 @@ class TestPluginAssets(unittest.TestCase):
         with open(PLUGIN_STOP_HOOKS[0]) as fh:
             body = fh.read()
         self.assertIn('"$CTL" turn-finalize --default-keep 1>&2 || rc=$?', body)
+
+
+class TestClaudeContextHook(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ctl = os.path.join(self._tmp.name, "ccc-agent")
+        self.plugin_root = os.path.join(PLUGINS, "claude-ccc-containment")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_hook(self, payload, extra_env=None):
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "CCC_AGENT_SESSION": "agent-x",
+            "CCC_AGENT_CLI": self.ctl,
+            "CLAUDE_PLUGIN_ROOT": self.plugin_root,
+        }
+        env.update(extra_env or {})
+        return subprocess.run(
+            ["sh", CLAUDE_CONTEXT_HOOK],
+            input=json.dumps(payload),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True)
+
+    def fake_ctl_review(self, rc, text):
+        with open(self.ctl, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                     "if [ \"$1\" = turn-review-kept ]; then\n"
+                     "  printf '%s\\n' %r 1>&2\n"
+                     "  exit %d\n"
+                     "fi\n"
+                     "exit 0\n" % ("%s", text, rc))
+        os.chmod(self.ctl, 0o755)
+
+    def test_session_start_injects_ccc_commit_skill_context(self):
+        proc = self.run_hook({"hook_event_name": "SessionStart",
+                              "source": "startup"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        out = data["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        self.assertIn("ccc-commit", out["additionalContext"])
+        self.assertIn("turn-kept-status", out["additionalContext"])
+        self.assertIn("contained filesystem", out["additionalContext"])
+
+    def test_user_prompt_submit_injects_turn_reminder(self):
+        proc = self.run_hook({"hook_event_name": "UserPromptSubmit",
+                              "prompt": "do work"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        out = data["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "UserPromptSubmit")
+        self.assertIn("CCC contained-session reminder", out["additionalContext"])
+        self.assertIn("turn-review-kept", out["additionalContext"])
+
+    def test_stop_review_kept_continues_with_user_decision_context(self):
+        calls = os.path.join(self._tmp.name, "calls")
+        prompt = ("ccc-agent: ask the user whether to commit, discard, or keep\n"
+                  "  - /storage/user/outside.txt\n"
+                  "    ccc-agent turn-resolve commit --paths /storage/user/outside.txt")
+        self.fake_ctl_review(2, prompt)
+
+        proc = self.run_hook(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            extra_env={"CCC_AGENT_TEST_CALLS": calls})
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        out = data["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "Stop")
+        self.assertIn("review is pending", out["additionalContext"])
+        self.assertIn("outside.txt", out["additionalContext"])
+        with open(calls) as fh:
+            self.assertIn("turn-review-kept", fh.read())
+
+    def test_stop_context_does_not_loop_when_stop_hook_already_active(self):
+        calls = os.path.join(self._tmp.name, "calls")
+        self.fake_ctl_review(2, "should not be called")
+
+        proc = self.run_hook(
+            {"hook_event_name": "Stop", "stop_hook_active": True},
+            extra_env={"CCC_AGENT_TEST_CALLS": calls})
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(calls))
 
 
 class TestShim(unittest.TestCase):

@@ -1,0 +1,107 @@
+#!/bin/sh
+# CCC Claude Code context hook.
+#
+# Claude plugin skills are model-invoked, not hard-preloaded.  This hook makes
+# the contained-session CCC rule explicit by injecting the bundled ccc-commit
+# skill at SessionStart, reminding before each user prompt, and asking for a
+# kept-file decision when Claude tries to stop with non-workspace changes still
+# held in the branch.
+set -eu
+
+# Direct/uncontained Claude runs should not see CCC behavior.
+if [ -z "${CCC_AGENT_SESSION:-}" ]; then
+    exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    exit 0
+fi
+
+INPUT=$(python3 -c 'import sys; print(sys.stdin.read(), end="")' 2>/dev/null || true)
+EVENT=$(printf '%s' "$INPUT" | python3 -c 'import json,sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    data={}
+print(data.get("hook_event_name", ""))' 2>/dev/null || true)
+STOP_ACTIVE=$(printf '%s' "$INPUT" | python3 -c 'import json,sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    data={}
+print("1" if data.get("stop_hook_active") else "0")' 2>/dev/null || true)
+
+PLUGIN_ROOT=${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}
+if [ -z "$PLUGIN_ROOT" ]; then
+    PLUGIN_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fi
+SKILL_PATH="$PLUGIN_ROOT/skills/ccc-commit/SKILL.md"
+
+emit_context() {
+    hook_event=$1
+    python3 -c 'import json, sys
+hook_event = sys.argv[1]
+text = sys.stdin.read()
+if not text.strip():
+    sys.exit(0)
+print(json.dumps({"hookSpecificOutput": {"hookEventName": hook_event,
+                                          "additionalContext": text}},
+                 separators=(",", ":")))' "$hook_event"
+}
+
+skill_body() {
+    python3 - "$SKILL_PATH" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+try:
+    text = open(path, encoding="utf-8").read()
+except OSError:
+    text = ""
+# Keep the human instructions and drop YAML frontmatter noise.
+if text.startswith("---"):
+    parts = text.split("---", 2)
+    if len(parts) >= 3:
+        text = parts[2]
+print(text.strip())
+PY
+}
+
+case "$EVENT" in
+    SessionStart)
+        BODY=$(skill_body)
+        if [ -n "$BODY" ]; then
+            printf '%s\n\n%s\n' \
+                "CCC contained-session skill ccc-commit is active because CCC_AGENT_SESSION is set. Its rules are part of the current session context." \
+                "$BODY" | emit_context SessionStart
+        fi
+        ;;
+    UserPromptSubmit)
+        printf '%s\n' \
+            "CCC contained-session reminder: workspace/in-policy files are written through by the supervisor, while non-workspace or out-of-policy files stay separate until the user decides. When work is finished and Claude would otherwise idle, check kept files with ccc-agent turn-kept-status or follow Stop-hook feedback from ccc-agent turn-review-kept; if kept files exist, ask the user whether to commit, discard, or keep them." \
+            | emit_context UserPromptSubmit
+        ;;
+    Stop)
+        # The main Stop hook already finalized the turn with --default-keep.
+        # If it kept anything, continue the conversation once so Claude asks the
+        # user for the required commit/discard/keep decision.  When Claude is
+        # already continuing because of a Stop hook, do not create a loop.
+        if [ "$STOP_ACTIVE" = "1" ]; then
+            exit 0
+        fi
+        CTL="${CCC_AGENT_CLI:-ccc-agent}"
+        if ! command -v "$CTL" >/dev/null 2>&1; then
+            exit 0
+        fi
+        rc=0
+        REVIEW=$("$CTL" turn-review-kept 2>&1) || rc=$?
+        if [ "$rc" -eq 2 ] && [ -n "$REVIEW" ]; then
+            printf '%s\n\n%s\n' \
+                "CCC contained-session review is pending. The supervisor kept non-workspace or out-of-policy files separate and they are not committed. Ask the user whether to commit, discard, or keep them, then run the exact ccc-agent turn-resolve command that matches the user's decision." \
+                "$REVIEW" | emit_context Stop
+        fi
+        ;;
+esac
+
+exit 0

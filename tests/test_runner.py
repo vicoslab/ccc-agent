@@ -1019,6 +1019,8 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertIn("/home/domen/.claude", cfg.agent_state_binds)
         self.assertIn("/home/domen/.hermes", cfg.agent_state_binds)
         self.assertIn("/home/domen/.claude.json", cfg.agent_state_binds)
+        self.assertIn("/home/domen/.local/bin/claude",
+                      cfg.agent_state_binds)
         self.assertIn("/home/domen/.local/share/claude",
                       cfg.agent_state_binds)
         self.assertIn("/home/domen/.local/state/claude",
@@ -1031,6 +1033,7 @@ class TestBwrapConfinement(unittest.TestCase):
         binds = [
             os.path.join(home, ".claude"),
             os.path.join(home, ".claude.json"),
+            os.path.join(home, ".local", "bin", "claude"),
             os.path.join(home, ".local", "share", "claude"),
             os.path.join(home, ".local", "state", "claude"),
             os.path.join(home, ".cache", "claude-cli-nodejs"),
@@ -1046,6 +1049,8 @@ class TestBwrapConfinement(unittest.TestCase):
 
         self.assertTrue(os.path.isdir(os.path.join(home, ".claude")))
         self.assertFalse(os.path.exists(os.path.join(home, ".claude.json")))
+        self.assertFalse(os.path.exists(os.path.join(home, ".local", "bin",
+                                                     "claude")))
         self.assertTrue(os.path.isdir(os.path.join(home, ".local", "share",
                                                   "claude")))
         self.assertTrue(os.path.isdir(os.path.join(home, ".local", "state",
@@ -1057,17 +1062,22 @@ class TestBwrapConfinement(unittest.TestCase):
         state = os.path.join(self._tmp.name, "real-agent-state")
         claude_home = os.path.join(state, ".claude")
         claude_json = os.path.join(state, ".claude.json")
+        local_bin_claude = os.path.join(state, ".local", "bin", "claude")
         share = os.path.join(state, ".local", "share", "claude")
         local_state = os.path.join(state, ".local", "state", "claude")
         cache = os.path.join(state, ".cache", "claude-cli-nodejs")
         for path in (claude_home, share, local_state, cache):
             os.makedirs(path)
+        os.makedirs(os.path.dirname(local_bin_claude))
         with open(claude_json, "w") as fh:
             fh.write("{}\n")
+        with open(local_bin_claude, "w") as fh:
+            fh.write("#!/bin/sh\n")
 
         binds = [
             claude_home + ":/home/domen/.claude",
             claude_json + ":/home/domen/.claude.json",
+            local_bin_claude + ":/home/domen/.local/bin/claude",
             share + ":/home/domen/.local/share/claude",
             local_state + ":/home/domen/.local/state/claude",
             cache + ":/home/domen/.cache/claude-cli-nodejs",
@@ -1081,6 +1091,9 @@ class TestBwrapConfinement(unittest.TestCase):
                    for k in range(len(argv) - 2)]
         self.assertIn(("--bind", claude_home, "/home/domen/.claude"), triples)
         self.assertIn(("--bind", claude_json, "/home/domen/.claude.json"), triples)
+        local_bin_dest = os.path.realpath("/home/domen/.local/bin/claude")
+        self.assertIn(("--bind", local_bin_claude,
+                       local_bin_dest), triples)
         self.assertIn(("--bind", share, "/home/domen/.local/share/claude"), triples)
         self.assertIn(("--bind", local_state, "/home/domen/.local/state/claude"), triples)
         cache_dest = os.path.realpath("/home/domen/.cache/claude-cli-nodejs")
@@ -1096,6 +1109,7 @@ class TestBwrapConfinement(unittest.TestCase):
             files = {
                 os.path.join(".claude", "settings.json"): "{}\n",
                 ".claude.json": "{}\n",
+                os.path.join(".local", "bin", "claude"): "#!/bin/sh\n",
                 os.path.join(".local", "share", "claude", "versions",
                              "v1", "node"): "runtime\n",
                 os.path.join(".local", "state", "claude", "locks",
@@ -1119,6 +1133,8 @@ class TestBwrapConfinement(unittest.TestCase):
                       session.policy["ignore_patterns"])
         self.assertIn("/storage/user/.claude.json",
                       session.policy["ignore_patterns"])
+        self.assertIn("/storage/user/.local/bin/claude",
+                      session.policy["ignore_patterns"])
         self.assertIn("/storage/user/.local/share/claude",
                       session.policy["ignore_patterns"])
         self.assertIn("/storage/user/.local/state/claude",
@@ -1129,6 +1145,9 @@ class TestBwrapConfinement(unittest.TestCase):
                                                      ".claude")))
         self.assertFalse(os.path.exists(os.path.join(self.h.base,
                                                      ".claude.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.h.base,
+                                                     ".local", "bin",
+                                                     "claude")))
         self.assertFalse(os.path.exists(os.path.join(self.h.base,
                                                      ".local", "share",
                                                      "claude")))
