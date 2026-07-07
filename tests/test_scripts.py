@@ -77,6 +77,10 @@ class TestPluginAssets(unittest.TestCase):
         with open(os.path.join(root, "hooks", "hooks.json")) as fh:
             hooks = json.load(fh)
         self.assertIn("Stop", hooks["hooks"])
+        stop_groups = hooks["hooks"]["Stop"]
+        self.assertEqual(len(stop_groups), 1)
+        stop_cmd = stop_groups[0]["hooks"][0]["command"]
+        self.assertEqual(stop_cmd, "${PLUGIN_ROOT}/hooks/ccc-stop-hook.sh")
         self.assertTrue(os.path.isfile(
             os.path.join(root, "hooks", "ccc-stop-hook.sh")))
 
@@ -136,21 +140,78 @@ class TestPluginAssets(unittest.TestCase):
         self.assertIn("def register", src)
         self.assertIn("turn-finalize", src)
 
-    def test_bundled_stop_hooks_match(self):
-        # the claude/codex plugin stop hooks are the same adapter; guard drift
-        bodies = set()
-        for path in PLUGIN_STOP_HOOKS:
-            with open(path) as fh:
-                bodies.add(fh.read())
-        self.assertEqual(len(bodies), 1, "plugin stop hooks have drifted")
+    def test_bundled_stop_hooks_are_agent_specific(self):
+        with open(PLUGIN_STOP_HOOKS[0]) as fh:
+            claude_body = fh.read()
+        with open(PLUGIN_STOP_HOOKS[1]) as fh:
+            codex_body = fh.read()
+        self.assertIn("turn-finalize --default-keep", claude_body)
+        self.assertNotIn("block_once_for_kept_review", claude_body)
+        self.assertIn("block_once_for_kept_review", codex_body)
+        self.assertIn("turn-review-kept", codex_body)
 
     def test_bundled_stop_hook_keeps_codex_stdout_json_clean(self):
         # Codex treats command-hook stdout as JSON. ccc-agent's human-readable
-        # turn-finalize text must therefore go to stderr, while exit status still
-        # carries block/allow semantics.
-        with open(PLUGIN_STOP_HOOKS[0]) as fh:
+        # text must therefore go to stderr, while exit status still carries
+        # block/allow semantics.
+        with open(PLUGIN_STOP_HOOKS[1]) as fh:
             body = fh.read()
         self.assertIn('"$CTL" turn-finalize --default-keep 1>&2 || rc=$?', body)
+        self.assertIn('REVIEW=$("$CTL" turn-review-kept 2>&1) || review_rc=$?',
+                      body)
+        self.assertIn("printf '%s\\n' \"$REVIEW\" >&2", body)
+
+    def test_codex_stop_hook_blocks_once_for_kept_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "if [ \"$1\" = turn-finalize ]; then\n"
+                         "  echo 'kept in branch only' 1>&2\n"
+                         "  exit 0\n"
+                         "fi\n"
+                         "if [ \"$1\" = turn-review-kept ]; then\n"
+                         "  echo 'ccc-agent: ask the user what to do' 1>&2\n"
+                         "  echo '  - /storage/user/outside.txt' 1>&2\n"
+                         "  exit 2\n"
+                         "fi\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "CCC_AGENT_SESSION": "agent-x",
+                "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                "CCC_AGENT_CLI": ctl,
+                "CCC_AGENT_TEST_CALLS": calls,
+                "TMPDIR": tmp,
+            }
+            proc = subprocess.run(
+                ["sh", PLUGIN_STOP_HOOKS[1]], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            self.assertIn("kept in branch only", proc.stderr)
+            self.assertIn("ask the user", proc.stderr)
+            self.assertIn("outside.txt", proc.stderr)
+            proc2 = subprocess.run(
+                ["sh", PLUGIN_STOP_HOOKS[1]], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(proc2.returncode, 0, proc2.stderr)
+            self.assertEqual(proc2.stdout, "")
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn("turn-finalize --default-keep", call_log)
+            self.assertIn("turn-review-kept", call_log)
+
+    def test_codex_stop_hook_degrades_safe_outside_contained_session(self):
+        proc = subprocess.run(
+            ["sh", PLUGIN_STOP_HOOKS[1]],
+            env={"PATH": "/usr/bin:/bin"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
 
 class TestClaudeContextHook(unittest.TestCase):

@@ -98,7 +98,9 @@ class TestSetupConfig(unittest.TestCase):
             setup_mod.plugins_dir(), "codex-ccc-containment", "hooks", "hooks.json")
         with open(hooks_json) as fh:
             hooks = json.load(fh)
-        command = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+        stop_groups = hooks["hooks"]["Stop"]
+        self.assertEqual(len(stop_groups), 1)
+        command = stop_groups[0]["hooks"][0]["command"]
         self.assertEqual(command, "${PLUGIN_ROOT}/hooks/ccc-stop-hook.sh")
 
     def test_system_config_keeps_agent_state_writable_by_default(self):
@@ -217,6 +219,10 @@ class TestSetupConfig(unittest.TestCase):
             self.assertIn("safe to leave enabled", codex_toml)
             self.assertIn('plugins."ccc@ccc-agent".enabled = true',
                           codex_toml)
+            self.assertIn("Trust only the bundled CCC hooks", codex_toml)
+            for key, trusted_hash in setup_mod.CODEX_HOOK_TRUSTED_HASHES:
+                self.assertIn('hooks.state."%s".trusted_hash = "%s"'
+                              % (key, trusted_hash), codex_toml)
             self.assertFalse(os.path.exists(os.path.join(home, ".claude", "settings.json")))
 
             with open(config_path) as fh:
@@ -234,7 +240,16 @@ class TestSetupConfig(unittest.TestCase):
             os.makedirs(codex_dir)
             codex_config = os.path.join(codex_dir, "config.toml")
             with open(codex_config, "w") as fh:
-                fh.write('model = "gpt-5.5"\n\n[projects."/"]\ntrust_level = "trusted"\n')
+                fh.write(
+                    'model = "gpt-5.5"\n'
+                    '\n[hooks.state]\n'
+                    '\n[hooks.state."ccc@ccc-agent:hooks/hooks.json:stop:0:0"]\n'
+                    'trusted_hash = "sha256:old"\n'
+                    '\n[hooks.state."ccc-agent@ccc-agent:hooks/hooks.json:stop:0:0"]\n'
+                    'trusted_hash = "sha256:older"\n'
+                    '\n[hooks.state."other@plugin:hooks/hooks.json:stop:0:0"]\n'
+                    'trusted_hash = "sha256:keep"\n'
+                    '\n[projects."/"]\ntrust_level = "trusted"\n')
             config_path = os.path.join(tmp, "config.json")
             with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False):
                 rc = setup_mod.main([
@@ -247,6 +262,12 @@ class TestSetupConfig(unittest.TestCase):
             self.assertIn('[projects."/"]', codex_toml)
             self.assertEqual(codex_toml.count("BEGIN ccc-agent Codex plugin"), 1)
             self.assertTrue(codex_toml.startswith("# BEGIN ccc-agent Codex plugin"))
+            self.assertNotIn('trusted_hash = "sha256:old"', codex_toml)
+            self.assertNotIn('trusted_hash = "sha256:older"', codex_toml)
+            self.assertIn('trusted_hash = "sha256:keep"', codex_toml)
+            for key, _trusted_hash in setup_mod.CODEX_HOOK_TRUSTED_HASHES:
+                self.assertIn('hooks.state."%s".trusted_hash' % key,
+                              codex_toml)
 
     def test_no_agent_plugins_flag_disables_injection(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -138,6 +138,15 @@ CODEX_PLUGIN_MARKETPLACE = "ccc-agent"
 CODEX_PLUGIN_VERSION = "0.2.0"
 CODEX_PLUGIN_ID = "%s@%s" % (CODEX_PLUGIN_NAME, CODEX_PLUGIN_MARKETPLACE)
 
+# Codex hook trust hashes are computed by Codex from the hook definition in
+# hooks/hooks.json (not from the raw script bytes).  Keep these in sync with the
+# bundled codex-ccc-containment hooks so contained runs do not stop for an
+# interactive hook-trust prompt.
+CODEX_HOOK_TRUSTED_HASHES = (
+    ("ccc@ccc-agent:hooks/hooks.json:stop:0:0",
+     "sha256:72d22a4a83b82ca16b8a5bcc60f519bc6b75773cc17f103e9acb18a028dc6998"),
+)
+
 CODEX_CONFIG_BEGIN = "# BEGIN ccc-agent Codex plugin"
 CODEX_CONFIG_END = "# END ccc-agent Codex plugin"
 
@@ -150,13 +159,13 @@ def codex_plugin_cache_path(home):
 
 
 def codex_plugin_config_block():
-    """Managed TOML snippet enabling the ccc-agent Codex plugin.
+    """Managed TOML snippet enabling and trusting the ccc-agent Codex plugin.
 
-    Use a top-level dotted key rather than a [plugins."..."] table so the block
-    can safely be prepended without changing the table context of the user's
+    Use top-level dotted keys rather than opening TOML tables so the block can
+    safely be prepended without changing the table context of the user's
     existing config.
     """
-    return "\n".join((
+    lines = [
         CODEX_CONFIG_BEGIN,
         "# Codex 0.136+ loads hooks only from enabled plugins. ccc-agent keeps",
         "# this plugin enabled so contained `ccc-agent run -- codex` sessions",
@@ -165,9 +174,13 @@ def codex_plugin_config_block():
         "# is absent Codex skips it, and if present the hook exits unless",
         "# CCC_AGENT_SESSION is set.",
         'plugins."%s".enabled = true' % CODEX_PLUGIN_ID,
-        CODEX_CONFIG_END,
-        "",
-    ))
+        "# Trust only the bundled CCC hooks; do not bypass trust globally.",
+    ]
+    for key, trusted_hash in CODEX_HOOK_TRUSTED_HASHES:
+        lines.append('hooks.state."%s".trusted_hash = "%s"'
+                     % (key, trusted_hash))
+    lines.extend((CODEX_CONFIG_END, ""))
+    return "\n".join(lines)
 
 
 def _strip_managed_codex_plugin_block(text):
@@ -188,6 +201,53 @@ def _strip_managed_codex_plugin_block(text):
         text = text[:line_start] + text[line_end:]
 
 
+def _is_managed_codex_hook_key(key):
+    return (key.startswith("ccc@ccc-agent:hooks/hooks.json:") or
+            key.startswith("ccc-agent@ccc-agent:hooks/hooks.json:"))
+
+
+def _strip_managed_codex_hook_state(text):
+    """Remove stale CCC hook trust entries written by Codex or old setup runs."""
+    lines = text.splitlines(True)
+    out = []
+    skip_table = False
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[hooks.state]":
+            # Codex writes this as a parent for nested hook-state tables.  Our
+            # managed block uses dotted keys at top level; keeping an otherwise
+            # empty parent table later would redeclare hooks.state and make the
+            # TOML invalid.  Preserve it only if it owns direct key/value lines.
+            has_direct_entries = False
+            j = idx + 1
+            while j < len(lines):
+                candidate = lines[j].strip()
+                if candidate.startswith("[") and candidate.endswith("]"):
+                    break
+                if candidate and not candidate.startswith("#"):
+                    has_direct_entries = True
+                    break
+                j += 1
+            if not has_direct_entries:
+                continue
+        if stripped.startswith('hooks.state."'):
+            key = stripped[len('hooks.state."'):].split('"', 1)[0]
+            if _is_managed_codex_hook_key(key):
+                continue
+        if stripped.startswith('[hooks.state."') and stripped.endswith('"]'):
+            key = stripped[len('[hooks.state."'):-2]
+            if _is_managed_codex_hook_key(key):
+                skip_table = True
+                continue
+        if skip_table:
+            if stripped.startswith("[") and stripped.endswith("]"):
+                skip_table = False
+            else:
+                continue
+        out.append(line)
+    return "".join(out)
+
+
 def ensure_codex_plugin_enabled(home, user=None):
     """Persist Codex config needed for ccc-agent's Codex plugin hooks.
 
@@ -205,7 +265,8 @@ def ensure_codex_plugin_enabled(home, user=None):
             existing = fh.read()
     except OSError:
         existing = ""
-    existing = _strip_managed_codex_plugin_block(existing).lstrip("\n")
+    existing = _strip_managed_codex_plugin_block(existing)
+    existing = _strip_managed_codex_hook_state(existing).lstrip("\n")
     content = codex_plugin_config_block() + existing
     if existing and not existing.endswith("\n"):
         content += "\n"
@@ -240,11 +301,12 @@ def build_agent_plugins(home, src_dir=None):
 
       claude  -- native ``--plugin-dir`` session-only plugin load (verified).
       codex   -- plugin mounted at Codex's installed-plugin cache path, paired
-                 with a persistent enabled-plugin entry in ~/.codex/config.toml;
-                 the blocking Stop hook comes from hooks/hooks.json.  ``argv``
-                 disables Codex's nested Linux sandbox because ccc-agent is
-                 already the containment boundary; per-turn hooks are
-                 best-effort and fall back to session-end review.
+                 with a persistent enabled/trusted plugin entry in
+                 ~/.codex/config.toml. The Stop hook commits the turn with
+                 default-keep and blocks final idle/stop once with a kept-file
+                 prompt when user review is required. ``argv`` disables Codex's
+                 nested Linux sandbox because ccc-agent is already the
+                 containment boundary.
       hermes  -- native bundled-plugin dir via HERMES_BUNDLED_PLUGINS, with
                  HERMES_ACCEPT_HOOKS=1 to skip the interactive consent prompt.
     """
