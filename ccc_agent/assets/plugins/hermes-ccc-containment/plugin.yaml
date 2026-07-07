@@ -1,13 +1,16 @@
 name: ccc-agent
-version: 0.1.0
+version: 0.2.0
 description: >-
-  CCC contained-session lifecycle hooks for Hermes. Injected read-only into the
-  bwrap sandbox by ccc-agent run (HERMES_BUNDLED_PLUGINS) for contained Hermes
-  sessions only. Signals turn/session boundaries to the trusted supervisor over
-  the control socket; it never holds commit authority. Best-effort: if the hook
-  is inactive, process-exit review remains authoritative.
+  CCC contained-session lifecycle and context hooks for Hermes. Injected
+  read-only into the bwrap sandbox by ccc-agent run (HERMES_BUNDLED_PLUGINS)
+  for contained Hermes sessions only. Injects mandatory CCC containment rules
+  with pre_llm_call, signals turn/session boundaries to the trusted supervisor,
+  and appends/queues kept-file review prompts before Hermes idles. Best-effort:
+  if the hooks are inactive, process-exit review remains authoritative.
 author: CCC agent
 kind: standalone
 hooks:
+  - pre_llm_call
+  - transform_llm_output
   - post_llm_call
   - on_session_end

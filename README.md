@@ -263,7 +263,8 @@ live Claude managed settings. Instead, for a contained run only, `ccc-agent run`
 loads CCC hooks through each agent's **native plugin mechanism**: it bind-mounts
 the matching read-only plugin (`ccc_agent/assets/plugins/…`) into the sandbox,
 adds Claude's `--plugin-dir`, drops the Codex plugin at the in-sandbox Codex
-plugin path, and sets Hermes' `HERMES_BUNDLED_PLUGINS`. Direct, uncontained
+plugin path, and sets Hermes' `HERMES_BUNDLED_PLUGINS` so the Hermes plugin can
+inject CCC turn context and final-response review prompts. Direct, uncontained
 `codex`/`claude`/`hermes` runs load none of this. By default `ccc-agent run`
 infers the plugin from the command executable basename, including absolute paths.
 For example, these load the matching plugin:

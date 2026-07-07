@@ -1,6 +1,7 @@
 """Tests for the shell scaffolding: launch shim and hook adapters. All run
 unprivileged (syntax and behavior checks only)."""
 
+import importlib.util
 import json
 import os
 import stat
@@ -27,6 +28,8 @@ PLUGIN_STOP_HOOKS = [
 ]
 CLAUDE_CONTEXT_HOOK = os.path.join(
     PLUGINS, "claude-ccc-containment", "hooks", "ccc-context-hook.sh")
+HERMES_PLUGIN_INIT = os.path.join(
+    PLUGINS, "hermes-ccc-containment", "__init__.py")
 
 
 class TestShellSyntax(unittest.TestCase):
@@ -84,9 +87,10 @@ class TestPluginAssets(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(root, "hooks", "ccc-stop-hook.sh")))
 
-    def test_ccc_commit_skill_is_bundled_for_claude_and_codex(self):
+    def test_ccc_commit_skill_is_bundled_for_claude_codex_and_hermes(self):
         bodies = []
-        for plugin in ("claude-ccc-containment", "codex-ccc-containment"):
+        for plugin in ("claude-ccc-containment", "codex-ccc-containment",
+                       "hermes-ccc-containment"):
             for old_name in ("branchfs-commit", "contained-commit"):
                 old_path = os.path.join(PLUGINS, plugin, "skills", old_name)
                 self.assertFalse(os.path.exists(old_path), old_path)
@@ -118,7 +122,8 @@ class TestPluginAssets(unittest.TestCase):
             "op": "ccc-agent turn-",
         }
         bodies = []
-        for plugin in ("claude-ccc-containment", "codex-ccc-containment"):
+        for plugin in ("claude-ccc-containment", "codex-ccc-containment",
+                       "hermes-ccc-containment"):
             for name, command in expected.items():
                 path = os.path.join(PLUGINS, plugin, "skills", name,
                                     "SKILL.md")
@@ -135,10 +140,22 @@ class TestPluginAssets(unittest.TestCase):
     def test_hermes_plugin_layout(self):
         root = os.path.join(PLUGINS, "hermes-ccc-containment")
         self.assertTrue(os.path.isfile(os.path.join(root, "plugin.yaml")))
+        with open(os.path.join(root, "plugin.yaml")) as fh:
+            manifest = fh.read()
+        self.assertIn("pre_llm_call", manifest)
+        self.assertIn("transform_llm_output", manifest)
+        self.assertIn("post_llm_call", manifest)
+        self.assertIn("on_session_end", manifest)
         with open(os.path.join(root, "__init__.py")) as fh:
             src = fh.read()
         self.assertIn("def register", src)
+        self.assertIn("pre_llm_call", src)
+        self.assertIn("transform_llm_output", src)
         self.assertIn("turn-finalize", src)
+        self.assertIn("turn-review-kept", src)
+        self.assertIn("ccc-commit", src)
+        self.assertTrue(os.path.isfile(
+            os.path.join(root, "skills", "ccc-commit", "SKILL.md")))
 
     def test_bundled_stop_hooks_are_agent_specific(self):
         with open(PLUGIN_STOP_HOOKS[0]) as fh:
@@ -302,6 +319,131 @@ class TestClaudeContextHook(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
         self.assertFalse(os.path.exists(calls))
+
+
+class TestHermesContainmentPlugin(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ctl = os.path.join(self._tmp.name, "ccc-agent")
+        self.calls = os.path.join(self._tmp.name, "calls")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def load_plugin(self):
+        spec = importlib.util.spec_from_file_location(
+            "ccc_agent_test_hermes_plugin", HERMES_PLUGIN_INIT)
+        if spec is None or spec.loader is None:
+            raise AssertionError("could not load Hermes plugin")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def set_contained_env(self):
+        old = dict(os.environ)
+        os.environ.update({
+            "CCC_AGENT_SESSION": "agent-x",
+            "CCC_AGENT_CONTROL_SOCK": os.path.join(self._tmp.name, "sock"),
+            "CCC_AGENT_CLI": self.ctl,
+        })
+        return old
+
+    def restore_env(self, old):
+        os.environ.clear()
+        os.environ.update(old)
+
+    def fake_ctl_review(self, rc=2, text=None):
+        text = text or (
+            "ccc-agent: ask the user whether to commit, discard, or keep\n"
+            "  - /storage/user/outside.txt\n"
+            "    ccc-agent turn-resolve discard --paths /storage/user/outside.txt")
+        with open(self.ctl, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "echo \"$*\" >> %r\n"
+                     "if [ \"$1\" = turn-finalize ]; then\n"
+                     "  exit 0\n"
+                     "fi\n"
+                     "if [ \"$1\" = turn-review-kept ]; then\n"
+                     "  printf '%%s\\n' %r 1>&2\n"
+                     "  exit %d\n"
+                     "fi\n"
+                     "exit 0\n" % (self.calls, text, rc))
+        os.chmod(self.ctl, 0o755)
+
+    def test_pre_llm_call_injects_first_turn_skill_context(self):
+        mod = self.load_plugin()
+        old = self.set_contained_env()
+        try:
+            self.fake_ctl_review(rc=0, text="")
+            result = mod._pre_llm_context(is_first_turn=True)
+        finally:
+            self.restore_env(old)
+        self.assertIsInstance(result, dict)
+        context = result["context"]
+        self.assertIn("ccc-commit", context)
+        self.assertIn("turn-kept-status", context)
+        self.assertIn("contained filesystem", context)
+        self.assertIn("Hermes would otherwise idle", context)
+
+    def test_pre_llm_call_is_inert_outside_contained_session(self):
+        mod = self.load_plugin()
+        old = dict(os.environ)
+        try:
+            os.environ.pop("CCC_AGENT_SESSION", None)
+            os.environ.pop("CCC_AGENT_CONTROL_SOCK", None)
+            self.assertIsNone(mod._pre_llm_context(is_first_turn=True))
+        finally:
+            self.restore_env(old)
+
+    def test_transform_llm_output_appends_kept_review_prompt(self):
+        mod = self.load_plugin()
+        old = self.set_contained_env()
+        try:
+            self.fake_ctl_review()
+            result = mod._append_review_to_response("Done.", turn_id="turn-1")
+        finally:
+            self.restore_env(old)
+        self.assertIn("Done.", result)
+        self.assertIn("CCC contained-session review is pending", result)
+        self.assertIn("outside.txt", result)
+        self.assertIn("turn-resolve discard", result)
+        with open(self.calls) as fh:
+            call_log = fh.read()
+        self.assertIn("turn-finalize --default-keep", call_log)
+        self.assertIn("turn-review-kept", call_log)
+
+    def test_transform_llm_output_does_not_repeat_same_review(self):
+        mod = self.load_plugin()
+        old = self.set_contained_env()
+        try:
+            self.fake_ctl_review()
+            first = mod._append_review_to_response("Done.", turn_id="turn-1")
+            second = mod._append_review_to_response("Still done.", turn_id="turn-2")
+        finally:
+            self.restore_env(old)
+        self.assertIn("CCC contained-session review is pending", first)
+        self.assertIsNone(second)
+
+    def test_registers_hermes_context_and_idle_hooks(self):
+        class FakeCtx(object):
+            def __init__(self):
+                self.hooks = []
+                self.injected = []
+
+            def register_hook(self, name, callback):
+                self.hooks.append((name, callback))
+
+            def inject_message(self, content, role="user"):
+                self.injected.append((role, content))
+                return True
+
+        mod = self.load_plugin()
+        ctx = FakeCtx()
+        mod.register(ctx)
+        self.assertEqual(
+            [name for name, _cb in ctx.hooks],
+            ["pre_llm_call", "transform_llm_output", "post_llm_call",
+             "on_session_end"])
 
 
 class TestShim(unittest.TestCase):

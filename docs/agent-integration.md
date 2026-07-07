@@ -104,10 +104,12 @@ still-kept branch deltas remain available through normal `pending-review` sessio
 review.
 
 **Hermes** loads a CCC bundled plugin (`HERMES_BUNDLED_PLUGINS`) whose
-`post_llm_call` / `on_session_end` hooks report turn boundaries with
-`--default-keep`. Hermes hooks cannot block or feed instructions back, so kept
-non-workspace paths are resolved through the same final/idle
-`turn-kept-status` → `turn-review-kept` flow or normal session-end review.
+`pre_llm_call` hook injects the mandatory `ccc-commit` rules into the current
+turn (full skill text on the first turn, concise reminders after that). Its
+`transform_llm_output`, `post_llm_call`, and `on_session_end` hooks report turn
+boundaries with `--default-keep`; when kept non-workspace paths remain, the
+final response is extended (or a follow-up message is queued) with the exact
+`turn-resolve commit|discard|keep` choices for the user.
 
 Hooks are **best-effort turn-boundary signals only**. If a plugin fails to load,
 a hook crashes, or an agent version changes the contract, the agent loses
@@ -158,9 +160,11 @@ skills) is mounted read-only at Codex's in-sandbox plugin cache path
 nested Linux/bwrap sandbox inside the existing ccc-agent BranchFS/bwrap
 containment boundary.
 
-**Hermes** — the bundled plugin (`plugin.yaml` + a `register()` module) is
-mounted under a read-only bundle root and activated with
+**Hermes** — the bundled plugin (`plugin.yaml` + a `register()` module + bundled
+CCC skill docs) is mounted under a read-only bundle root and activated with
 `HERMES_BUNDLED_PLUGINS=/ccc-agent/plugins/hermes` and `HERMES_ACCEPT_HOOKS=1`.
+The plugin uses Hermes `pre_llm_call` context injection to preload CCC rules and
+`transform_llm_output` / idle hooks to surface kept-file review prompts.
 
 Disable all injection with `ccc-agent setup --no-agent-plugins` (alias
 `--no-hooks`), which sets `agent_hook_mode: "disabled"`.
