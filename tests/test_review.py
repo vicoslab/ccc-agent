@@ -220,6 +220,61 @@ class TestReview(unittest.TestCase):
         self.assertEqual(controller.review_paths, [change.path])
         selector.assert_called_once_with([change], stream=stream)
 
+    def test_pending_review_prompt_lists_actions_and_accepts_commit_alias_c(self):
+        class FakeController(object):
+            def __init__(self):
+                self.commit_args = None
+
+            def commit(self, session_id, include_ignored=False):
+                self.commit_args = (session_id, include_ignored)
+                return SimpleNamespace(session_id=session_id)
+
+        controller = FakeController()
+        session = SimpleNamespace(session_id="agent-test", policy={})
+        stream = io.StringIO()
+        with mock.patch.object(cli_module, "_ensure_foreground_for_prompt",
+                               return_value=True):
+            with mock.patch.object(cli_module, "_read_review_choice",
+                                   return_value="c"):
+                updated = cli_module._prompt_pending_review_decision(
+                    controller, session, stream=stream, include_ignored=True)
+
+        self.assertEqual(updated.session_id, "agent-test")
+        self.assertEqual(controller.commit_args, ("agent-test", True))
+        output = stream.getvalue()
+        self.assertIn("ccc-agent: Accept changes?\n", output)
+        self.assertIn("  [c] commit all changes", output)
+        self.assertIn("  [s] selective accept", output)
+        self.assertIn("  [d] discard all changes", output)
+        self.assertIn("  [l] keep for later review", output)
+        self.assertIn("choice [l]: ", output)
+        self.assertIn("ccc-agent: committed session agent-test", output)
+
+    def test_pending_review_prompt_accepts_discard_aliases(self):
+        class FakeController(object):
+            def __init__(self):
+                self.aborted = None
+
+            def abort(self, session_id):
+                self.aborted = session_id
+                return SimpleNamespace(session_id=session_id)
+
+        for choice in ("d", "discard", "n", "no"):
+            controller = FakeController()
+            session = SimpleNamespace(session_id="agent-test", policy={})
+            stream = io.StringIO()
+            with self.subTest(choice=choice):
+                with mock.patch.object(cli_module, "_ensure_foreground_for_prompt",
+                                       return_value=True):
+                    with mock.patch.object(cli_module, "_read_review_choice",
+                                           return_value=choice):
+                        updated = cli_module._prompt_pending_review_decision(
+                            controller, session, stream=stream)
+            self.assertEqual(updated.session_id, "agent-test")
+            self.assertEqual(controller.aborted, "agent-test")
+            self.assertIn("ccc-agent: discarded session agent-test",
+                          stream.getvalue())
+
     def test_curses_selector_uses_terminal_default_colors(self):
         calls = []
 
