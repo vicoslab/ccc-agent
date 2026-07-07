@@ -5,6 +5,7 @@ import io
 import json
 import os
 import signal
+import subprocess
 import termios
 import tempfile
 import unittest
@@ -1570,10 +1571,25 @@ class TestUnifiedMain(unittest.TestCase):
         self.assertEqual(main(["list", "--config", self.h.config_path],
                               env={}), 0)
 
-    def test_version_flag_reports_release_without_config(self):
+    def test_version_flag_reports_release_and_git_commit_without_config(self):
+        expected_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            text=True).strip()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = main(["--version"], env={})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out.getvalue(),
+            "ccc-agent v0.4 (git %s)\n" % expected_commit)
+
+    def test_version_flag_omits_git_commit_when_unknown(self):
+        out = io.StringIO()
+        with mock.patch("ccc_agent.version.git_commit", return_value=None):
+            with contextlib.redirect_stdout(out):
+                code = main(["--version"], env={})
 
         self.assertEqual(code, 0)
         self.assertEqual(out.getvalue(), "ccc-agent v0.4\n")

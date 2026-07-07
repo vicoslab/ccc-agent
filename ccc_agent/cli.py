@@ -38,7 +38,7 @@ import time
 import tty
 from importlib import resources
 
-from . import __version__
+from .version import version_string
 from .branchfs import BranchfsCli, FakeBranchFS
 from .commit_failures import has_permission_failures, permission_failures
 from .control import (ControlClient, VERDICT_COMMITTED, VERDICT_DISCARDED,
@@ -1958,7 +1958,7 @@ def _print_main_help(stream=None):
         "usage: ccc-agent OP [options]\n\n"
         "Unified CCC agent containment CLI.\n\n"
         "Global options:\n"
-        "  --version        print the ccc-agent release version\n\n"
+        "  --version        print the ccc-agent release version and Git commit when known\n\n"
         "Primary user ops:\n"
         "  run              start a contained BranchFS session; when no command "
         "is given, open the invoking shell (legacy alias: launch)\n"
@@ -2013,7 +2013,7 @@ def main(argv=None, env=None):
     """Dispatch the unified ``ccc-agent OP`` command surface."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "--version":
-        sys.stdout.write("ccc-agent v%s\n" % __version__)
+        sys.stdout.write("ccc-agent %s\n" % version_string())
         return 0
     if not argv or argv[0] in ("-h", "--help", "help"):
         _print_main_help()
