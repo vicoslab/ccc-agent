@@ -90,6 +90,42 @@ class TestCondaShimActivation(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), os.path.join(self.conda_bin, "codex"))
 
+    def test_shell_path_hook_moves_dedicated_shim_dir_to_front(self):
+        config = os.path.join(self.tmp, "config.json")
+        hook = os.path.join(self.tmp, "ccc-agent-shim-path.sh")
+        with mock.patch.dict(os.environ, {"HOME": self.home}, clear=False):
+            rc = setup_mod.main([
+                "--user",
+                "--config", config,
+                "--state-dir", os.path.join(self.tmp, "state"),
+                "--no-hooks",
+                "--enable-shims",
+                "--link-dir", self.shimdir,
+                "--shell-path-hook", hook,
+            ])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(hook))
+
+        original_path = "%s:%s:%s:/usr/bin:/bin" % (
+            self.local_bin_for_test(), self.shimdir, self.conda_bin)
+        proc = subprocess.run(
+            ["sh", "-c", ". \"$HOOK\" && printf '%s\\n%s\\n' \"$PATH\" \"$CCC_AGENT_SHIM_DIR\""],
+            env={"PATH": original_path, "HOOK": hook},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(lines[0], "%s:%s:%s:/usr/bin:/bin" % (
+            self.shimdir, self.local_bin_for_test(), self.conda_bin))
+        self.assertEqual(lines[1], self.shimdir)
+
+    def local_bin_for_test(self):
+        local_bin = os.path.join(self.home, ".local", "bin")
+        os.makedirs(local_bin, exist_ok=True)
+        return local_bin
+
 
 class TestSetupConfig(unittest.TestCase):
     def test_bundled_codex_hook_uses_plugin_root_command_path(self):
