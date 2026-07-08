@@ -1,351 +1,168 @@
-# ccc-agent — BranchFS containment for agents in CCC containers
+# ccc-agent
 
-Run Codex / Claude Code / Hermes / OpenCode (and any command) against CCC
-storage **without giving them direct write access to real data**. The agent
-works in a node-local BranchFS branch view; a trusted supervisor freezes the
-branch when the agent finishes, classifies the changes against a path policy,
-and only then commits to the real NFS-backed underlay — or parks the session
-for human review, or discards it.
+`ccc-agent` runs AI agents and other commands in a reviewable filesystem session.
+The command sees normal project paths, but its writes land in a BranchFS branch
+first. When the command or turn finishes, a trusted supervisor freezes the
+branch, checks what changed, and either commits safe changes to the real files,
+keeps the session for review, or discards it.
+
+Use it when you want autonomous tools such as Codex, Claude Code, Hermes, or
+OpenCode to edit files without giving the agent direct final-write authority over
+important storage.
 
 ```text
+ccc-agent run -- codex exec "fix the parser"
+  -> create branch session
+  -> run the agent inside the protected view
+  -> freeze and classify changes
+  -> commit | pending review | discard
+```
+## How it works
+
+`ccc-agent` is a small Python supervisor around three ideas:
+
+1. **Branch first**: protected roots are mounted as [BranchFS](https://github.com/vicoslab/branchfs) branch views.
+2. **Run contained**: the command runs in a rootless bubblewrap user/mount/PID
+   namespace where writable project paths resolve to the branch view, not the
+   real underlay.
+3. **Commit only after review**: the trusted supervisor freezes the branch,
+   reads real BranchFS status, applies policy, and selectively applies approved
+   changes.
+
+The agent can create branch deltas. It cannot directly commit them through the
+agent-visible filesystem view but must call `ccc-agent turn-*`.
+
+
+## Quick start
+
+Run agent in current directory:
+
+```bash
+ccc-agent run codex
+ccc-agent run claude
+```
+
+Run a one-shot agent task in the current directory:
+
+```bash
 ccc-agent run -- codex exec "implement feature X"
-   create session -> branch bundle -> (bwrap) agent run ->
-   freeze -> status -> policy -> auto-commit | pending-review | abort
+ccc-agent run -- claude -p "review this repository"
+ccc-agent run -- hermes "summarize and clean up the TODOs"
 ```
 
-Everything in this directory is **non-invasive scaffolding**: nothing here is
-wired into CCC image startup by default. Deploy by copying to `/opt/ccc-agent`
-(see *Deployment*).
-
-## Quick start (explicit wrapper)
+Run in a specific workspace:
 
 ```bash
-# config: protected roots, state dir, branchfs binary (see config/config.example.json)
-export CCC_AGENT_CONFIG=/etc/ccc-agent/config.json
-
-# run any command contained; workspace defaults to $PWD
-ccc-agent run --workspace /home/$USER/Projects/foo \
-              --policy workspace-auto \
-              --agent codex \
-              -- codex exec "implement feature X"
-
-# omit the command to open the invoking shell (bash/sh/zsh/...) inside containment
-ccc-agent run --workspace /home/$USER/Projects/foo
+ccc-agent run \
+  --workspace /home/$USER/Projects/my-project \
+  --policy workspace-auto \
+  -- codex exec "fix the failing tests"
 ```
 
-Outcome per policy:
-
-- all changes inside the workspace, no deny rule hit → **auto-committed**;
-- anything outside scope / deny match (`.ssh`, `.env`, `.git/hooks`, ...) →
-  **pending-review** (branch stays frozen, nothing touched the underlay);
-- `--policy throwaway` → branch aborted at completion;
-- no changes → session closes as a no-op.
-
-### Per-turn review (interactive, in the agent UI)
-
-At each Stop boundary the agent's hook calls `ccc-agent turn-finalize` over
-the control socket. In-scope changes auto-commit and the agent continues;
-out-of-scope changes are reported to the user, who responds (relayed by the
-agent) with one of:
+Open an interactive shell inside a protected session:
 
 ```bash
-ccc-agent turn-approve <token>            # accept all flagged changes
-ccc-agent turn-approve <token> keep       # keep deltas, don't commit (continue)
-ccc-agent turn-approve <token> revert     # reject; the agent undoes them
-ccc-agent turn-approve <token> --paths a,b # commit only a,b (file-by-file)
+# current dir as main workspace
+ccc-agent run 
+
+# in explicity folder as main workspace 
+ccc-agent run --workspace /home/$USER/Projects/my-project
 ```
 
-### Post-session review (operator) + lingering sessions
+Default behavior with `workspace-auto`:
 
-A session that exits with un-committed changes stays as a reviewable branch:
+- changes inside the declared workspace auto-commit when no deny rule matches;
+- changes outside the workspace, or to sensitive paths such as `.ssh`, `.env`,
+  `.git/hooks`, credentials, or shell startup files, become `pending-review`;
+- ignored runtime/cache noise is discarded with the branch;
+- `--policy manual` always requires review;
+- `--policy throwaway` discards the branch at completion.
+
+## Reviewing sessions
+
+After session finishes, you can review it / inspect it before committing:
 
 ```bash
-ccc-agent list                              # sessions + states (alias: ccc-agent ls)
-ccc-agent review <session>                  # browse, then accept/select/reject/later on a TTY
-ccc-agent diff <session>                    # read-only changed-path summary
-ccc-agent diff <session> --show-file-diffs  # append hunks for changed text files; binary/non-text skipped
-ccc-agent diff <session> <path>             # unified diff for one changed text file
-ccc-agent review <session> --accept         # scripted commit of policy-visible changes; ignored runtime noise is discarded
-ccc-agent review <session> --reject         # scripted discard everything
-ccc-agent review <session> --commit a,b     # scripted commit only a,b (file-by-file)
-ccc-agent review <session> --emit-patch > c.patch  # text hunks only: prune hunks…
-ccc-agent review <session> --apply-patch c.patch   # …then apply
-ccc-agent commit <session> [<session> ...]  # scripted commit one or more pending/frozen sessions
-ccc-agent abort <session> [<session> ...]   # scripted discard one or more sessions
-ccc-agent cleanup --older-than 30           # remove old closed session bundles
-ccc-agent cleanup --older-than 30 --dry-run # preview without deleting
-ccc-agent cleanup -a -o 20                  # include failed/non-terminal sessions
+ccc-agent list
+ccc-agent diff <session-id>
+ccc-agent diff <session-id> --show-file-diffs
+ccc-agent review <session-id>          # interactive accept/select/reject/later
+ccc-agent review <session-id> --accept # scripted accept
+ccc-agent review <session-id> --reject # scripted discard
 ```
 
-On an interactive TTY, plain `ccc-agent review <session>` first shows the same
-changed-path summary as `diff`, then prompts for `yes`/`no`/`later` or
-`selective accept`. Selective accept opens a stdlib terminal tree selector:
-Up/Down move, Enter opens a folder, Backspace returns to the parent, Space
-selects a file or an entire folder subtree, `c` commits selected paths, and
-`q`/Esc cancels back to the review prompt.
-
-`ccc-agent diff` uses live BranchFS status while a session is still live
-(`created`, `mounting`, `running`, `finalizing`). Cached review JSON is used only
-for quiescent review/closed states where the branch is frozen or may no longer be
-mounted. `ccc-agent finish <session>` freezes the branch and rewrites generated
-review artifacts from fresh status. `ccc-agent thaw <session>` reopens a
-`pending-review` branch for more work and clears generated review artifacts so
-stale paths are not mistaken for current branch state; human-created files in the
-review directory are left alone.
-
-If the node/container reboots while a session is `running`, the agent process and
-FUSE mounts are gone but the session bundle and BranchFS branch remain. You can
-also resume a `pending-review` session to add more work before committing, or an
-`aborted` session to restart it under the same session id:
+Other useful operations:
 
 ```bash
-ccc-agent resume <session>                         # re-run the exact stored command
-ccc-agent resume <session> --cmd bash              # custom shell-style command string
-ccc-agent resume <session> --cmd 'codex exec ...'  # e.g. switch agents for follow-up work
-ccc-agent resume <session> -- sh -lc '...'         # exact custom argv after --
+ccc-agent resume <session-id>          # continue after crash or pending review
+ccc-agent thaw <session-id>            # reopen a pending branch for more work
+ccc-agent finish <session-id>          # freeze/status/review a live session now
+ccc-agent cleanup --older-than 30      # remove old closed session bundles
 ```
 
-For `running`, `pending-review`, and explicitly allowed `failed` sessions,
-`resume` reuses the existing branch, re-mounts the saved roots, runs the stored
-command by default, and then performs the normal freeze/status/policy
-finalization. `pending-review`/`failed` branches are thawed before mounting.
-For `aborted` sessions, the previous branch was already discarded, so `resume`
-recreates the branch with the same session id and restarts from the current base.
-If you pass a custom command, the original `agent_command` stored in
-`session.json` is preserved; the custom exec is recorded as a resume event. Use
-`--force` only after verifying that no old agent process/mount is still alive.
-Failed sessions still require `--allow-failed`.
+Each session keeps durable metadata and review artifacts under the configured
+`state_dir`, including the command, protected roots, status JSON, policy decision,
+and a human-readable summary.
 
-`cleanup` only removes closed session bundles (`auto-committed`, `committed`,
-`aborted`) older than the requested age. Pending review, running, and failed
-sessions stay visible for human review/recovery; aborted sessions remain
-restartable until cleanup removes their bundle.
+## Agent integrations
 
-Or directly via the BranchFS CLI (branch name == session id):
+`ccc-agent run` already knows how to integrate with common agent CLIs:
 
-```bash
-branchfs list   --storage <store>
-branchfs status <session> --storage <store> --json
-branchfs commit-branch <session> --storage <store>   # low-level: applies all deltas, bypasses ccc-agent ignores
-branchfs abort-branch  <session> --storage <store>   # discard the branch
-```
+- **Codex**: injects the bundled Codex containment plugin for contained runs and
+  disables Codex's nested Linux sandbox because `ccc-agent` is already the
+  filesystem boundary.
+- **Claude Code**: adds the bundled Claude plugin with `--plugin-dir` for the
+  contained invocation.
+- **Hermes**: exposes the bundled Hermes plugin through `HERMES_BUNDLED_PLUGINS`.
+- **OpenCode or any other command**: still benefits from process-exit review even
+  without a native turn hook.
 
-Durable review artifacts (summary.md, per-root status JSON, policy decision)
-land under `<state_dir>/<session-id>/reviews/`. These files are generated cache
-for a frozen/completed review point: finalization rewrites them from fresh
-BranchFS status, and thaw removes generated files because the branch becomes
-mutable again. Non-generated operator notes or patches in the review directory
-are preserved. Other non-store runtime data for the same run is bundled nearby,
-e.g.
-`<state_dir>/<session-id>/session/session.json`,
-`<state_dir>/<session-id>/mounts/`, and
-`<state_dir>/<session-id>/control/control.sock`. BranchFS stores/deltas stay at
-the configured root `store` paths.
+Interactive Codex/Claude/Hermes sessions use best-effort turn hooks. Ordinary
+workspace changes can be committed at turn boundaries; out-of-scope changes are
+kept in the branch and surfaced for review. If a hook does not run, process-exit
+finalization still provides the authoritative freeze/status/policy path.
 
-### Credentials and agent state
+Optional transparent shims can wrap `codex`, `claude`, `hermes`, and `opencode`
+so users can keep invoking the normal command names. Nested agent calls reuse the
+current `CCC_AGENT_SESSION` instead of creating a new branch for every subcommand.
 
-`~/.codex`, `~/.claude`, and `~/.hermes` are **agent/system state**, not
-BranchFS-protected project data by default. `ccc-agent run` direct-binds those
-real shared directories read-write over the BranchFS home view so the tools can
-manage their own config, sessions, caches, locks, and token refreshes. Changes
-there persist immediately and are not committed, reviewed, or rolled back by
-BranchFS; Codex/Claude/Hermes own their concurrent access semantics across
-sessions/nodes.
+## Installation
 
-Use `ccc-agent run --protect-agent-state` or config `protect_agent_state: true`
-only when you intentionally want those dirs inside BranchFS review and are
-prepared to handle tool-specific merging/conflicts yourself.
+Managed CCC images include integration for installing and wiring `ccc-agent` as
+part of image/runtime setup. Administrators and developers should see:
 
-The containment plugin itself must not be writable agent state. In system deployments,
-install the package/hooks as root-owned files under `/usr` (or another OS path
-that bwrap exposes read-only) and write `config.json` under `/etc/ccc-agent`.
-Do not edit the user's normal Codex/Claude/Hermes config or globally install
-direct-run managed settings just to enable containment hooks. For a contained
-run only, the trusted launcher mounts CCC plugin assets read-only, e.g. Claude's
-`--plugin-dir`, Codex's in-sandbox plugin path, or Hermes'
-`HERMES_BUNDLED_PLUGINS`.
+- [Installation and build](docs/installation.md)
+- [Dependencies](docs/dependencies.md)
+- [Configuration](docs/configuration.md)
 
-`cred_mounts` remains available only for narrow special-case read-only overlays;
-do **not** use it for the whole `~/.codex`, `~/.claude`, or `~/.hermes`
-directories. API-key deployments can still combine `cred_mask` (overmount an
-individual secret file with `/dev/null`) and `cred_env` (supervisor reads a
-credential and passes it as env). OAuth-subscription logins (ChatGPT / Claude
-account — the common case) authenticate from token files, so those files must
-remain readable through the shared agent-state bind.
-
-## Layers
-
-| Piece | Role |
-|---|---|
-| `bin/ccc-agent` / `ccc-agent run` | trusted launcher: session + branch bundle + agent/shell + finalize; also used by transparent shims (workspace = `$PWD`) |
-| `ccc-agent list` / `ccc-agent ls` / `show` / `diff` / ... | operator controls outside a contained session: list/show/diff/review/commit/abort/finish/thaw/cleanup |
-| `ccc-agent turn-finalize` / `turn-approve` | in-sandbox plugin control ops over the session control socket |
-| `ccc-agent setup` | installer/wiring op: config, plugin entries, optional transparent PATH shims |
-| `ccc_agent/` | stdlib-only Python: session store, policy engine, BranchFS driver, bwrap assembler, control socket + per-turn handler |
-| `shims/ccc-agent-shim.sh` | transparent `codex`/`claude`/... PATH shims |
-| `assets/plugins/` | native CCC lifecycle-hook plugins (`claude-`/`codex-`/`hermes-ccc-containment`) injected read-only per contained run |
-| `hooks/` | standalone Stop-hook / `notify` adapter scripts (manual/fallback registration) |
-| `config/` | runtime config example + legacy claude/codex overlay examples (fallback only) |
-
-Confinement modes (`confinement` in config.json):
-
-- **`bwrap`** (default, the real boundary): runs the agent in a rootless
-  bubblewrap user+mount+pid namespace — OS read-only, the BranchFS view
-  read-write at its visible path, the real underlay/store hidden. By default it
-  also exposes the existing CCC/container runtime views for `/run`, read-only
-  `/var` (including the conventional `/var/run/docker.sock` Docker path), and a
-  device-capable `/dev` bind, so the agent can use sockets/devices that the
-  container deployment already exposes (Docker, ssh-agent, `/dev/fuse`, etc.).
-  The `/dev` bind must use bwrap `--dev-bind`, not ordinary `--bind`, because
-  ordinary binds are mounted `nodev` inside bwrap and make `/dev/urandom`
-  unusable for Python startup. This is intentionally not a full
-  container-escape-prevention boundary; use `ccc-agent run
-  --full-isolation` or config `container_run_access: false` to omit ambient
-  `/run`/`/var` access and restore bwrap's isolated minimal `/dev`. No container
-  `CAP_SYS_ADMIN` needed (just unprivileged user namespaces). Rootless bwrap
-  maps the user id plus one group id, not the full supplementary group list; in
-  default runtime-access mode, `ccc-agent` maps the Docker socket's group id when
-  the outer process can access `/var/run/docker.sock` only through that
-  supplementary group. Set config `bwrap_gid` to override this auto-selection.
-  `bwrap_bin` and `bwrap_proc_mode` (`bind`|`ro`|`fresh`) are configurable.
-- **`none`** (debug only — *not* a security boundary): runs the agent with its
-  cwd inside the view but nothing else isolated; absolute-path writes bypass the
-  view. Use only to exercise the policy/commit pipeline without bwrap.
-
-Design references: `docs/architecture.md` (trust boundaries, sandbox layout),
-`docs/policy.md` (path policy + secret hiding), and the workspace-level
-`CCC_AGENT_BRANCHFS_PROTECTION_REVIEW_DESIGN.md`.
-
-## Install
-
-It's a pip package (stdlib-only, no dependencies) with one `ccc-agent` console
-script and the shell hooks/shims bundled as package data.
+For local development from this repository:
 
 ```bash
-# system (CCC images / shared): install into the SYSTEM python so the entry
-# points are conda-independent (shebang pinned to /usr/bin/python3) and visible
-# inside the bwrap sandbox (which only exposes /usr):
-/usr/bin/python3 -m pip install --break-system-packages \
-    "git+https://github.com/vicoslab/ccc-agent.git@master"
-ccc-agent setup --system --branchfs-bin /usr/local/bin/branchfs --bwrap-bin "$(command -v bwrap)"
-
-# user / dev:
-python3 -m pip install --user "git+https://github.com/vicoslab/ccc-agent.git"
+python3 -m pip install --user -e .
 ccc-agent setup --user
 ```
 
-### Shell completion
+`BranchFS` and `bubblewrap` are runtime prerequisites and are configured outside
+this Python package.
 
-`pip install ccc-agent` installs shell completion files into standard
-`share/...` locations, so bash/fish/zsh can pick them up the same way Git
-completions are picked up by package installs:
+## Documentation
 
-- `share/bash-completion/completions/ccc-agent`
-- `share/zsh/site-functions/_ccc-agent`
-- `share/fish/vendor_completions.d/ccc-agent.fish`
+Start with [docs/README.md](docs/README.md):
 
-With `pip install --user`, those land under the user base (normally
-`~/.local/share/...`). With the system install command above, they land under the
-system Python prefix. Start a new shell after install; no `source <(...)` step is
-part of normal setup. `ccc-agent completion <bash|zsh|fish>` remains available
-only as a debug / one-off fallback.
+- [User guide](docs/user-guide.md)
+- [Agent integration](docs/agent-integration.md)
+- [Installation and build](docs/installation.md)
+- [Configuration](docs/configuration.md)
+- [Path policy and secret handling](docs/policy.md)
+- [Architecture](docs/architecture.md)
+- [Design decisions](docs/design-decisions.md)
+- [Dependencies](docs/dependencies.md)
+- [Development](docs/development.md)
 
-The completion hook reads the configured session store and completes optional
-`session-id` prefixes for `list`/`ls`, plus required `session-id` arguments for
-`show`, `status`, `diff`, `review`, `commit`, `abort`, `thaw`, `finish`,
-`turn-record`, and `turn-check`. It also completes `cleanup` options
-such as `--older-than`/`-o`, `--all-type`/`-a`, and `--dry-run`.
+## Important limits
 
-`ccc-agent setup` does what pip can't: writes `config.json` with the
-`agent_plugins` map, makes the bundled plugin hook scripts executable, and
-optionally installs the transparent PATH shims (`--enable-shims`). It does
-**not** edit the user's `~/.codex/config.toml`, `~/.claude/settings.json`, or
-live Claude managed settings. Instead, for a contained run only, `ccc-agent run`
-loads CCC hooks through each agent's **native plugin mechanism**: it bind-mounts
-the matching read-only plugin (`ccc_agent/assets/plugins/…`) into the sandbox,
-adds Claude's `--plugin-dir`, drops the Codex plugin at the in-sandbox Codex
-plugin path, and sets Hermes' `HERMES_BUNDLED_PLUGINS` so the Hermes plugin can
-inject CCC turn context and final-response review prompts. Direct, uncontained
-`codex`/`claude`/`hermes` runs load none of this. By default `ccc-agent run`
-infers the plugin from the command executable basename, including absolute paths.
-For example, these load the matching plugin:
-
-- `ccc-agent run -- codex exec ...`
-- `ccc-agent run -- /path/to/claude -p ...`
-
-Use `--agent <name>` only for an explicit override; explicit selection wins over
-executable-path inference. Disable injection with `--no-agent-plugins` (alias
-`--no-hooks`). Agent state is shared pass-through by default; pass
-`ccc-agent run --protect-agent-state` for one run, or generate/set
-`protect_agent_state: true` in config, to keep `~/.codex`, `~/.claude`, and
-`~/.hermes` inside BranchFS review.
-
-The plugins live under the installed package (`ccc_agent/assets/plugins/…`),
-which is under `/usr` for a system install and therefore exposed read-only
-inside the sandbox. See `docs/agent-integration.md` for the per-agent activation
-and turn-boundary matrix.
-
-The branchfs binary and bwrap are separate (not pip-installable); in CCC images
-the runit startup installs them and runs the two commands above (see the CCC
-image repo's `06_ccc_agent.sh`).
-
-## Deployment
-
-Hard rules:
-
-- `config.json`, the state dir pointer, and the plugin/hook source assets
-  must **not** be writable by the agent user (mounted read-only in the sandbox);
-- the BranchFS store and real underlay paths must not be visible inside the
-  agent's view (bwrap mode enforces this by exposing only the view; in `none`
-  debug mode the `.ccc-agent` deny pattern is the only fallback);
-- hooks report and at most request self-repair (`ccc-agent
-  turn-check` exits 2 with the offending paths while the per-session
-  repair budget lasts); only the supervisor/operator commits.
-
-Shims (optional, after the explicit wrapper works for you):
-
-```bash
-# Simple case: no conda env shadows /usr/local/bin.
-ccc-agent setup --system --enable-shims
-
-# Conda-compatible case: use a dedicated trusted shim directory and install
-# activation hooks in the env that contains codex/claude. On every `conda
-# activate`, the hook re-prepends the shim directory ahead of $CONDA_PREFIX/bin;
-# the shim then skips itself and resolves the real binary from the active env.
-conda activate my-agent-env
-ccc-agent setup --user --enable-shims \
-    --link-dir "$HOME/.local/share/ccc-agent/shims" \
-    --conda-activate-shims --conda-prefix "$CONDA_PREFIX"
-
-# Verify precedence: this should print the shim path, not $CONDA_PREFIX/bin/codex.
-command -v codex
-```
-
-Do **not** install the transparent `codex`/`claude` shim directly into the same
-`$CONDA_PREFIX/bin` that contains the real binary: that overwrites or masks the
-real executable. Use a separate shim directory and the conda activation hook so
-PATH becomes:
-
-```text
-<trusted-shim-dir>:$CONDA_PREFIX/bin:...
-```
-
-The same generic shim is symlinked as each agent name:
-
-```bash
-ln -s /opt/ccc-agent/shims/ccc-agent-shim.sh /usr/local/bin/codex
-ln -s /opt/ccc-agent/shims/ccc-agent-shim.sh /usr/local/bin/claude
-# nested agent calls reuse the outer session via CCC_AGENT_SESSION
-```
-
-## Tests
-
-```bash
-python3 -m unittest discover                    # all non-FUSE, stdlib-only
-```
-
-Integration against a real `branchfs` binary (still no FUSE — daemon socket
-only) runs automatically when the binary is found (or set
-`CCC_AGENT_BRANCHFS_BIN`). Real FUSE mount + bwrap end-to-end validation
-(`scripts/test-e2e-bwrap.sh`) needs a host with `/dev/fuse` and unprivileged
-user namespaces; see *Runtime validation* in `docs/architecture.md`.
+`ccc-agent` protects configured filesystem roots and review/commit authority. It
+is not a full VM or hostile-container escape boundary. If the surrounding runtime
+intentionally exposes powerful sockets or devices, the agent may be able to use
+those capabilities. Use `ccc-agent run --full-isolation` when you want to omit
+ambient `/run`, `/var`, and `/dev` access from the sandbox.

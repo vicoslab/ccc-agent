@@ -4,10 +4,10 @@
   "state_dir": "/storage/user/.ccc-agent",
   "backend": "branchfs",
   "branchfs_bin": "/usr/local/bin/branchfs",
-  "user": "domen",
+  "user": "<user>",
 
   "_alias_comment": "home_subdir feeds the policy alias /home/<user> -> /storage/user/<home_subdir>. CCC mounts the user home to the same bytes as /storage/user/<container>, so set this to the container name to dedup them in policy.",
-  "home_subdir": "domen-cuda10",
+  "home_subdir": "<home-subdir>",
   "_workspace_comment": "Launch workspace is per invocation: ccc-agent run defaults to the caller's current directory; pass --workspace to override.",
 
   "_confinement_comment": "bwrap = real rootless sandbox (default). none = debug only, NOT a boundary.",
@@ -18,13 +18,13 @@
   "container_run_access": true,
 
   "_runtime_comment": "The agent binary + deps live under the real $HOME / storage that the view hides; re-expose them read-only here. Prefer dests OUTSIDE the views (e.g. install agents at /opt) to avoid bwrap mkdir'ing mountpoints into the FUSE view. 'src' or 'src:dest'.",
-  "bwrap_ro_binds": ["/home/domen/.local:/opt/agent/.local"],
+  "bwrap_ro_binds": ["/home/<user>/.local:/opt/agent/.local"],
   "bwrap_setenv": {},
 
   "_agent_state_comment": "Default: ~/.codex, ~/.claude, and ~/.hermes are shared rw agent/system state, direct-bound over the BranchFS home view and therefore outside ccc-agent commit/review/rollback. Codex/Claude/Hermes own concurrent access to their state. Set protect_agent_state=true or pass ccc-agent run --protect-agent-state to keep these dirs inside BranchFS instead.",
   "protect_agent_state": false,
   "ensure_agent_state_dirs": true,
-  "agent_state_binds": ["/home/domen/.codex", "/home/domen/.claude", "/home/domen/.hermes"],
+  "agent_state_binds": ["/home/<user>/.codex", "/home/<user>/.claude", "/home/<user>/.hermes"],
 
   "_cred_comment": "Do NOT bind the whole ~/.codex, ~/.claude, or ~/.hermes read-only: Codex/Claude/Hermes need writable config/state/cache/session dirs. They are shared rw agent_state_binds by default, outside BranchFS merge policy. Use cred_mounts only for narrow special-case read-only overlays; API-key deployments can use cred_mask + cred_env for individual secret files.",
   "cred_mounts": [],
@@ -36,8 +36,8 @@
   "agent_plugins": {
     "codex": {
       "src": "/usr/lib/python3/dist-packages/ccc_agent/assets/plugins/codex-ccc-containment",
-      "sandbox_path": "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0",
-      "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
+      "sandbox_path": "/home/<user>/.codex/plugins/cache/ccc-agent/ccc/0.2.0",
+      "ensure_dirs": ["/home/<user>/.codex/plugins/cache/ccc-agent/ccc"],
       "plugin_id": "ccc@ccc-agent",
       "argv": ["--dangerously-bypass-approvals-and-sandbox"]
     },
@@ -60,16 +60,16 @@
       "base": "/storage",
       "store": "/opt/branchfs_branches/storage",
       "visible": "/storage",
-      "home_subdir": "user/domen-cuda10",
-      "hide_paths": ["user/domen-cuda10/.ssh", "user/domen-cuda10/.gnupg",
-                     "user/domen-cuda10/.netrc", "user/domen-cuda10/.aws",
-                     "user/domen-cuda10/.kube", "user/domen-cuda10/.docker/config.json"]
+      "home_subdir": "user/<home-subdir>",
+      "hide_paths": ["user/<home-subdir>/.ssh", "user/<home-subdir>/.gnupg",
+                     "user/<home-subdir>/.netrc", "user/<home-subdir>/.aws",
+                     "user/<home-subdir>/.kube", "user/<home-subdir>/.docker/config.json"]
     }
   ],
   "hide_patterns": [".env", ".env.*", "*.pem", "id_rsa*", "id_ed25519*", "credentials.json"],
   "policy": {
     "mode": "workspace-auto",
     "_policy_comment": "workspace-auto: changes under the workspace auto-commit; anything else under /storage (datasets, group, other users) is read-through but flagged for review on write. Agent state dirs are outside BranchFS by default via agent_state_binds; cache/history noise plus ccc-agent-created bind/plugin mountpoints are ignored and discarded.",
-    "ignore_patterns": ["/storage/user/domen-cuda10/.cache*"]
+    "ignore_patterns": ["/storage/user/<home-subdir>/.cache*"]
   }
 }

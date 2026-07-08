@@ -1,149 +1,182 @@
-# ccc-agent path policy and secret hiding
+# Path policy and secret handling
 
-Two distinct mechanisms, often confused — keep them apart:
+`ccc-agent` policy decides what to do with actual BranchFS changes after a turn
+or session reaches a review point. It is a commit/review policy, not the
+filesystem implementation itself.
 
-1. **Hide paths** (BranchFS, *preventive*): literal relative paths masked from
-   the agent's branch view. The agent can never read them. Configured per
-   protected root (`roots[].hide_paths`), enforced by the BranchFS resolver
-   (`branchfs create --hide ...`).
-2. **Deny/hide patterns** (policy engine, *detective*): globs evaluated at
-   freeze time against the canonicalized change list. A match never blocks the
-   agent while it runs; it downgrades the decision to `pending-review`.
+## Three path mechanisms
+
+| Mechanism | Layer | Purpose | Timing |
+|---|---|---|---|
+| `roots[].hide_paths` | BranchFS | Prevent the agent from reading/listing inherited sensitive literal paths. | Before and during the run. |
+| `deny_patterns` / `hide_patterns` | Policy | Force review when changed paths match sensitive glob-like patterns. | After status. |
+| `ignore_patterns` | Policy | Drop runtime/cache noise from review and commit. | After status, before decision. |
+
+Keep these separate. Hiding prevents reads for known literal locations; denying
+prevents auto-commit; ignoring removes non-deliverable noise.
 
 ## Decision model
 
-After freeze, every changed path (from `branchfs status`, mapped into the
-agent-visible namespace) is canonicalized — `/home/$USER/...` and
-`/storage/user/...` collapse to one namespace — then:
+After freeze or turn finalization:
+
+1. `ccc-agent` reads BranchFS status for each protected root.
+2. It maps paths into the agent-visible namespace and canonicalizes aliases such
+   as `/home/<user>` and `/storage/user/...`.
+3. It collapses raw status entries into net final changes.
+4. It removes ignored runtime/cache changes.
+5. It classifies remaining paths against allowed scopes and deny/hide patterns.
+6. It chooses a decision.
 
 ```text
-no changes                                      -> no-op close (abort branch)
-mode=throwaway                                  -> abort
-mode=manual | read-only-review                  -> pending-review
-mode=workspace-auto | training-run:
-    every path within allowed_scopes
-    and no deny/hide pattern matches            -> auto-commit
-    otherwise                                   -> pending-review
+no policy-visible changes                 -> close as no-op and discard branch
+policy mode = throwaway                   -> abort/discard
+policy mode = manual/read-only-review     -> pending-review
+policy mode = workspace-auto/training-run:
+  all changes inside allowed scopes
+  and no deny/hide pattern matches        -> auto-commit
+  otherwise                               -> pending-review
 ```
 
-`allowed_scopes` defaults to the declared workspace. Scopes may be declared
-via either alias (`/home/...` or `/storage/user/...`); canonicalization makes
-them equivalent.
-
-## Multi-session conflicts and LLM/human handling
-
-BranchFS provides lazy live-base views, not frozen snapshots. A session keeps its
-own branch deltas/tombstones, but inherited paths it never touched may reflect
-newer commits from other sessions.
-
-When a parent/base path changed after this session first touched the same path,
-BranchFS/ccc-agent should first try a git-style 3-way merge for regular text
-files. Clean non-overlapping merges are committed as merged content and treated
-like disjoint-path changes for policy. Unclean overlaps, binary files,
-delete-vs-modify, type changes, symlinks/directories, or missing merge-base
-content become conflict records.
-
-Conflict records are **review signals**, not generic commit failures. Normal
-latest-session-wins policy lets commit proceed while recording the conflict. The
-same records must be usable in two paths:
-
-- **LLM-handled:** `turn-check` / turn hooks print concise conflict
-  summaries so the agent can reconcile in the still-running branch before
-  finalization.
-- **Human-handled:** review artifacts and CLI output list conflicts separately
-  from ordinary changes and ignored paths, so a human can inspect or request
-  follow-up repair.
-
-## Pattern semantics (`ccc_agent.policy.path_matches`)
-
-- pattern without `/` — matches any single path component:
-  `.env`, `id_rsa*`, `*.pem`
-- pattern with `/`, not absolute — matches that component sequence anywhere,
-  plus everything below it: `.git/hooks` matches `proj/.git/hooks/pre-commit`
-- absolute pattern — fnmatch against the whole canonical path:
-  `/storage/group/*`
-
-Default deny set (see `policy.DEFAULT_DENY_PATTERNS`): SSH/GPG material,
-`.env*`, key/credential files, `.netrc`, `.aws`, `.kube/config`,
-`.docker/config.json`, `.git/config`, `.git/hooks`, shell startup files,
-`.condarc`, and `.ccc-agent` (supervisor state). Override per deployment via
-`deny_patterns` in policy config; extend per run with `ccc-agent run --hide`.
-
-Default ignore set (see `policy.DEFAULT_IGNORE_PATTERNS`): launcher/runtime noise
-that should never become a deliverable, including NFS `.nfs*` silly-renames,
-caches/logs such as `~/.cache` and `~/.npm/_logs`, and interactive history files
-such as `~/.bash_history`, `~/.zsh_history`, `~/.python_history`, `~/.lesshst`,
-and common database/REPL histories. Ignored changes are removed before turn
-checks, review artifacts, auto-commit, and manual `ccc-agent commit/review
---accept`; they are discarded with the branch unless a human uses lower-level
-BranchFS tools outside the normal supervisor flow.
-
-Agent tool homes are handled separately: by default `~/.codex`, `~/.claude`, and
-`~/.hermes` are **direct shared rw binds outside BranchFS**, not ignored deltas.
-They are system/agent state, so changes there persist immediately and are owned
-by Codex/Claude/Hermes concurrency semantics. Use `ccc-agent run
---protect-agent-state` or config `protect_agent_state: true` only if you want
-those directories inside BranchFS status/review/commit.
-
-`ccc-agent run` also adds per-session ignores for its own bwrap/plugin plumbing
-when a bind target lands inside a BranchFS-backed view: read-only `bwrap_ro_binds`,
-`cred_mounts`/`cred_mask`, and the matched agent plugin's `sandbox_path` and
-`ensure_dirs`. Prefer mounting trusted runtime/plugin assets outside the view
-(`/ccc-agent`, `/opt/...`) when the agent supports it; when a native agent (for
-example Codex plugin discovery) requires an in-home path, those mountpoint deltas
-are treated as infrastructure and ignored.
-
-## Secret hiding: what is and is not guaranteed
-
-With `hide_paths` on a root (e.g. `.ssh`, `.netrc`, `.aws`):
-
-- the agent cannot read or list those inherited paths — resolution and
-  readdir treat them as nonexistent (subtree included);
-- main and other branches are unaffected; the underlay is untouched;
-- if the agent *creates* a file at a hidden path, that is its own delta
-  (shadow): visible to the agent, reported by status, and **flagged by the
-  matching deny pattern** so it cannot auto-commit over the real secret.
-
-Not guaranteed:
-
-- secrets inside the workspace the user explicitly exposed (an `.env` the
-  project itself contains is readable unless listed in `hide_paths`; the
-  deny pattern still forces review if the agent modifies it);
-- patterns in `hide_paths` — BranchFS hiding is literal-prefix only by
-  design (O(1), no tree scans). Use well-known literal locations there and
-  globs in `deny_patterns`/`hide_patterns`;
-- anything outside the protected roots.
-
-Defense in depth, in order: hide at the filesystem (can't read), deny at
-policy (can't auto-commit), review artifacts (humans see exactly what was
-touched).
+`allowed_scopes` defaults to the run workspace. Add scopes with `ccc-agent run
+--scope PATH` or config `policy.allowed_scopes`.
 
 ## Policy modes
 
-| mode | use case |
+| Mode | Behavior |
 |---|---|
-| `workspace-auto` | default: agent edits its project, auto-commit when clean |
-| `manual` | high-stakes data; always a human decision |
-| `read-only-review` | audits/dry-runs: report, never commit automatically |
-| `training-run` | scopes = declared artifact dirs (checkpoints, logs) |
-| `throwaway` | exploration; discard at completion unless a human commits first |
+| `workspace-auto` | Default. Auto-commit only when all policy-visible changes are inside allowed scopes and no deny/hide pattern matches. |
+| `manual` | Always preserve the branch for human review. |
+| `read-only-review` | Report changes, never auto-commit. |
+| `training-run` | Same decision structure as `workspace-auto`, intended for declared artifact/output scopes. |
+| `throwaway` | Discard the branch at completion unless work was resolved manually before then. |
 
-## Bounded self-repair (`ccc-agent turn-check`)
+## Pattern semantics
 
-When a harness supports a blocking Stop hook (Claude Code, Codex), the hook
-runs `ccc-agent turn-check <session>` before reporting the turn.
-The check classifies **live** status — no freeze, no commit — and only looks
-at scope and deny/hide hygiene; mode semantics (`manual`,
-`read-only-review`, ...) still apply at finalize:
+`ccc_agent.policy.path_matches` supports:
 
-- **clean** → exit 0 (`check-clean` event); the stop proceeds and the normal
-  finalize flow decides per mode;
-- **dirty, repair budget left** → exit 2 with the offending paths printed;
-  the harness blocks the stop and the agent reverts in-session
-  (`repair-requested` event, `repair_attempts` incremented);
-- **dirty, budget exhausted** → exit 0 (`repair-budget-exhausted` event) so
-  hooks can never livelock the agent; the violations simply land in
-  `pending-review` at finalize.
+- pattern without `/`: matches any single path component;
+  - examples: `.env`, `id_rsa*`, `*.pem`
+- relative pattern with `/`: matches that component sequence anywhere, including
+  descendants;
+  - example: `.git/hooks` matches `repo/.git/hooks/pre-commit`
+- absolute pattern: matched against the whole canonical path, including
+  descendants of a matched directory;
+  - example: `/storage/group/private/*`
 
-`max_policy_repair_attempts` (default 2) bounds the loop; the count is
-stored per session, in supervisor state the agent cannot touch.
+Default deny patterns include SSH/GPG material, `.env*`, private keys,
+credential files, `.netrc`, `.aws`, `.kube/config`, `.docker/config.json`,
+`.git/config`, `.git/hooks`, shell startup files, `.condarc`, and `.ccc-agent`.
+
+## Preventive hiding
+
+`roots[].hide_paths` are literal relative prefixes enforced by BranchFS. Example:
+
+```json
+{
+  "roots": [
+    {
+      "name": "storage",
+      "base": "/storage",
+      "visible": "/storage",
+      "hide_paths": [
+        "user/my-home/.ssh",
+        "user/my-home/.aws",
+        "user/my-home/.netrc"
+      ]
+    }
+  ]
+}
+```
+
+Effects:
+
+- inherited hidden paths cannot be read or listed by the agent;
+- the real underlay is unchanged;
+- if the agent creates a new file at a hidden path, that new branch delta is
+  visible to the agent but policy deny patterns force review before commit.
+
+`hide_paths` are not glob patterns. They are literal prefixes so branch creation
+and path checks remain cheap. Use `deny_patterns`/`hide_patterns` for globs.
+
+## Ignored runtime noise
+
+Ignored changes are excluded from review and commit. They are discarded with the
+branch unless an operator deliberately uses low-level BranchFS tools outside the
+normal `ccc-agent` flow.
+
+Default ignores cover common non-deliverables such as:
+
+- NFS `.nfs*` silly-renames;
+- generic cache/log directories like `.cache` and `.npm/_logs`;
+- shell/REPL/client history files (`.bash_history`, `.zsh_history`,
+  `.python_history`, `.sqlite_history`, `.lesshst`, fish history, IPython
+  history, etc.);
+- launcher-created bind/plugin/mask mountpoint paths when they happen inside a
+  protected view.
+
+Startup/config files such as `.bashrc`, `.profile`, `.zshrc`, and `.condarc` are
+not ignored; they are deny matches that require review.
+
+## Agent runtime state
+
+By default, `~/.codex`, `~/.claude`, `~/.hermes`, and selected Claude runtime
+paths are direct shared read-write binds outside BranchFS review. Changes there
+persist immediately and are not part of policy status.
+
+Use `ccc-agent run --protect-agent-state` or config `protect_agent_state: true`
+only when you intentionally want agent internals to be branch deltas. In that
+mode `ccc-agent` does not understand agent-specific databases or cache merge
+semantics; the user must review conflicts/noise explicitly.
+
+## Per-turn kept paths
+
+Interactive plugins call `turn-finalize --default-keep` by default. That means:
+
+- ordinary in-scope workspace changes can commit at turn boundaries;
+- new out-of-scope or deny-matching paths are kept in the branch and remembered;
+- the agent continues instead of turning every autonomous loop into an approval
+  gate;
+- the user can later resolve kept paths with `turn-resolve` or normal final
+  review.
+
+Useful commands inside a live session:
+
+```bash
+ccc-agent turn-kept-status --details
+ccc-agent turn-review-kept
+ccc-agent turn-resolve commit --paths a,b
+ccc-agent turn-resolve discard --paths c
+ccc-agent turn-resolve keep --paths d
+```
+
+Discarding a live kept path asks the trusted supervisor to revert the path in the
+BranchFS branch. Added files disappear, modified inherited files fall back to the
+base view, and deleted inherited files reappear.
+
+## Multi-session conflicts
+
+BranchFS branches are lazy live-base overlays, not frozen snapshots. A session's
+own deltas/tombstones remain stable, while untouched inherited paths may reflect
+commits from other sessions.
+
+When a path changed in the base after this session first touched it, BranchFS can
+record conflict information. Clean non-overlapping text merges are treated like
+ordinary changes. Unclean overlaps, binary/type/delete conflicts, symlink/dir
+cases, or missing merge-base content become review signals.
+
+Conflict records must be visible to both:
+
+- LLM repair paths (`turn-check` / turn hooks);
+- human review artifacts and CLI summaries.
+
+They are not a reason to let the agent bypass review or commit directly.
+
+## Defense in depth
+
+Use the mechanisms in order:
+
+1. Hide known secret locations with BranchFS `hide_paths` so the agent cannot read
+   inherited content.
+2. Deny sensitive path patterns so any attempted modifications require review.
+3. Keep review artifacts durable so humans can inspect exactly what changed.
+4. Commit only through the trusted supervisor.

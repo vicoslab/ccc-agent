@@ -1,226 +1,198 @@
-# ccc-agent architecture: trust boundaries and contained roots
+# Architecture
 
-This document covers the runtime mechanics. The accepted cross-repo design
-lives in the workspace root (`CCC_AGENT_BRANCHFS_PROTECTION_REVIEW_DESIGN.md`);
-this is the implementation view.
+`ccc-agent` is a trusted supervisor for reviewable filesystem sessions. It does
+not implement BranchFS itself and it does not own privileged FUSE mounting. Its
+job is to create a branch session before the agent runs, launch the command in a
+protected view, and decide what to do with the branch after real status is known.
 
-## Trust split
+## Components and trust split
 
 ```text
-untrusted: the agent process tree (codex/claude/hermes/... and children)
-trusted:   ccc-agent run / ccc-agent / ccc_agent (supervisor)
-           branchfs daemon + store
-           ccc-fuse-sidecar (privileged FUSE broker)
+trusted outside sandbox:
+  ccc-agent CLI / supervisor
+  session store and review artifacts
+  BranchFS store and daemon socket
+  real underlay paths
+  optional local FUSE sidecar
+
+untrusted inside sandbox:
+  agent process tree (codex/claude/hermes/opencode/shell/...)
+  writable BranchFS branch views
+  agent runtime commands and child processes
 ```
 
-The supervisor launches the agent inside a **rootless bwrap sandbox** (no extra
-container privilege); bwrap is part of the untrusted-launch boundary, not a
-privileged component.
+The agent can produce branch deltas. Only the trusted supervisor can freeze,
+inspect, selectively apply, or discard them.
 
-The agent can *produce branch deltas*. Only the supervisor can freeze,
-inspect, commit, or abort them. This holds because:
+| Component | Responsibility | Must not do |
+|---|---|---|
+| `ccc-agent run` | Create session, create/mount branches, assemble sandbox, run command, finalize. | Rely on agent self-report for commit decisions. |
+| `ccc-agent review/diff/commit/abort/...` | Operator control over persisted sessions. | Bypass policy accidentally. |
+| BranchFS | Lazy branch views, deltas, tombstones, freeze/thaw/status primitives. | Decide human policy or agent lifecycle. |
+| FUSE sidecar | Local privileged mount plumbing when needed. | Classify paths or commit data. |
+| Agent plugins/hooks | Signal turn boundaries and expose convenient review commands. | Directly commit real data. |
 
-1. agent-visible paths are BranchFS **agent mounts** (`--agent`): the
-   `.branchfs_ctl` control file and `@branch` virtual dirs are not exposed;
-2. the BranchFS store (deltas, tombstones, metadata, `daemon.sock`) lives
-   outside the agent view — commit requests are only accepted over that
-   socket;
-3. session state (`<state_dir>/<session-id>/session`), review artifacts,
-   mountpoints, and per-turn control sockets are grouped under one
-   `<state_dir>/<session-id>/` bundle outside the view and additionally covered
-   by the `.ccc-agent` deny pattern;
-4. plugin hooks report turn boundaries to the trusted supervisor: the legacy
-   store-based path invokes `turn-record`/`turn-check` only, while the bwrap
-   control-socket path invokes `turn-finalize --default-keep` so the supervisor
-   can commit in-scope workspace changes and keep non-workspace/out-of-policy
-   paths in the branch without turning intermediate autonomous loops into
-   approval gates. Bundled `ccc-commit` and `/ccc:*` command skills let the
-   user/agent inspect status, review kept paths, and translate commit/discard
-   prompts into `turn-resolve` calls. Discard is implemented by the trusted
-   supervisor through BranchFS `revert-path` so selected deltas/tombstones are
-   actually removed from the live branch. The hook itself never gets direct
-   BranchFS commit/abort authority.
-
-## Session lifecycle (process-exit completion, first milestone)
+## Session lifecycle
 
 ```text
 created -> mounting -> running -> finalizing -> frozen
         -> auto-committed | pending-review | committed | aborted | failed
 ```
 
-- `ccc-agent run` materializes one branch per protected root (branch name =
-  session id), mounts agent views, runs the command with
-  `CCC_AGENT_SESSION` set, and finalizes on exit.
-- If a node/container reboots while a session is `running`, `ccc-agent resume
-  <session>` reuses the existing branch bundle, re-mounts the saved roots, runs
-  the stored `agent_command` by default (or a custom shell-style command with
-  `--cmd CMD` / exact argv after `--`), and then follows the same process-exit
-  finalization path. Resume also supports
-  `pending-review` follow-up work by thawing the preserved branch before
-  mounting. `aborted` sessions are restartable under the same session id, but
-  because abort has already discarded the branch delta, resume recreates an
-  empty branch from the current base. Custom resume commands do not overwrite the
-  stored original exec.
-- Freeze happens **after** completion; per-turn control-socket hooks may already
-  have committed ordinary workspace changes and default-kept non-workspace data
-  in the live branch. The legacy blocking self-repair path (`turn-check`) can
-  still ask the agent to repair policy/conflict issues before finalization, then
-  `branchfs status --json` per root feeds the policy engine.
-- `pending-review` keeps branches frozen; the branchfs daemon may exit (it
-  auto-exits with its last mount) — `ccc-agent commit/abort SESSION [SESSION ...]`
-  re-ensures it from session metadata (`branchfs start-daemon --base ... --storage ...`).
-- Commit failures never abort: the branch is preserved and the session is
-  marked `failed` for manual recovery.
-- BranchFS branches use lazy live-base inheritance: a running session keeps its
-  own deltas/tombstones, while untouched inherited paths may reflect commits
-  from other sessions. Same-path parent changes are handled at commit/review
-  time. Clean text 3-way merges are treated like disjoint changes; unclean
-  overlaps/binary/type/delete conflicts are recorded but do not make low-level
-  commit fail by default. ccc-agent must surface those records to both blocking
-  LLM repair hooks and human review artifacts.
-- Nested agents: a shim or `ccc-agent run` invoked with `CCC_AGENT_SESSION`
-  already set reuses the outer session — one review unit per task, no branch
-  explosion.
+Main flow:
 
-### Review artifacts and cache validity
+1. `ccc-agent run` creates a session record and one BranchFS branch per protected
+   root. The branch name is the session id.
+2. BranchFS agent mounts are created. Agent-visible mounts do not expose BranchFS
+   commit controls.
+3. The command runs with `CCC_AGENT_SESSION` and, in bwrap mode, a per-turn
+   control socket mapped to `/tmp/ccc-agent/control.sock`.
+4. Native plugins may call `turn-finalize` at turn boundaries.
+5. Process exit always performs session-end finalization.
+6. Finalization freezes the branch, reads BranchFS status, splits ignored noise,
+   evaluates policy, writes review artifacts, and applies the decision.
+7. Commit is selective: `ccc-agent` applies only reviewed policy-visible changes
+   and then discards the rest of the branch.
 
-`<state_dir>/<session-id>/reviews/` is a durable review snapshot, not a live
-status database. `ccc-agent diff` may use cached `status.*.json` only when the
-session is quiescent (`pending-review`, terminal states, or a preserved failed
-session). For live states (`created`, `mounting`, `running`, `finalizing`), it
-must read live BranchFS status and ignore any old review cache left by a previous
-freeze/thaw cycle.
+Commit failures never abort automatically. If applying changes fails, the branch
+is preserved and the session becomes `failed` or `pending-review` for recovery.
 
-Finalization always recomputes status after freezing and rewrites generated
-review files from scratch: `status.*.json`, `ignored.*.json`, `warnings.*.json`,
-`policy-decision.json`, `summary.md`, and `session.json`. `ccc-agent thaw` clears
-those generated artifacts after BranchFS thaw succeeds because the branch is
-mutable again; non-generated operator files such as notes or saved patches remain
-in the review directory. Cached tombstone/delete entries whose underlying base
-path is absent are filtered from review display because they are no-op remnants,
-not real deletes.
+## Sandbox layout in `bwrap` mode
 
-## Contained root layout (bwrap mode)
+`confinement: "bwrap"` is the real execution boundary. It uses rootless
+bubblewrap user/mount/PID namespaces; no container `CAP_SYS_ADMIN` is required
+for bwrap itself.
 
-`ccc_agent.runner._bwrap_command` builds a bubblewrap invocation that assembles
-a rootless user+mount+pid namespace — no container `CAP_SYS_ADMIN`, just
-unprivileged user namespaces. The sandbox command is a small PID-1 lifecycle
-wrapper that starts the real agent as a normal child process and exits with the
-agent's status. This makes process-exit finalization depend on the foreground
-agent, not on bubblewrap's default reaper waiting forever for lingering helper
-processes. The namespace (and all its mounts/processes) disappears when that
-wrapper exits after the agent. Layout the agent sees:
+Typical paths visible inside the sandbox:
 
 ```text
-/usr /etc /opt                    read-only binds of the container image
-/bin /sbin /lib /lib64            recreated as the host's usrmerge symlinks
-/proc                             bound from the container (bwrap_proc_mode:
-                                  bind|ro; "fresh" needs systempaths=unconfined)
-/dev                              existing container device namespace (rw bind by
-                                  default, including container-visible /dev/fuse;
-                                  bwrap minimal dev with --full-isolation)
-/tmp                              fresh tmpfs (session-scoped)
-/var                              existing container /var (ro bind by default;
-                                  includes conventional /var/run socket paths;
-                                  omitted with --full-isolation)
-/run                              existing container runtime namespace (rw bind
-                                  by default; omitted with --full-isolation or
-                                  container_run_access=false)
-/storage/user                     BranchFS agent view (rw) — overlays + hides
-                                  the real underlay at the same path
-/home/<user>                      same view or its home_subdir (rw)
-~/.codex ~/.claude ~/.hermes      direct shared rw binds over the home view
-                                  (default agent/system state, not BranchFS)
-/ccc-agent/plugins/…              CCC agent plugin root (ro) when supported
-~/.codex/plugins/ccc-agent       Codex plugin scan path (ro bind on top of
-                                  shared ~/.codex when Codex requires it)
-/tmp/ccc-agent/control.sock       per-turn control socket (per-turn mode;
-                                  under private /tmp so it does not depend on
-                                  permissions in the bound container /run)
+/usr /etc /opt                    read-only OS/image binds
+/bin /sbin /lib /lib64            usrmerge symlinks or read-only binds
+/proc                             bound or read-only, depending on bwrap_proc_mode
+/dev                              container device tree by default, or minimal dev with --full-isolation
+/tmp                              private tmpfs
+/var                              read-only container /var by default
+/run                              container /run by default
+/storage                          BranchFS branch view, read-write
+/home/<user>                      same branch or branch subdir, read-write
+~/.codex ~/.claude ~/.hermes      shared direct agent state by default
+/ccc-agent/plugins/...            read-only bundled plugin assets when injected
+/tmp/ccc-agent/control.sock       per-turn control socket inside sandbox
 ```
 
-The CCC agent plugin is a **read-only** bind of root-owned package assets,
-injected only for a contained run of the matching agent (Claude `--plugin-dir`,
-Codex in-sandbox plugin path, Hermes `HERMES_BUNDLED_PLUGINS`). The untrusted
-agent can load it but never edit the hook source. Agent tool homes (`~/.codex`,
-`~/.claude`, `~/.hermes`) are direct shared rw binds by default, outside BranchFS
-commit/review/rollback. Set `protect_agent_state: true` or run with
-`--protect-agent-state` to omit those binds and make the user handle any
-agent-state merges through BranchFS review. A failed/missing plugin degrades to
-process-exit review — it never grants commit authority. See
-`docs/agent-integration.md`.
+Deliberately absent:
 
-Deliberately absent: real `/storage/*` underlays (the view `--bind` overlays
-the visible path), the BranchFS store, `daemon.sock`, the supervisor state dir,
-and any other `/storage` mount. `/home/$USER` and `/storage/user` bind the
-**same** view (alias rule), never two branches.
+- real underlay paths behind protected roots;
+- BranchFS stores and daemon sockets;
+- generated session/control/review state except the limited control socket;
+- commit-capable BranchFS control files in the agent mount.
 
-The container's existing `/run`, read-only `/var`, and `/dev` are **not**
-treated as data that ccc-agent must hide by default. CCC containers already
-isolate those namespaces from the host unless the container deployment
-intentionally exposes a socket or device. Therefore bwrap mode binds container
-`/run`, `/var` (read-only), and `/dev` into the sandbox by default so agents can
-use container-provided runtime services such as Docker (including the default
-`/var/run/docker.sock` path), ssh-agent, the FUSE sidecar socket, or `/dev/fuse`
-when that container has them.
-This is an intentional escape-capability tradeoff: a powerful socket/device such
-as Docker or the FUSE sidecar may let an agent reach data paths outside the
-BranchFS view. That risk is considered deployment-authorized system access, not
-a violation of ccc-agent's primary goal (protect and review normal writes to
-`/home`/`/storage`). For stricter containment, run `ccc-agent run
---full-isolation` or set `container_run_access: false`; that restores the older
-no-ambient-runtime behavior aside from ccc-agent's own control socket and uses
-bwrap's isolated minimal `/dev` instead of binding the container device tree.
+`container_run_access` defaults to true so the sandbox can use runtime services
+that the outer environment intentionally exposes, such as Docker sockets,
+ssh-agent sockets, the FUSE sidecar socket, or `/dev/fuse`. This is a pragmatic
+compatibility tradeoff, not a full hostile-container escape boundary. Use
+`ccc-agent run --full-isolation` or `container_run_access: false` to omit ambient
+`/run`, `/var`, and `/dev` access.
 
-The agent gets a scrubbed environment (`--clearenv` + an explicit `--setenv`
-allowlist). No network or proc isolation is enforced by design; the boundary
-is filesystem confinement plus PID-namespace process isolation, not a full
-container-escape prevention boundary. Rootless bwrap maps the user id and one
-primary group id into the user namespace. It cannot preserve every outer
-supplementary group in the common unprivileged path; if default runtime access is
-enabled and `/var/run/docker.sock` is accessible outside only via a supplementary
-group, `ccc-agent` maps that socket group as the sandbox gid so Docker remains
-usable. Set `bwrap_gid` explicitly to override this auto-selection.
+`confinement: "none"` is only a debug mode. It runs the command with its current
+directory inside the branch mount but does not hide absolute paths. It is not a
+security boundary.
 
-In **`none` mode** (debug only) the agent runs with its cwd inside the mounted
-view but nothing else isolated — **not a security boundary**: absolute-path
-writes go straight to the real underlay and bypass the view. Use it only to
-exercise the policy/commit pipeline without bwrap.
+## Alias model
 
-## FUSE plumbing
-
-Normal CCC app containers have no `CAP_SYS_ADMIN`; BranchFS mounts go through
-`ccc-fuse-sidecar`:
+When two user-visible paths refer to the same backing data, they must come from
+one BranchFS branch. The common case is home storage:
 
 ```text
-branchfs (unprivileged, in-container)
-  -> fusermount3 shim                  (PATH-installed by CCC base image)
-  -> /run/ccc-fuse-sidecar/fuse.sock   (host sidecar, SYS_ADMIN)
-  -> /dev/fuse open + mount(2), fd passed back SCM_RIGHTS
+real root:      /storage
+branch view:    /storage
+home alias:     /home/<user> -> /storage/user/<container-or-home-subdir>
 ```
 
-The sidecar stays policy-free. Path translation between the container and
-sidecar namespaces is the sidecar's Docker-inspect mode (see that repo's
-README); BranchFS mountpoints under the per-session
-`<state_dir>/<session-id>/mounts/...` bundle must resolve to the same host paths
-in both namespaces or be translated.
+Creating separate BranchFS roots for `/home/<user>` and `/storage/user/...` would
+produce incoherent aliases for the same files. `home_subdir` and the alias map
+exist to avoid that.
 
-## Runtime validation
+## Review artifacts and cache validity
 
-Everything in `tests/` runs without FUSE. End-to-end validation needs a host
-with `/dev/fuse` (via `ccc-fuse-sidecar`) and unprivileged user namespaces
-(e.g. `donbot-domen-cuda10`):
+Generated review artifacts live under:
 
-```bash
-# bwrap confinement, real FUSE, full commit/review cycle:
-scripts/test-e2e-bwrap.sh      # in-scope auto-commit, out-of-scope pending,
-                               # /usr read-only, underlay + store hidden
-# debug pipeline without a sandbox:
-scripts/test-e2e-none.sh
+```text
+<state_dir>/<session-id>/reviews/
+  session.json
+  summary.md
+  status.<root>.json
+  ignored.<root>.json
+  warnings.<root>.json
+  policy-decision.json
 ```
 
-bwrap's only host requirements are an unprivileged-userns-capable kernel and
-the `bwrap` binary (`bwrap_bin` in config). A *fresh* `/proc` (`bwrap_proc_mode:
-fresh`) additionally needs the container's `/proc` masks cleared
-(`--security-opt systempaths=unconfined`); otherwise use the default bound
-`/proc`.
+Rules:
+
+- Live states (`created`, `mounting`, `running`, `finalizing`) use live BranchFS
+  status. Cached review files from an earlier freeze are ignored.
+- Finalization freezes the branch and rewrites generated review artifacts from
+  fresh status.
+- `ccc-agent thaw` reopens a pending branch and removes generated review files
+  because the branch is mutable again.
+- Operator-authored files in the review directory, such as notes or patches, are
+  preserved across thaw/freeze cycles.
+
+## BranchFS and FUSE plumbing
+
+BranchFS is responsible for filesystem behavior:
+
+- O(1) branch creation;
+- lazy inheritance from the base/parent;
+- deltas for changed files;
+- tombstones for inherited deletes;
+- freeze/thaw/status/revert/commit/abort primitives;
+- agent mounts that hide commit-capable control paths.
+
+When the app container cannot mount FUSE directly, a local sidecar performs the
+privileged mount operation:
+
+```text
+branchfs client process
+  -> fusermount3 shim / sidecar client
+  -> local ccc-fuse-sidecar socket
+  -> /dev/fuse + mount(2)
+  -> FUSE fd returned to BranchFS
+```
+
+The sidecar is intentionally policy-free. It may log the `CCC_AGENT_SESSION` for
+audit, but it does not decide allowed paths or commits.
+
+## Agent state handling
+
+Known agent runtime state (`~/.codex`, `~/.claude`, `~/.hermes`, selected Claude
+runtime paths) is direct-bound read-write over the BranchFS home view by default.
+That state is owned by the agent tools and persists immediately. It is not part
+of project review/commit/rollback unless the user opts into
+`--protect-agent-state`.
+
+Trusted plugin assets are different: they are package/root-owned files mounted
+read-only for a matching contained run. The untrusted agent can load them but not
+edit them.
+
+## Completion model
+
+Process exit is the authoritative completion signal because it works for every
+command. Native hooks improve interactive UX by adding turn-boundary commits and
+kept-path prompts, but hook failure cannot grant commit authority. If a plugin
+fails to load or an agent version changes hook behavior, session-end finalization
+still freezes the branch and applies policy based on BranchFS status.
+
+## Limits
+
+`ccc-agent` protects configured filesystem roots and commit authority. It does
+not provide:
+
+- full VM isolation;
+- network isolation;
+- proof against every container escape if powerful sockets/devices are exposed;
+- strict same-file multi-writer semantics for concurrent sessions;
+- distributed live-FUSE replication between nodes.
+
+The global/durable operation is the reviewed commit to the real underlay, not the
+live FUSE mount.
