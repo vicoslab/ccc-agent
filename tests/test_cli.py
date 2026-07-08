@@ -1,6 +1,7 @@
 """Tests for the ccc-agent run / ccc-agent command-line layer."""
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from unittest import mock
 from ccc_agent import cli as cli_mod
 from ccc_agent.branchfs import BranchfsCli
 from ccc_agent.cli import build_runtime, load_config, main, main_ctl, main_run
+from ccc_agent.ctl import Controller
 from ccc_agent.session import ProtectedRoot, SessionStore
 
 
@@ -1487,6 +1489,101 @@ class TestMainCtl(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("%s: would remove" % old_closed, out.getvalue())
         self.assertEqual(self.store().load(old_closed).state, "auto-committed")
+
+    def test_cleanup_detects_active_mounts_from_mountinfo(self):
+        sid = "agent-cleanup-active-mount"
+        store = self.store()
+        mount = os.path.join(self.h.tmp, "state", sid, "mounts", "storage")
+        os.makedirs(mount, exist_ok=True)
+        root = ProtectedRoot(
+            name="storage", base=self.h.base,
+            store=os.path.join(self.h.tmp, "stores", "storage"),
+            branch=sid, mount=mount, visible="/storage/user",
+            home_subdir="")
+        session = store.create(
+            owner="domen", agent_kind="codex", agent_command=["codex"],
+            workspace="/storage/user/Projects/proj-a",
+            policy={"mode": "manual"},
+            protected_roots={"storage": root}, session_id=sid)
+        for state in ("mounting", "running", "finalizing", "frozen",
+                      "auto-committed"):
+            session.transition(state)
+        store.save(session)
+        self.set_session_time(sid, "2000-01-01T00:00:00Z")
+        mountinfo = os.path.join(self.h.tmp, "mountinfo")
+        escaped_mount = mount.replace(" ", "\\040")
+        with open(mountinfo, "w") as fh:
+            fh.write("123 1 0:42 / %s rw,relatime - "
+                     "fuse.branchfs branchfs rw\n" % escaped_mount)
+
+        out = io.StringIO()
+        controller = Controller(store, SimpleNamespace(_mountinfo_path=mountinfo),
+                                None)
+        matched = controller.cleanup(older_than_days=7, out=out)
+
+        self.assertEqual(matched, [])
+        self.assertIn("%s: skipped (active mount: %s)" % (sid, mount),
+                      out.getvalue())
+        self.assertTrue(os.path.isdir(store.bundle_dir(sid)))
+        self.assertEqual(store.load(sid).state, "auto-committed")
+
+    def test_cleanup_continues_after_remove_error_and_reports_failures(self):
+        store = self.store()
+
+        def make_closed(session_id):
+            root = ProtectedRoot(
+                name="storage", base=self.h.base,
+                store=os.path.join(self.h.tmp, "stores", "storage"),
+                branch=session_id,
+                mount=os.path.join(self.h.tmp, "state", session_id, "mounts",
+                                   "storage"),
+                visible="/storage/user", home_subdir="")
+            session = store.create(
+                owner="domen", agent_kind="codex", agent_command=["codex"],
+                workspace="/storage/user/Projects/proj-a",
+                policy={"mode": "manual"},
+                protected_roots={"storage": root}, session_id=session_id)
+            for state in ("mounting", "running", "finalizing", "frozen",
+                          "auto-committed"):
+                session.transition(state)
+            store.save(session)
+            self.set_session_time(session_id, "2000-01-01T00:00:00Z")
+
+        first = "agent-cleanup-a"
+        failing = "agent-cleanup-b"
+        last = "agent-cleanup-c"
+        for sid in (first, failing, last):
+            make_closed(sid)
+
+        original_remove = SessionStore.remove
+
+        def flaky_remove(store_obj, session_id):
+            if session_id == failing:
+                raise OSError(errno.EBUSY, os.strerror(errno.EBUSY), "storage")
+            return original_remove(store_obj, session_id)
+
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.object(SessionStore, "remove", flaky_remove):
+            with contextlib.redirect_stdout(out):
+                with contextlib.redirect_stderr(err):
+                    code = main_ctl(["--config", self.h.config_path, "cleanup",
+                                     "--older-than", "7"], env={})
+
+        self.assertEqual(code, 1)
+        text = out.getvalue()
+        self.assertIn("%s: removed" % first, text)
+        self.assertIn("%s: failed ([Errno 16] Device or resource busy: "
+                      "'storage')" % failing, text)
+        self.assertIn("%s: removed" % last, text)
+        self.assertIn("removed 2 old session(s); failed 1 session(s)", text)
+        self.assertIn("ccc-agent: cleanup failed for 1 session(s)",
+                      err.getvalue())
+        with self.assertRaises(KeyError):
+            store.load(first)
+        self.assertEqual(store.load(failing).state, "auto-committed")
+        with self.assertRaises(KeyError):
+            store.load(last)
 
     def test_ctl_error_returns_nonzero(self):
         self.assertEqual(

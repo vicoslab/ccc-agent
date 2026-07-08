@@ -16,7 +16,7 @@ import sys
 import time
 
 from . import artifacts
-from .branchfs import StatusReport
+from .branchfs import StatusReport, _mountinfo_entry
 from .commit_failures import (clear_permission_failures,
                               has_permission_failures,
                               is_permission_denied,
@@ -389,6 +389,10 @@ class Controller(object):
                 net_final_ignored_changes(ignored, self.alias_map))
 
     def _mount_still_active(self, root):
+        mountinfo_path = getattr(self.backend, "_mountinfo_path",
+                                 "/proc/self/mountinfo")
+        if _mountinfo_entry(root.mount, mountinfo_path) is not None:
+            return True
         try:
             return os.path.ismount(root.mount)
         except OSError:
@@ -459,6 +463,7 @@ class Controller(object):
         cutoff = (time.time() if now is None else now) - older_than_days * 86400
         matched = []
         skipped = []
+        failed = []
         verb = "would remove" if dry_run else "removed"
         for session in self.store.list():
             if session.state not in CLEANUP_STATES:
@@ -478,14 +483,19 @@ class Controller(object):
                 try:
                     self.store.remove(session.session_id)
                 except (OSError, ValueError) as exc:
-                    raise ControlError("could not remove session %s: %s"
-                                       % (session.session_id, exc))
+                    failed.append((session.session_id, exc))
+                    out.write("%s: failed (%s)\n" % (session.session_id, exc))
+                    continue
             matched.append(session.session_id)
             out.write("%s: %s\n" % (session.session_id, verb))
         out.write("%s %d old session(s)" % (verb, len(matched)))
         if skipped:
             out.write("; skipped %d active session(s)" % len(skipped))
+        if failed:
+            out.write("; failed %d session(s)" % len(failed))
         out.write("\n")
+        if failed:
+            raise ControlError("cleanup failed for %d session(s)" % len(failed))
         return matched
 
     def show(self, session_id, out=None):
