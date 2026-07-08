@@ -81,8 +81,9 @@ def write_conda_shim_hooks(conda_prefix, shim_dir):
     Conda activation normally prepends ``$CONDA_PREFIX/bin``. If the ccc shims
     only live in /usr/local/bin, a conda-installed ``codex``/``claude`` wins and
     bypasses containment. These hooks run after conda's PATH mutation and
-    re-prepend a trusted shim directory, while the shim itself skips that first
-    PATH hit and resolves the real binary from the active env.
+    re-prepend a trusted shim directory; the shim redirects to ``ccc-agent run``
+    and passes an unshimmed PATH so the contained command resolves the active
+    env's real binary normally.
     """
     activate_dir = os.path.join(conda_prefix, "etc", "conda", "activate.d")
     deactivate_dir = os.path.join(conda_prefix, "etc", "conda", "deactivate.d")
@@ -344,7 +345,7 @@ def build_agent_state_binds(home):
     """Default shared direct state for agent tools, outside BranchFS."""
     paths = (
         ".codex", ".claude", ".hermes",
-        ".claude.json", ".local/bin/claude",
+        ".claude.json", ".local/bin/codex", ".local/bin/claude",
         ".local/share/claude", ".local/state/claude",
         ".cache/claude-cli-nodejs",
     )
@@ -414,9 +415,11 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "_runtime_comment": "Re-expose the agent binary/runtime read-only at a "
                             "NON-view dest (e.g. '/path/to/agent:/opt/agent').",
         "bwrap_ro_binds": [],
-        "_agent_state_comment": "By default Codex/Hermes state plus Claude "
-                                "Code state (~/.claude, ~/.claude.json, "
-                                "~/.local/bin/claude, ~/.local/share/claude, "
+        "_agent_state_comment": "By default Codex/Hermes state plus Codex/"
+                                "Claude Code local launcher/runtime paths "
+                                "(~/.claude, ~/.claude.json, "
+                                "~/.local/bin/codex, ~/.local/bin/claude, "
+                                "~/.local/share/claude, "
                                 "~/.local/state/claude, and "
                                 "~/.cache/claude-cli-nodejs) are shared rw "
                                 "system state, direct-bound over the BranchFS "
@@ -430,9 +433,9 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "ensure_agent_state_dirs": True,
         "agent_state_binds": build_agent_state_binds(home),
         "_cred_comment": "Agent config/state paths such as ~/.codex, "
-                         "~/.claude, ~/.claude.json, Claude .local binary/"
-                         "state/cache, and ~/.hermes are direct shared rw "
-                         "agent_state_binds by default, so real agents can "
+                         "~/.claude, ~/.claude.json, Codex/Claude .local "
+                         "binary/state/cache, and ~/.hermes are direct shared "
+                         "rw agent_state_binds by default, so real agents can "
                          "create logs, sessions, caches, config, and refreshed "
                          "tokens without BranchFS merge policy. Use cred_mounts "
                          "only for narrow special-case read-only overlays; do "

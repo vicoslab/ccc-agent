@@ -72,8 +72,7 @@ class TestCondaShimActivation(unittest.TestCase):
             lines = proc.stdout.splitlines()
             self.assertEqual(lines[0], os.path.join(self.shimdir, agent))
             self.assertIn(
-                "LAUNCH:run --agent %s -- %s do thing" %
-                (agent, os.path.join(self.conda_bin, agent)),
+                "LAUNCH:run --agent %s -- %s do thing" % (agent, agent),
                 proc.stdout)
 
         proc = subprocess.run(
@@ -148,6 +147,7 @@ class TestSetupConfig(unittest.TestCase):
         self.assertIn("/home/domen/.claude", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.hermes", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.claude.json", cfg["agent_state_binds"])
+        self.assertIn("/home/domen/.local/bin/codex", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.local/bin/claude", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.local/share/claude", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.local/state/claude", cfg["agent_state_binds"])
@@ -185,6 +185,7 @@ class TestSetupConfig(unittest.TestCase):
         self.assertIn("/home/domen/.claude", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.hermes", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.claude.json", cfg["agent_state_binds"])
+        self.assertIn("/home/domen/.local/bin/codex", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.local/bin/claude", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.local/share/claude", cfg["agent_state_binds"])
         self.assertIn("/home/domen/.local/state/claude", cfg["agent_state_binds"])

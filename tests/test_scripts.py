@@ -469,7 +469,7 @@ class TestShim(unittest.TestCase):
         os.chmod(self.real, 0o755)
         self.launcher = os.path.join(tmp, "ccc-agent")
         with open(self.launcher, "w") as fh:
-            fh.write("#!/bin/sh\necho LAUNCH:$*\n")
+            fh.write("#!/bin/sh\necho LAUNCH:$*\necho UNDERLYING_PATH:${CCC_AGENT_SHIM_UNDERLYING_PATH:-}\n")
         os.chmod(self.launcher, 0o755)
         self.env = {
             "PATH": "%s:%s:/usr/bin:/bin" % (self.shimdir, self.realdir),
@@ -490,10 +490,48 @@ class TestShim(unittest.TestCase):
     def test_shim_wraps_with_launcher(self):
         proc = self.run_shim()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("LAUNCH:run --agent codex -- %s do thing" % self.real,
+        self.assertIn("LAUNCH:run --agent codex -- codex do thing",
+                      proc.stdout)
+        self.assertIn("redirect active", proc.stderr)
+
+    def test_shim_does_not_preflight_missing_underlying_agent(self):
+        os.unlink(self.real)
+
+        proc = self.run_shim()
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("LAUNCH:run --agent codex -- codex do thing",
+                      proc.stdout)
+        self.assertNotIn("no real", proc.stderr)
+
+    def test_missing_underlying_agent_fails_from_contained_exec(self):
+        os.unlink(self.real)
+        with open(self.launcher, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "while [ \"$1\" != -- ]; do shift; done\n"
+                     "shift\n"
+                     "CCC_AGENT_SESSION=agent-x\n"
+                     "export CCC_AGENT_SESSION\n"
+                     "PATH=\"$CCC_AGENT_SHIM_UNDERLYING_PATH\"\n"
+                     "export PATH\n"
+                     "exec \"$@\"\n")
+        os.chmod(self.launcher, 0o755)
+
+        proc = self.run_shim()
+
+        self.assertEqual(proc.returncode, 127)
+        self.assertNotIn("no real", proc.stderr)
+        self.assertNotIn("LAUNCH:", proc.stdout)
+
+    def test_shim_exports_path_without_itself_for_contained_agent_lookup(self):
+        proc = self.run_shim()
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("redirect active", proc.stderr)
+        self.assertIn("UNDERLYING_PATH:%s:/usr/bin:/bin" % self.realdir,
                       proc.stdout)
 
-    def test_finds_user_local_bin_when_not_on_path(self):
+    def test_redirect_does_not_hardcode_user_local_bin_when_not_on_path(self):
         for agent in ("codex", "claude"):
             local_real = os.path.join(self.localbin, agent)
             with open(local_real, "w") as fh:
@@ -505,7 +543,7 @@ class TestShim(unittest.TestCase):
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("LAUNCH:run --agent %s -- %s do thing" % (agent, local_real),
+            self.assertIn("LAUNCH:run --agent %s -- %s do thing" % (agent, agent),
                           proc.stdout)
 
     def test_nested_session_runs_real_binary_directly(self):
@@ -553,6 +591,27 @@ class TestShim(unittest.TestCase):
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
                          proc.stdout)
         self.assertNotIn("LAUNCH:", proc.stdout)
+
+    def test_nested_session_uses_exported_unshimmed_conda_path(self):
+        conda = os.path.join(self._tmp.name, "conda", "bin")
+        os.makedirs(conda)
+        conda_codex = os.path.join(conda, "codex")
+        with open(conda_codex, "w") as fh:
+            fh.write("#!/bin/sh\necho CONDA-REAL:$0:$*\n")
+        os.chmod(conda_codex, 0o755)
+
+        env = dict(self.env)
+        env.update({
+            "CCC_AGENT_SESSION": "agent-x",
+            "CCC_AGENT_SHIM_UNDERLYING_PATH": "%s:/usr/bin:/bin" % conda,
+        })
+        proc = subprocess.run(["codex", "do", "thing"], env=env,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("CONDA-REAL:%s:" % conda_codex, proc.stdout)
+        self.assertNotIn("REAL:%s:" % self.real, proc.stdout)
 
     def test_bypass_env(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SHIM_BYPASS": "1"})

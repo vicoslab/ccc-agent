@@ -1,22 +1,64 @@
 #!/bin/sh
 # Generic transparent launch shim for agent CLIs (codex, claude, hermes,
-# opencode, ...). Install by symlinking this file into a PATH directory that
-# precedes the real binary, named after the tool:
+# opencode, ...). Install by symlinking this file into a trusted PATH directory
+# that precedes the real binary, named after the tool:
 #
 #   ln -s /opt/ccc-agent/shims/ccc-agent-shim.sh /usr/local/bin/codex
 #
 # Behavior:
-#   - resolves the real binary as the next match in PATH after this shim,
-#     also checking ~/.local/bin for user-level agent installs;
-#   - nested agents (CCC_AGENT_SESSION set) run directly: the launcher reuses
-#     the existing session, so no new branch bundle is created;
-#   - CCC_AGENT_SHIM_BYPASS=1 skips containment entirely (debug only; policy
-#     may forbid it on managed deployments).
+#   - outside an active ccc-agent session, only redirects to
+#     `ccc-agent run --agent <name> -- <name> ...` and announces that redirect;
+#   - exports a PATH with this shim directory removed so the contained launch can
+#     resolve the real binary from the user's active PATH/conda env;
+#   - nested agents (CCC_AGENT_SESSION set) run the real command directly from
+#     that unshimmed PATH, so no new branch bundle is created;
+#   - CCC_AGENT_SHIM_BYPASS=1 skips containment entirely (debug only; policy may
+#     forbid it on managed deployments).
 set -eu
 
 AGENT_NAME="$(basename "$0")"
-SHIM_PATH="$(command -v -- "$AGENT_NAME" || true)"
+SHIM_PATH="$(command -v -- "$AGENT_NAME" 2>/dev/null || true)"
+SHIM_DIR=""
+case "$SHIM_PATH" in
+    */*) SHIM_DIR="${SHIM_PATH%/*}" ;;
+esac
 CODEX_DISABLE_INNER_SANDBOX_ARG="--dangerously-bypass-approvals-and-sandbox"
+
+ccc_agent_path_without_this_shim() {
+    _input_path=${1:-}
+    _out_path=""
+    _old_ifs="$IFS"
+    IFS=:
+    for _dir in $_input_path; do
+        [ -n "$_dir" ] || _dir=.
+        _skip=0
+        if [ -n "$SHIM_DIR" ] && [ "$_dir" = "$SHIM_DIR" ]; then
+            _skip=1
+        fi
+        if [ "$_skip" = 0 ] && [ -n "${CCC_AGENT_SHIM_DIR:-}" ] && [ "$_dir" = "$CCC_AGENT_SHIM_DIR" ]; then
+            _skip=1
+        fi
+        _candidate="$_dir/$AGENT_NAME"
+        if [ "$_skip" = 0 ] && [ -n "$SHIM_PATH" ] && [ -e "$_candidate" ]; then
+            if [ "$_candidate" -ef "$SHIM_PATH" ] 2>/dev/null; then
+                _skip=1
+            fi
+        fi
+        [ "$_skip" = 0 ] || continue
+        if [ -z "$_out_path" ]; then
+            _out_path="$_dir"
+        else
+            _out_path="$_out_path:$_dir"
+        fi
+    done
+    IFS="$_old_ifs"
+    printf '%s\n' "$_out_path"
+}
+
+UNSHIMMED_PATH="${CCC_AGENT_SHIM_UNDERLYING_PATH:-}"
+if [ -z "$UNSHIMMED_PATH" ]; then
+    UNSHIMMED_PATH="$(ccc_agent_path_without_this_shim "${PATH:-}")"
+fi
 
 codex_inner_sandbox_state() {
     # Return codes:
@@ -46,53 +88,35 @@ codex_inner_sandbox_state() {
     return 0
 }
 
-# Find the real binary: first PATH entry whose $AGENT_NAME is not this shim.
-# Also check ~/.local/bin because Codex/Claude are commonly installed there,
-# and CCC startup/service environments may not include it in PATH.
-REAL_BIN=""
-SEARCH_PATH="$PATH"
-if [ -n "${HOME:-}" ]; then
-    USER_LOCAL_BIN="${HOME%/}/.local/bin"
-    case ":$SEARCH_PATH:" in
-        *":$USER_LOCAL_BIN:"*) ;;
-        *) SEARCH_PATH="$SEARCH_PATH:$USER_LOCAL_BIN" ;;
-    esac
-fi
-OLD_IFS="$IFS"; IFS=:
-for dir in $SEARCH_PATH; do
-    candidate="$dir/$AGENT_NAME"
-    [ -x "$candidate" ] || continue
-    if [ "$candidate" != "$SHIM_PATH" ] && [ ! "$candidate" -ef "$SHIM_PATH" ]; then
-        REAL_BIN="$candidate"
-        break
-    fi
-done
-IFS="$OLD_IFS"
-
-if [ -z "$REAL_BIN" ]; then
-    echo "ccc-agent-shim: no real '$AGENT_NAME' binary found in PATH or ~/.local/bin" >&2
-    exit 127
-fi
+exec_underlying_agent() {
+    PATH="$UNSHIMMED_PATH"
+    export PATH
+    exec "$AGENT_NAME" "$@"
+}
 
 if [ "${CCC_AGENT_SHIM_BYPASS:-0}" = "1" ]; then
-    echo "ccc-agent-shim: bypass enabled, running $REAL_BIN unprotected" >&2
-    exec "$REAL_BIN" "$@"
+    echo "ccc-agent-shim: bypass enabled, running '$AGENT_NAME' from unshimmed PATH" >&2
+    exec_underlying_agent "$@"
 fi
 
 if [ -n "${CCC_AGENT_SESSION:-}" ]; then
-    # already inside a contained session: run directly, stay in the branch
+    # Already inside a contained session: run the underlying agent command from
+    # the unshimmed PATH, staying in the existing branch instead of redirecting
+    # to another ccc-agent run.
     set +e
     codex_inner_sandbox_state "$@"
     codex_sandbox_state=$?
     set -e
     if [ "$codex_sandbox_state" = "0" ]; then
         echo "ccc-agent-shim: nested codex inside ccc-agent; disabling Codex inner sandbox (outer containment active)" >&2
-        exec "$REAL_BIN" "$CODEX_DISABLE_INNER_SANDBOX_ARG" "$@"
+        PATH="$UNSHIMMED_PATH"
+        export PATH
+        exec "$AGENT_NAME" "$CODEX_DISABLE_INNER_SANDBOX_ARG" "$@"
     elif [ "$codex_sandbox_state" = "2" ]; then
         echo "ccc-agent-shim: refusing nested Codex sandbox inside ccc-agent; use --yolo/--sandbox danger-full-access or omit --sandbox so the shim can disable Codex's inner sandbox" >&2
         exit 2
     fi
-    exec "$REAL_BIN" "$@"
+    exec_underlying_agent "$@"
 fi
 
 LAUNCH="${CCC_AGENT_CLI:-ccc-agent}"
@@ -102,5 +126,6 @@ if ! command -v "$LAUNCH" >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "ccc-agent-shim: containing '$AGENT_NAME' via $LAUNCH (real: $REAL_BIN)" >&2
-exec "$LAUNCH" run --agent "$AGENT_NAME" -- "$REAL_BIN" "$@"
+export CCC_AGENT_SHIM_UNDERLYING_PATH="$UNSHIMMED_PATH"
+echo "ccc-agent-shim: redirect active for '$AGENT_NAME' via $LAUNCH run --agent $AGENT_NAME -- $AGENT_NAME" >&2
+exec "$LAUNCH" run --agent "$AGENT_NAME" -- "$AGENT_NAME" "$@"

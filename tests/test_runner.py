@@ -656,6 +656,23 @@ class TestBwrapConfinement(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 7)
 
+    def test_bwrap_uses_unshimmed_path_export_for_agent_lookup(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        path = "/tmp/conda-agent-bin:/usr/bin:/bin"
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["codex"], agent_kind="codex"),
+                        env={"CCC_AGENT_SHIM_UNDERLYING_PATH": path})
+
+        argv = seen["argv"]
+        path_i = next(k for k in range(len(argv) - 2)
+                      if argv[k] == "--setenv" and argv[k + 1] == "PATH")
+        self.assertEqual(argv[path_i + 2], path)
+
     def test_bwrap_mode_builds_sandbox_and_wraps_command(self):
         seen = {}
 
@@ -1019,6 +1036,8 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertIn("/home/domen/.claude", cfg.agent_state_binds)
         self.assertIn("/home/domen/.hermes", cfg.agent_state_binds)
         self.assertIn("/home/domen/.claude.json", cfg.agent_state_binds)
+        self.assertIn("/home/domen/.local/bin/codex",
+                      cfg.agent_state_binds)
         self.assertIn("/home/domen/.local/bin/claude",
                       cfg.agent_state_binds)
         self.assertIn("/home/domen/.local/share/claude",
@@ -1151,6 +1170,29 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.h.base,
                                                      ".local", "share",
                                                      "claude")))
+
+    def test_codex_local_bin_delta_is_ignored_when_optional_bind_missing(self):
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0)
+
+        def codex_runtime_delta(session):
+            root = session.protected_roots["storage_user"]
+            path = os.path.join(root.mount, ".local", "bin", "codex")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n")
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(self._bwrap_config(
+                ["codex"], agent_kind="codex", agent_state_binds=[]),
+                before_finalize=codex_runtime_delta)
+
+        self.assertEqual(session.state, "auto-committed")
+        self.assertIn("/storage/user/.local/bin/codex",
+                      session.policy["ignore_patterns"])
+        self.assertFalse(os.path.exists(os.path.join(self.h.base,
+                                                     ".local", "bin",
+                                                     "codex")))
 
     def test_claude_runtime_ignores_do_not_hide_neighbor_local_data(self):
         def fake_run(argv, **kwargs):
