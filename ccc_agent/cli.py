@@ -1599,9 +1599,13 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
     lp.add_argument("session_id", nargs="?", metavar="session-id-prefix",
                     help="optional session id prefix filter")
     cp = _add_ctl_parser(sub, "cleanup")
-    cp.add_argument("--older-than", metavar="DAYS", type=_nonnegative_days,
-                    default=30,
-                    help="remove closed sessions older than DAYS (default: 30)")
+    cp.add_argument("-o", "--older-than", metavar="DAYS",
+                    type=_nonnegative_days, default=30,
+                    help="remove sessions older than DAYS (default: 30)")
+    cp.add_argument("-a", "--all-type", "--all-types", dest="all_types",
+                    action="store_true",
+                    help="include every session state, not only closed "
+                         "terminal sessions")
     cp.add_argument("--dry-run", action="store_true",
                     help="show what would be removed without deleting")
     for name in _SESSION_ID_CTL_OPS:
@@ -1698,7 +1702,8 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
             controller.list(getattr(args, "session_id", None))
         elif args.cmd == "cleanup":
             controller.cleanup(older_than_days=args.older_than,
-                               dry_run=args.dry_run)
+                               dry_run=args.dry_run,
+                               all_types=args.all_types)
         elif args.cmd == "show":
             controller.show(args.session_id)
         elif args.cmd == "status":
@@ -1774,7 +1779,7 @@ _MAIN_OPS = tuple(sorted(_CTL_OPS | {
 }))
 _TOP_LEVEL_OPTIONS = ("--config", "--version", "--help")
 _GLOBAL_VALUE_OPTIONS = frozenset(("--config",))
-_CLEANUP_VALUE_OPTIONS = frozenset(("--older-than",))
+_CLEANUP_VALUE_OPTIONS = frozenset(("--older-than", "-o"))
 _REVIEW_VALUE_OPTIONS = frozenset(("--commit", "--apply-patch"))
 _RESUME_VALUE_OPTIONS = frozenset(("--agent", "--cmd"))
 _RUN_OPTIONS = (
@@ -1782,7 +1787,8 @@ _RUN_OPTIONS = (
     "--protect-agent-state", "--scope", "--verbose", "--workspace", "-v",
     "--config", "--help",
 )
-_CLEANUP_OPTIONS = ("--older-than", "--dry-run", "--config", "--help")
+_CLEANUP_OPTIONS = ("--older-than", "-o", "--all-type", "--all-types", "-a",
+                    "--dry-run", "--config", "--help")
 _DIFF_OPTIONS = ("--show-ignored", "--show-file-diffs", "--config", "--help")
 _REVIEW_OPTIONS = (
     "--accept", "--reject", "--commit", "--emit-patch", "--apply-patch",
@@ -2021,7 +2027,7 @@ def _print_main_help(stream=None):
         "repeat IDs to batch\n"
         "  thaw             reopen a pending-review branch for more work\n"
         "  cleanup          remove old terminal session bundles after an age "
-        "check\n\n"
+        "check; use --all-type to include failed/non-terminal sessions\n\n"
         "Plugin/hook ops (normally invoked by agent plugins/hooks):\n"
         "  turn-finalize   inside session: finalize the current turn via the "
         "control socket\n"
@@ -2046,6 +2052,7 @@ def _print_main_help(stream=None):
         "  ccc-agent review <session> --accept\n"
         "  ccc-agent diff <session> <path>\n"
         "  ccc-agent cleanup --older-than 30 --dry-run\n"
+        "  ccc-agent cleanup -a -o 20           # include failed/non-terminal sessions\n"
         "  ccc-agent setup --system --enable-shims\n")
 
 

@@ -30,7 +30,7 @@ from .policy import (Change, IgnoredChange, PolicyConfig, classify,
 from .previous_commits import split_previously_committed_changes
 from .runner import finalize_session, _rewrite_review_for_permission_failures
 from .paths import is_within
-from .session import TERMINAL_STATES
+from .session import STATES, TERMINAL_STATES
 
 # turn-check outcomes (stable strings for hook adapters and logs)
 CHECK_ALLOW = "allow"          # change set clean: finish normally
@@ -38,7 +38,8 @@ CHECK_REPAIR = "repair"        # dirty, budget left: agent should revert
 CHECK_EXHAUSTED = "exhausted"  # dirty, budget spent: defer to human review
 
 # States whose BranchFS branches should already be closed/discarded. Failed and
-# pending-review sessions are deliberately kept for manual recovery/review.
+# pending-review sessions are deliberately kept for manual recovery/review unless
+# the operator passes cleanup --all-type.
 CLEANUP_STATES = ("auto-committed", "committed", "aborted")
 # While a session is live or being finalized, BranchFS status is the source of
 # truth.  Review artifacts from a previous freeze may still exist after `thaw`,
@@ -450,8 +451,9 @@ class Controller(object):
                          session.agent_kind, session.created_at))
         return sessions
 
-    def cleanup(self, older_than_days=30, dry_run=False, out=None, now=None):
-        """Remove old closed session bundles from the session state dir."""
+    def cleanup(self, older_than_days=30, dry_run=False, out=None, now=None,
+                all_types=False):
+        """Remove old session bundles from the session state dir."""
         out = out or sys.stdout
         try:
             older_than_days = int(older_than_days)
@@ -460,13 +462,14 @@ class Controller(object):
         if older_than_days < 0:
             raise ControlError("cleanup --older-than must be a non-negative day count")
 
+        cleanup_states = STATES if all_types else CLEANUP_STATES
         cutoff = (time.time() if now is None else now) - older_than_days * 86400
         matched = []
         skipped = []
         failed = []
         verb = "would remove" if dry_run else "removed"
         for session in self.store.list():
-            if session.state not in CLEANUP_STATES:
+            if session.state not in cleanup_states:
                 continue
             stamp = session.finished_at or session.created_at
             seconds = _utc_seconds(stamp)

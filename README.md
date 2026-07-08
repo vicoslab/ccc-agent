@@ -74,6 +74,7 @@ ccc-agent commit <session> [<session> ...]  # scripted commit one or more pendin
 ccc-agent abort <session> [<session> ...]   # scripted discard one or more sessions
 ccc-agent cleanup --older-than 30           # remove old closed session bundles
 ccc-agent cleanup --older-than 30 --dry-run # preview without deleting
+ccc-agent cleanup -a -o 20                  # include failed/non-terminal sessions
 ```
 
 On an interactive TTY, plain `ccc-agent review <session>` first shows the same
@@ -253,7 +254,7 @@ The completion hook reads the configured session store and completes optional
 `session-id` prefixes for `list`/`ls`, plus required `session-id` arguments for
 `show`, `status`, `diff`, `review`, `commit`, `abort`, `thaw`, `finish`,
 `turn-record`, and `turn-check`. It also completes `cleanup` options
-such as `--older-than` and `--dry-run`.
+such as `--older-than`/`-o`, `--all-type`/`-a`, and `--dry-run`.
 
 `ccc-agent setup` does what pip can't: writes `config.json` with the
 `agent_plugins` map, makes the bundled plugin hook scripts executable, and
