@@ -13,6 +13,11 @@ license = { text = "MIT" }
 # python3 (and can be installed system-wide without pulling a dependency tree).
 dependencies = []
 
+[project.optional-dependencies]
+branchfs = [
+    "vicoslab-branchfs-bin @ https://github.com/vicoslab/branchfs/releases/download/v0.1.2/vicoslab_branchfs_bin-0.1.2-py3-none-linux_x86_64.whl ; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
 [project.scripts]
 ccc-agent = "ccc_agent.cli:main"
 

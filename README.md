@@ -35,6 +35,25 @@ agent-visible filesystem view but must call `ccc-agent turn-*`.
 
 ## Quick start
 
+Install the supervisor only when you will provide `branchfs` yourself:
+
+```bash
+pip install 'ccc-agent @ git+https://github.com/vicoslab/ccc-agent.git'
+```
+
+Install with the matching vicoslab BranchFS release binary bundled from the
+`vicoslab/branchfs` GitHub release:
+
+```bash
+pip install 'ccc-agent[branchfs] @ git+https://github.com/vicoslab/ccc-agent.git'
+```
+
+The `branchfs` extra downloads the prebuilt `vicoslab-branchfs-bin` wheel. It
+does not compile Rust and does not bundle `libfuse3`; install `libfuse3-3`/`fuse3`
+or the equivalent host package separately. If the extra is not installed,
+`ccc-agent setup` records the `branchfs` binary it finds on `PATH` or at
+`/usr/local/bin/branchfs`, and you can override it with `--branchfs-bin`.
+
 Run agent in current directory:
 
 ```bash

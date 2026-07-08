@@ -39,6 +39,7 @@ import tty
 from importlib import resources
 
 from .version import version_string
+from . import branchfs_runtime
 from .branchfs import BranchfsCli, FakeBranchFS
 from .commit_failures import has_permission_failures, permission_failures
 from .control import (ControlClient, VERDICT_COMMITTED, VERDICT_DISCARDED,
@@ -139,7 +140,7 @@ def build_runtime(config):
         backend = FakeBranchFS()
     else:
         backend = BranchfsCli(
-            binary=config.get("branchfs_bin", "branchfs"),
+            binary=config.get("branchfs_bin") or branchfs_runtime.default_branchfs_bin(),
             timeout_seconds=config.get("branchfs_timeout_seconds", 30))
     user = config.get("user") or getpass.getuser()
     alias_map = AliasMap.for_home(user,

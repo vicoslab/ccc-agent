@@ -93,6 +93,59 @@ class TestCondaShimActivation(unittest.TestCase):
 
 
 class TestSetupConfig(unittest.TestCase):
+    def test_setup_prefers_packaged_vicoslab_branchfs_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home)
+            bundled = os.path.join(tmp, "branchfs")
+            with open(bundled, "w") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(bundled, 0o755)
+            config_path = os.path.join(tmp, "config.json")
+            with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False), \
+                    mock.patch("ccc_agent.setup.branchfs_runtime.packaged_branchfs_bin",
+                               return_value=bundled), \
+                    mock.patch("ccc_agent.setup.branchfs_runtime.libfuse3_status",
+                               return_value=(True, "libfuse3.so.3")):
+                rc = setup_mod.main([
+                    "--user",
+                    "--config", config_path,
+                    "--state-dir", os.path.join(tmp, "state"),
+                    "--no-hooks",
+                ])
+            self.assertEqual(rc, 0)
+            with open(config_path) as fh:
+                cfg = json.load(fh)
+            self.assertEqual(cfg["branchfs_bin"], bundled)
+
+    def test_setup_warns_when_packaged_branchfs_needs_libfuse3(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home)
+            bundled = os.path.join(tmp, "branchfs")
+            with open(bundled, "w") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(bundled, 0o755)
+            config_path = os.path.join(tmp, "config.json")
+            stderr = tempfile.TemporaryFile(mode="w+")
+            with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False), \
+                    mock.patch("ccc_agent.setup.branchfs_runtime.packaged_branchfs_bin",
+                               return_value=bundled), \
+                    mock.patch("ccc_agent.setup.branchfs_runtime.libfuse3_status",
+                               return_value=(False, "libfuse3.so.3 not found")), \
+                    mock.patch("sys.stderr", stderr):
+                rc = setup_mod.main([
+                    "--user",
+                    "--config", config_path,
+                    "--state-dir", os.path.join(tmp, "state"),
+                    "--no-hooks",
+                ])
+            self.assertEqual(rc, 0)
+            stderr.seek(0)
+            self.assertIn("WARNING packaged BranchFS requires libfuse3",
+                          stderr.read())
+            stderr.close()
+
     def test_bundled_codex_hook_uses_plugin_root_command_path(self):
         hooks_json = os.path.join(
             setup_mod.plugins_dir(), "codex-ccc-containment", "hooks", "hooks.json")

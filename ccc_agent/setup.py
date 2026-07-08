@@ -25,6 +25,8 @@ import sys
 from importlib import resources
 from shutil import which
 
+from . import branchfs_runtime
+
 
 def assets_dir():
     """On-disk path to the bundled shell assets (real files in a wheel install)."""
@@ -61,6 +63,42 @@ def _resolve(name, override=None, fallbacks=()):
         if cand and os.path.exists(cand):
             return cand
     return name  # bare name: resolved on PATH at runtime
+
+
+def _resolve_branchfs(override=None):
+    if override:
+        return override
+    bundled = branchfs_runtime.packaged_branchfs_bin()
+    if bundled:
+        return bundled
+    return _resolve("branchfs", None, ["/usr/local/bin/branchfs"])
+
+
+def _warn_branchfs_runtime(binary):
+    packaged = branchfs_runtime.is_packaged_branchfs_bin(binary)
+    if packaged:
+        ok, detail = branchfs_runtime.libfuse3_status()
+        if not ok:
+            sys.stderr.write(
+                "ccc-agent setup: WARNING packaged BranchFS requires libfuse3 "
+                "at runtime; install the system libfuse3 package (details: %s)\n"
+                % detail)
+        version = branchfs_runtime.packaged_branchfs_version()
+    else:
+        version = branchfs_runtime.probe_branchfs_version(binary)
+    expected = branchfs_runtime.EXPECTED_BRANCHFS_VERSION
+    if version and version != expected:
+        sys.stderr.write(
+            "ccc-agent setup: WARNING BranchFS version %s was found, but "
+            "ccc-agent expects vicoslab BranchFS %s. Install "
+            "ccc-agent[branchfs] or pass --branchfs-bin for the matching "
+            "vicoslab/branchfs release.\n" % (version, expected))
+    elif version is None and not packaged and binary != "branchfs":
+        sys.stderr.write(
+            "ccc-agent setup: WARNING could not verify BranchFS version for "
+            "%s; ccc-agent expects vicoslab BranchFS %s. Install "
+            "ccc-agent[branchfs] to use the pinned GitHub release binary.\n"
+            % (binary, expected))
 
 
 def _write_json(path, data):
@@ -534,8 +572,8 @@ def main(argv=None, prog="ccc-agent setup"):
         config_file = args.config or os.path.join(
             home, ".config", "ccc-agent", "config.json")
 
-    branchfs_bin = _resolve("branchfs", args.branchfs_bin,
-                            ["/usr/local/bin/branchfs"])
+    branchfs_bin = _resolve_branchfs(args.branchfs_bin)
+    _warn_branchfs_runtime(branchfs_bin)
     bwrap_bin = _resolve("bwrap", args.bwrap_bin)
 
     config = build_config(mode, user, home, branchfs_bin, bwrap_bin,

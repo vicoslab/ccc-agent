@@ -96,6 +96,30 @@ class TestBuildRuntime(unittest.TestCase):
             self.assertEqual(backend.binary, "/bin/branchfs-test")
             self.assertEqual(backend.timeout_seconds, 42)
 
+    def test_missing_branchfs_bin_uses_packaged_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "state_dir": os.path.join(tmp, "state"),
+                "backend": "branchfs",
+                "branchfs_timeout_seconds": 42,
+                "user": "domen",
+                "home_subdir": "",
+                "roots": [{
+                    "name": "storage_user",
+                    "base": os.path.join(tmp, "base"),
+                    "store": os.path.join(tmp, "store"),
+                    "visible": "/storage/user",
+                }],
+            }
+
+            with mock.patch("ccc_agent.cli.branchfs_runtime.default_branchfs_bin",
+                            return_value="/opt/vicoslab/branchfs"):
+                _store, backend, _alias_map, _user, _roots = build_runtime(config)
+
+            self.assertIsInstance(backend, BranchfsCli)
+            self.assertEqual(backend.binary, "/opt/vicoslab/branchfs")
+            self.assertEqual(backend.timeout_seconds, 42)
+
 
 class TestShellDefault(unittest.TestCase):
     def test_default_shell_prefers_current_parent_over_login_shell_env(self):
