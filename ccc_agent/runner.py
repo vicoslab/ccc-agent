@@ -40,6 +40,8 @@ ENV_SESSION = "CCC_AGENT_SESSION"
 ENV_STATE_DIR = "CCC_AGENT_STATE_DIR"
 ENV_CONTROL_SOCK = "CCC_AGENT_CONTROL_SOCK"
 ENV_CONTROL_TOKEN = "CCC_AGENT_CONTROL_TOKEN"
+ENV_SHIM_UNDERLYING_PATH = "CCC_AGENT_SHIM_UNDERLYING_PATH"
+BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox.
 # The host-side socket lives under the state dir, outside the sandbox.  Keep the
@@ -272,8 +274,11 @@ AGENT_STATE_DIRS = (
     ".local/share/claude", ".local/state/claude",
     ".cache/claude-cli-nodejs",
 )
-AGENT_STATE_FILES = (".claude.json", ".local/bin/claude")
+AGENT_STATE_FILES = (".claude.json", ".local/bin/codex", ".local/bin/claude")
 AGENT_STATE_PATHS = AGENT_STATE_DIRS + AGENT_STATE_FILES
+CODEX_RUNTIME_STATE_PATHS = (
+    ".local/bin/codex",
+)
 CLAUDE_RUNTIME_STATE_PATHS = (
     ".claude", ".claude.json", ".local/bin/claude",
     ".local/share/claude", ".local/state/claude",
@@ -526,37 +531,57 @@ def _canonical_protected_path(path, session, config):
     return None
 
 
+def _is_agent_kind(config, name):
+    """Best-effort detection of a contained invocation for one agent kind."""
+    token = name.lower()
+    if _agent_token(config.agent_kind) == token:
+        return True
+    return token in _inferred_agent_plugin_names(config)
+
+
 def _is_claude_agent(config):
     """Best-effort detection of a contained Claude Code invocation."""
-    if _agent_token(config.agent_kind) == "claude":
-        return True
-    return "claude" in _inferred_agent_plugin_names(config)
+    return _is_agent_kind(config, "claude")
 
 
-def _add_claude_runtime_state_ignores(session, config, ignore):
-    """Drop narrowly-known Claude Code runtime files from BranchFS review.
+def _is_codex_agent(config):
+    """Best-effort detection of a contained Codex invocation."""
+    return _is_agent_kind(config, "codex")
 
-    Optional shared binds are skipped when the source is absent.  If Claude then
-    creates the path inside the BranchFS home view during this run, it is still
-    runtime/config noise rather than a user deliverable.  Add only exact Claude
-    runtime paths (not broad ``.local`` or ``.cache`` parents) and only in the
-    default shared-state mode; ``--protect-agent-state`` intentionally leaves
-    agent state reviewable.
-    """
-    if config.protect_agent_state or not _is_claude_agent(config):
-        return
+
+def _add_runtime_state_ignores(session, config, ignore, relpaths):
     home = "/home/%s" % config.owner
-    for relpath in CLAUDE_RUNTIME_STATE_PATHS:
+    for relpath in relpaths:
         canonical = _canonical_protected_path(os.path.join(home, relpath),
                                              session, config)
         if canonical and canonical not in ignore:
             ignore.append(canonical)
 
 
+def _add_agent_runtime_state_ignores(session, config, ignore):
+    """Drop narrowly-known agent runtime files from BranchFS review.
+
+    Optional shared binds are skipped when the source is absent. If the agent
+    then creates the path inside the BranchFS home view during this run, it is
+    still runtime/config noise rather than a user deliverable. Add only exact
+    known runtime paths (not broad ``.local`` or ``.cache`` parents) and only in
+    the default shared-state mode; ``--protect-agent-state`` intentionally leaves
+    agent state reviewable.
+    """
+    if config.protect_agent_state:
+        return
+    if _is_codex_agent(config):
+        _add_runtime_state_ignores(session, config, ignore,
+                                   CODEX_RUNTIME_STATE_PATHS)
+    if _is_claude_agent(config):
+        _add_runtime_state_ignores(session, config, ignore,
+                                   CLAUDE_RUNTIME_STATE_PATHS)
+
+
 def _add_session_infra_ignores(session, config):
     """Ignore ccc-agent-owned bind/plugin/mask targets inside branch views."""
     ignore = session.policy.setdefault("ignore_patterns", [])
-    _add_claude_runtime_state_ignores(session, config, ignore)
+    _add_agent_runtime_state_ignores(session, config, ignore)
 
     def add(path):
         for canonical in _infra_ignore_paths_for(path, session, config):
@@ -740,7 +765,7 @@ def _bwrap_gid(config):
     return os.getgid()
 
 
-def _bwrap_command(session, config, control=None):
+def _bwrap_command(session, config, control=None, env=None):
     """Build a bubblewrap command that confines the agent rootlessly.
 
     This needs no container CAP_SYS_ADMIN and no privileged helper: bwrap
@@ -751,6 +776,7 @@ def _bwrap_command(session, config, control=None):
     /proc is bound from the container by default.
     """
     alias_map = config.alias_map
+    env = os.environ if env is None else env
     primary = _primary_root(session, alias_map)
     # Use the workspace path the user launched from as the in-sandbox cwd.
     # Policy/root selection still canonicalizes aliases, but the process should
@@ -871,13 +897,13 @@ def _bwrap_command(session, config, control=None):
         host_sock, token = control
         argv += ["--bind", host_sock, SANDBOX_CONTROL_SOCK]
 
+    sandbox_path = env.get(ENV_SHIM_UNDERLYING_PATH) or BWRAP_DEFAULT_PATH
     argv += ["--setenv", ENV_SESSION, session.session_id,
              "--setenv", "HOME", home,
              "--setenv", "USER", config.owner,
              "--setenv", "LOGNAME", config.owner,
-             "--setenv", "PATH",
-             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-             "--setenv", "TERM", os.environ.get("TERM", "xterm")]
+             "--setenv", "PATH", sandbox_path,
+             "--setenv", "TERM", env.get("TERM", os.environ.get("TERM", "xterm"))]
     if control is not None:
         argv += ["--setenv", ENV_CONTROL_SOCK, SANDBOX_CONTROL_SOCK,
                  "--setenv", ENV_CONTROL_TOKEN, control[1]]
@@ -1205,7 +1231,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
         if config.confinement == "bwrap":
             # bwrap assembles the namespace itself and --chdir's into the
             # workspace inside the sandbox, so no host-side cwd is set here.
-            argv = _bwrap_command(session, config, control=control)
+            argv = _bwrap_command(session, config, control=control, env=run_env)
             session.add_event("bwrap-launch", argv[0])
             session.add_event("container-run-access",
                               "enabled" if config.container_run_access
