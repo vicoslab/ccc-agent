@@ -646,8 +646,13 @@ class TestSshShellRouter(unittest.TestCase):
                      "  i=$((i + 1))\n"
                      "  printf 'ARG%d:%s\\n' \"$i\" \"$arg\"\n"
                      "done\n"
-                     "printf 'ORIG:%s\\n' \"${CCC_AGENT_SSH_ORIGINAL_COMMAND:-}\"\n")
+                     "printf 'ORIG:%s\\n' \"${CCC_AGENT_SSH_ORIGINAL_COMMAND:-}\"\n"
+                     "printf 'UNDERLYING:%s\\n' \"${CCC_AGENT_SHIM_UNDERLYING_PATH:-}\"\n")
         os.chmod(self.launcher, 0o755)
+        self.shimdir = os.path.join(self._tmp.name, "shims")
+        self.realdir = os.path.join(self._tmp.name, "real")
+        os.makedirs(self.shimdir)
+        os.makedirs(self.realdir)
         self.real_shell = os.path.join(self.bin, "real-shell")
         with open(self.real_shell, "w") as fh:
             fh.write("#!/bin/sh\n"
@@ -695,6 +700,22 @@ class TestSshShellRouter(unittest.TestCase):
     def test_routes_absolute_agent_paths(self):
         self.assert_routed("/home/domen/.local/bin/claude --version", "claude")
         self.assert_routed("/storage/user/conda-envs/codex/bin/codex --help", "codex")
+
+    def test_routed_commands_export_unshimmed_path_for_contained_lookup(self):
+        proc = self.run_router(
+            "claude --app",
+            extra_env={
+                "PATH": "%s:%s:%s:/usr/bin:/bin" % (
+                    self.shimdir, self.realdir, self.bin),
+                "CCC_AGENT_SHIM_DIR": self.shimdir,
+            },
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ARG1:run", proc.stdout)
+        self.assertIn("UNDERLYING:%s:%s:/usr/bin:/bin" %
+                      (self.realdir, self.bin), proc.stdout)
+        self.assertNotIn("UNDERLYING:%s:" % self.shimdir, proc.stdout)
 
     def test_routes_claude_remote_server_and_cli_paths(self):
         self.assert_routed(

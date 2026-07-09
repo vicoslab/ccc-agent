@@ -36,6 +36,34 @@ _passthrough() {
     exec "${_shell}" "$@"
 }
 
+_path_without_shims() {
+    _input_path=${1:-}
+    _agent=${2:-}
+    _out_path=""
+    _old_ifs="$IFS"
+    IFS=:
+    for _dir in $_input_path; do
+        [ -n "$_dir" ] || _dir=.
+        _skip=0
+        if [ -n "${CCC_AGENT_SHIM_DIR:-}" ] && [ "$_dir" = "${CCC_AGENT_SHIM_DIR}" ]; then
+            _skip=1
+        fi
+        if [ "$_skip" = 0 ] && [ -n "$_agent" ] && [ -n "${CCC_AGENT_SHIM_PATH:-}" ] && [ -e "$_dir/$_agent" ]; then
+            if [ "$_dir/$_agent" -ef "${CCC_AGENT_SHIM_PATH}" ] 2>/dev/null; then
+                _skip=1
+            fi
+        fi
+        [ "$_skip" = 0 ] || continue
+        if [ -z "$_out_path" ]; then
+            _out_path="$_dir"
+        else
+            _out_path="$_out_path:$_dir"
+        fi
+    done
+    IFS="$_old_ifs"
+    printf '%s\n' "$_out_path"
+}
+
 _detect_agent() {
     command -v python3 >/dev/null 2>&1 || return 1
     python3 - "$1" <<'PY'
@@ -212,4 +240,8 @@ fi
 
 echo "ccc-agent-ssh-shell-router: redirect active for ${agent} remote command via ccc-agent run" >&2
 export CCC_AGENT_SSH_ORIGINAL_COMMAND="${original_command}"
+if [ -z "${CCC_AGENT_SHIM_UNDERLYING_PATH:-}" ]; then
+    CCC_AGENT_SHIM_UNDERLYING_PATH="$(_path_without_shims "${PATH:-}" "${agent}")"
+    export CCC_AGENT_SHIM_UNDERLYING_PATH
+fi
 exec "${launcher}" run --agent "${agent}" -- "${shell}" -c "${original_command}"
