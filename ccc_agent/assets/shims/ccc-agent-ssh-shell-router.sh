@@ -267,10 +267,9 @@ if ! { [ -x "${launcher}" ] || command -v "${launcher}" >/dev/null 2>&1; }; then
     exit 127
 fi
 
-echo "ccc-agent-ssh-shell-router: redirect active for ${agent} remote command via ccc-agent run" >&2
 export CCC_AGENT_SSH_ORIGINAL_COMMAND="${original_command}"
 if [ -z "${CCC_AGENT_SHIM_UNDERLYING_PATH:-}" ]; then
     CCC_AGENT_SHIM_UNDERLYING_PATH="$(_path_without_shims "${PATH:-}" "${agent}")"
     export CCC_AGENT_SHIM_UNDERLYING_PATH
 fi
-exec "${launcher}" run --agent "${agent}" -- "${shell}" -c "${original_command}"
+exec "${launcher}" run --serve "${agent}" -- "${shell}" -c "${original_command}"

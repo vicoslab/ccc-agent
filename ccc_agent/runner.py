@@ -165,7 +165,8 @@ class RunnerConfig(object):
                  cred_mounts=(), cred_mask=(), cred_env=None,
                  bwrap_uid=None, bwrap_gid=None, agent_plugins=None,
                  agent_state_binds=None, protect_agent_state=False,
-                 ensure_agent_state_dirs=False, on_session_start=None):
+                 ensure_agent_state_dirs=False, on_session_start=None,
+                 server_mode=False):
         self.store = store              # SessionStore
         self.backend = backend          # BranchfsCli or FakeBranchFS
         self.alias_map = alias_map
@@ -237,6 +238,7 @@ class RunnerConfig(object):
         self.protect_agent_state = bool(protect_agent_state)
         self.ensure_agent_state_dirs = bool(ensure_agent_state_dirs)
         self.on_session_start = on_session_start
+        self.server_mode = bool(server_mode)
 
 
 def _agent_cwd(session, alias_map):
@@ -408,9 +410,10 @@ def _matched_agent_plugin(config):
     source does not exist on the host (graceful degradation -> process-exit
     review still runs), or when the direct agent command uses ``--bare`` (which
     disables plugins/hooks, so per-turn injection would be a silent no-op).
-    SSH-routed server/bootstrap commands may be labelled with ``--agent`` for
+    SSH-routed server/bootstrap commands may be labelled with ``--serve`` for
     session metadata, but they are not decorated unless argv[0] is the agent CLI
-    itself.
+    itself.  When server mode does match a direct agent command, bwrap still
+    suppresses the plugin's argv/env activation below.
     """
     if "--bare" in config.agent_command:
         return None
@@ -930,14 +933,18 @@ def _bwrap_command(session, config, control=None, env=None):
         if value:
             argv += ["--setenv", var, value]
     # Plugin activation env (e.g. HERMES_BUNDLED_PLUGINS); operator bwrap_setenv
-    # below can still override.
-    if plugin_spec is not None:
+    # below can still override. Server-mode launches may mount plugin assets, but
+    # never mutate the server protocol argv/env with agent-interactive flags.
+    plugin_launch_activation = False
+    if plugin_spec is not None and not config.server_mode:
+        plugin_launch_activation = True
         for key, value in sorted(plugin_spec.get("setenv", {}).items()):
             argv += ["--setenv", key, str(value)]
     for key, value in sorted(config.bwrap_setenv.items()):
         argv += ["--setenv", key, str(value)]
     argv += ["--chdir", workdir, "--"]
-    command = _agent_command_with_plugin(config.agent_command, plugin_spec)
+    command = _agent_command_with_plugin(
+        config.agent_command, plugin_spec if plugin_launch_activation else None)
     argv += ["/usr/bin/python3", "-c", BWRAP_AGENT_RUNNER,
              BWRAP_AGENT_RUNNER_ARG0] + command
     return argv

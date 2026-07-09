@@ -821,15 +821,15 @@ class TestSshShellRouter(unittest.TestCase):
     def assert_routed(self, command, agent):
         proc = self.run_router(command)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
         self.assertIn("ARG1:run", proc.stdout)
-        self.assertIn("ARG2:--agent", proc.stdout)
+        self.assertIn("ARG2:--serve", proc.stdout)
         self.assertIn("ARG3:%s" % agent, proc.stdout)
         self.assertIn("ARG4:--", proc.stdout)
         self.assertIn("ARG5:%s" % self.real_shell, proc.stdout)
         self.assertIn("ARG6:-c", proc.stdout)
         self.assertIn("ARG7:%s" % command, proc.stdout)
         self.assertIn("ORIG:%s" % command, proc.stdout)
-        self.assertIn("redirect active", proc.stderr)
 
     def test_routes_direct_claude_and_codex_commands(self):
         self.assert_routed("claude --app", "claude")

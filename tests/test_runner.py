@@ -985,6 +985,27 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertNotIn(src, other)
         self.assertNotIn("--plugin-dir", other)
 
+    def test_bwrap_does_not_inject_claude_plugin_into_serve_direct_agent(self):
+        src = self._make_plugin("claude-ccc-containment")
+        sandbox = "/ccc-agent/plugins/claude-ccc-containment"
+        plugins = {"claude": {"src": src, "sandbox_path": sandbox,
+                              "argv": ["--plugin-dir", sandbox]}}
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        cfg = self._bwrap_config(["claude", "-p", "x"], agent_kind="claude",
+                                 agent_plugins=plugins, server_mode=True)
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(cfg)
+
+        argv = seen["argv"]
+        self.assertIn(src, argv)  # mount-only part remains useful
+        self.assertNotIn("--plugin-dir", argv)
+        self.assertEqual(self._wrapped_agent_command(argv), ["claude", "-p", "x"])
+
     def test_bwrap_does_not_inject_claude_plugin_into_ssh_server_shell(self):
         src = self._make_plugin("claude-ccc-containment")
         sandbox = "/ccc-agent/plugins/claude-ccc-containment"
