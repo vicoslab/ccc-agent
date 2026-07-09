@@ -825,15 +825,18 @@ class TestSshShellRouter(unittest.TestCase):
         self.assertIn("ARG1:run", proc.stdout)
         self.assertIn("ARG2:--serve", proc.stdout)
         self.assertIn("ARG3:%s" % agent, proc.stdout)
-        self.assertIn("ARG4:--", proc.stdout)
-        self.assertIn("ARG5:%s" % self.real_shell, proc.stdout)
-        self.assertIn("ARG6:-c", proc.stdout)
-        self.assertIn("ARG7:%s" % command, proc.stdout)
+        self.assertIn("ARG4:--lifecycle", proc.stdout)
+        self.assertIn("ARG5:adaptive", proc.stdout)
+        self.assertIn("ARG6:--", proc.stdout)
+        self.assertIn("ARG7:%s" % self.real_shell, proc.stdout)
+        self.assertIn("ARG8:-c", proc.stdout)
+        self.assertIn("ARG9:%s" % command, proc.stdout)
         self.assertIn("ORIG:%s" % command, proc.stdout)
 
-    def test_routes_direct_claude_and_codex_commands(self):
+    def test_routes_direct_claude_codex_and_hermes_commands(self):
         self.assert_routed("claude --app", "claude")
         self.assert_routed("codex exec task", "codex")
+        self.assert_routed("hermes chat", "hermes")
 
     def test_routes_absolute_agent_paths(self):
         self.assert_routed("/home/domen/.local/bin/claude --version", "claude")
@@ -856,11 +859,21 @@ class TestSshShellRouter(unittest.TestCase):
         self.assertNotIn("UNDERLYING:%s:" % self.shimdir, proc.stdout)
 
     def test_routes_claude_remote_server_and_cli_paths(self):
-        self.assert_routed(
-            "/home/domen/.claude/remote/srv/abc123/server --stdio", "claude")
+        for operation in (
+                "--version",
+                "--install --cli-dir /home/domen/.claude/remote/ccd-cli",
+                "--stop --socket /home/domen/.claude/remote/run/x/rpc.sock",
+                "--serve --socket /home/domen/.claude/remote/run/x/rpc.sock",
+                "--bridge --socket /home/domen/.claude/remote/run/x/rpc.sock"):
+            self.assert_routed(
+                "/home/domen/.claude/remote/srv/abc123/server %s" % operation,
+                "claude")
         self.assert_routed(
             "bash -lc '/home/domen/.claude/remote/ccd-cli/2.1.202 --continue'",
             "claude")
+
+    def test_routes_absolute_hermes_path(self):
+        self.assert_routed("/home/domen/.local/bin/hermes --version", "hermes")
 
     def test_routes_codex_state_executables(self):
         self.assert_routed(
@@ -883,11 +896,15 @@ class TestSshShellRouter(unittest.TestCase):
         self.assert_routed(command, "codex")
 
     def test_does_not_route_mentions_that_are_not_executables(self):
-        proc = self.run_router("grep claude ~/.claude/remote/run/log")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("SHELLARG1:-c", proc.stdout)
-        self.assertIn("SHELLARG2:grep claude ~/.claude/remote/run/log", proc.stdout)
-        self.assertNotIn("ARG1:run", proc.stdout)
+        for command in (
+                "grep claude ~/.claude/remote/run/log",
+                "echo codex app-server proxy",
+                "printf '%s\\n' hermes"):
+            proc = self.run_router(command)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("SHELLARG1:-c", proc.stdout)
+            self.assertIn("SHELLARG2:%s" % command, proc.stdout)
+            self.assertNotIn("ARG1:run", proc.stdout)
 
     def test_disabled_or_nested_sessions_pass_through(self):
         proc = self.run_router("claude --app", enabled=False)

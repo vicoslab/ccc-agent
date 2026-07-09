@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -618,6 +619,152 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertIn("child = subprocess.Popen", argv[sep + 3])
         self.assertEqual(argv[sep + 4], "ccc-agent-runner")
         return argv[sep + 5:]
+
+    def _fake_bwrap(self):
+        path = os.path.join(self._tmp.name, "fake-bwrap.py")
+        with open(path, "w") as fh:
+            fh.write(r'''#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+env = dict(os.environ)
+binds = {}
+i = 0
+while i < len(args) and args[i] != "--":
+    token = args[i]
+    if token == "--setenv":
+        env[args[i + 1]] = args[i + 2]
+        i += 3
+    elif token in ("--bind", "--ro-bind", "--dev-bind"):
+        binds[args[i + 2]] = args[i + 1]
+        i += 3
+    elif token in ("--uid", "--gid", "--chdir", "--proc", "--dev",
+                   "--tmpfs", "--dir", "--symlink"):
+        i += 2 if token not in ("--symlink",) else 3
+    else:
+        i += 1
+command = args[i + 1:]
+command = [binds.get(part, part) for part in command]
+for key, value in list(env.items()):
+    env[key] = binds.get(value, value)
+os.execvpe(command[0], command, env)
+''')
+        os.chmod(path, 0o755)
+        return path
+
+    def _wait_terminal(self, session_id, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            session = self.h.store.load(session_id)
+            if session.state in ("auto-committed", "committed",
+                                 "pending-review", "aborted", "failed"):
+                return session
+            time.sleep(0.01)
+        self.fail("adaptive supervisor did not finalize session %s" % session_id)
+
+    def test_adaptive_requires_bwrap(self):
+        with self.assertRaisesRegex(ValueError, "requires bwrap"):
+            self.h.config(["true"], lifecycle="adaptive")
+
+    def test_adaptive_tty_run_uses_foreground_lifecycle(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = self._bwrap_config(["true"], lifecycle="adaptive")
+        with mock.patch.object(os, "isatty", return_value=True), \
+                mock.patch.object(os, "fork",
+                                  side_effect=AssertionError("must not detach TTY")), \
+                mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(config)
+
+        self.assertEqual(session.state, "auto-committed")
+        self.assertIn(BWRAP_AGENT_RUNNER, seen["argv"])
+
+    def test_adaptive_clean_detach_returns_running_then_finalizes(self):
+        code = r'''
+import subprocess, sys
+subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(0.35)"],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL, start_new_session=True)
+'''
+        config = self.h.config(
+            [sys.executable, "-c", code], confinement="bwrap",
+            bwrap_bin=self._fake_bwrap(), lifecycle="adaptive",
+            adaptive_bootstrap_seconds=0.5,
+            adaptive_stability_seconds=0.03,
+            adaptive_detach_seconds=0.2,
+            per_turn=False)
+
+        started = time.monotonic()
+        session = run_session(config)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(session.state, "running")
+        self.assertLess(elapsed, 0.3)
+        finished = self._wait_terminal(session.session_id)
+        self.assertEqual(finished.state, "auto-committed")
+        self.assertEqual(finished.exit_status, 0)
+        self.assertTrue(any(e["event"] == "adaptive-handoff"
+                            for e in finished.events))
+
+    def test_adaptive_services_use_independent_concurrent_sessions(self):
+        code = r'''
+import subprocess, sys
+subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(0.3)"],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL, start_new_session=True)
+'''
+        def config():
+            return self.h.config(
+                [sys.executable, "-c", code], confinement="bwrap",
+                bwrap_bin=self._fake_bwrap(), lifecycle="adaptive",
+                adaptive_bootstrap_seconds=0.5,
+                adaptive_stability_seconds=0.02,
+                adaptive_detach_seconds=0.15,
+                per_turn=False)
+
+        first = run_session(config())
+        second = run_session(config())
+
+        self.assertNotEqual(first.session_id, second.session_id)
+        self.assertEqual(first.state, "running")
+        self.assertEqual(second.state, "running")
+        self.assertEqual(self._wait_terminal(first.session_id).state,
+                         "auto-committed")
+        self.assertEqual(self._wait_terminal(second.session_id).state,
+                         "auto-committed")
+
+    def test_adaptive_foreground_exit_does_not_wait_for_leaked_helper(self):
+        code = r'''
+import subprocess, sys, time
+subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL, start_new_session=True)
+time.sleep(0.18)
+'''
+        config = self.h.config(
+            [sys.executable, "-c", code], confinement="bwrap",
+            bwrap_bin=self._fake_bwrap(), lifecycle="adaptive",
+            adaptive_bootstrap_seconds=0.05,
+            adaptive_stability_seconds=0.02,
+            adaptive_detach_seconds=0.08,
+            per_turn=False)
+
+        started = time.monotonic()
+        session = run_session(config)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(session.state, "auto-committed")
+        self.assertTrue(any(e["event"] == "adaptive-foreground-locked"
+                            for e in session.events))
 
     def test_bwrap_needs_no_script_or_uid(self):
         # Unlike chroot, bwrap is rootless: it must not require uid/gid/script.

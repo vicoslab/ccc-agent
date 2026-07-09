@@ -953,6 +953,19 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
                         help="do not bind the existing container /run, /var, "
                              "or /dev into the bwrap sandbox; restores the "
                              "stricter no-ambient-runtime-sockets behavior")
+    parser.add_argument("--lifecycle", choices=("foreground", "adaptive"),
+                        default="foreground",
+                        help="process lifecycle: foreground kills leftover "
+                             "children when the command exits; adaptive allows "
+                             "a clean early daemon handoff (default: foreground)")
+    parser.add_argument("--adaptive-bootstrap-seconds", type=float,
+                        help="seconds before an adaptive command is permanently "
+                             "classified as foreground")
+    parser.add_argument("--adaptive-stability-seconds", type=float,
+                        help="minimum stable descendant time before handoff")
+    parser.add_argument("--adaptive-detach-seconds", type=float,
+                        help="maximum time for a handoff candidate to release "
+                             "stdout and stderr")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="print the full session event log (always shows "
                              "the error detail on failure)")
@@ -1031,7 +1044,20 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
         on_session_start=(None if server_mode else
                           lambda session: _write_session_start_banner(
                               session, alias_map, confinement)),
-        server_mode=server_mode)
+        server_mode=server_mode,
+        lifecycle=args.lifecycle,
+        adaptive_bootstrap_seconds=(
+            args.adaptive_bootstrap_seconds
+            if args.adaptive_bootstrap_seconds is not None else
+            config.get("adaptive_bootstrap_seconds", 2.0)),
+        adaptive_stability_seconds=(
+            args.adaptive_stability_seconds
+            if args.adaptive_stability_seconds is not None else
+            config.get("adaptive_stability_seconds", 0.2)),
+        adaptive_detach_seconds=(
+            args.adaptive_detach_seconds
+            if args.adaptive_detach_seconds is not None else
+            config.get("adaptive_detach_seconds", 2.0)))
     before_finalize = None
     if server_mode:
         before_finalize = lambda session: _default_keep_before_finish(
@@ -1904,13 +1930,15 @@ _CLEANUP_VALUE_OPTIONS = frozenset(("--older-than", "-o"))
 _REVIEW_VALUE_OPTIONS = frozenset(("--commit", "--apply-patch"))
 _RESUME_VALUE_OPTIONS = frozenset(("--agent", "--cmd"))
 _RUN_VALUE_OPTIONS = frozenset((
-    "--agent", "--config", "--hide", "--policy", "--scope", "--serve",
-    "--workspace",
+    "--adaptive-bootstrap-seconds", "--adaptive-detach-seconds",
+    "--adaptive-stability-seconds", "--agent", "--config", "--hide",
+    "--lifecycle", "--policy", "--scope", "--serve", "--workspace",
 ))
 _RUN_OPTIONS = (
-    "--agent", "--serve", "--full-isolation", "--hide", "--policy",
-    "--protect-agent-state", "--scope", "--verbose", "--workspace", "-v",
-    "--config", "--help",
+    "--adaptive-bootstrap-seconds", "--adaptive-detach-seconds",
+    "--adaptive-stability-seconds", "--agent", "--serve", "--lifecycle",
+    "--full-isolation", "--hide", "--policy", "--protect-agent-state",
+    "--scope", "--verbose", "--workspace", "-v", "--config", "--help",
 )
 _CLEANUP_OPTIONS = ("--older-than", "-o", "--all-type", "--all-types", "-a",
                     "--dry-run", "--config", "--help")

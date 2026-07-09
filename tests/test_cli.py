@@ -266,6 +266,38 @@ class TestMainRun(unittest.TestCase):
                          "committed")
         self.assertEqual(decisions.get("/storage/user/escape.txt"), "kept")
 
+    def test_serve_and_adaptive_lifecycle_are_orthogonal(self):
+        with open(self.h.config_path) as fh:
+            data = json.load(fh)
+        data["confinement"] = "bwrap"
+        with open(self.h.config_path, "w") as fh:
+            json.dump(data, fh)
+        seen = []
+
+        def fake_run_session(config, env=None, before_finalize=None):
+            seen.append(config)
+            return SimpleNamespace(
+                session_id="agent-lifecycle", workspace=config.workspace,
+                protected_roots={}, state="auto-committed", events=[],
+                exit_status=0, agent_kind=config.agent_kind, policy={})
+
+        with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
+            self.assertEqual(main_run([
+                "--config", self.h.config_path,
+                "--serve", "claude", "--lifecycle", "adaptive",
+                "--", "tool", "--lifecycle", "child-value",
+            ], env={}), 0)
+            self.assertEqual(main_run([
+                "--config", self.h.config_path,
+                "--serve", "claude", "--", "true",
+            ], env={}), 0)
+
+        self.assertEqual(seen[0].lifecycle, "adaptive")
+        self.assertEqual(seen[0].agent_command,
+                         ["tool", "--lifecycle", "child-value"])
+        self.assertEqual(seen[1].lifecycle, "foreground")
+        self.assertEqual(seen[1].adaptive_bootstrap_seconds, 2.0)
+
     def test_serve_run_suppresses_banner_finish_and_review_prompt(self):
         with open(self.h.config_path) as fh:
             data = json.load(fh)
@@ -1878,6 +1910,10 @@ class TestShellCompletion(unittest.TestCase):
         self.assertIn("--full-isolation", matches)
         self.assertIn("--protect-agent-state", matches)
         self.assertIn("--serve", matches)
+        self.assertIn("--lifecycle", matches)
+        self.assertIn("--adaptive-bootstrap-seconds", matches)
+        self.assertIn("--adaptive-stability-seconds", matches)
+        self.assertIn("--adaptive-detach-seconds", matches)
 
     def test_review_completion_lists_ignored_policy_options(self):
         matches = self.complete(["ccc-agent", "review", "--"])

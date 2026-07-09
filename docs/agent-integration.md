@@ -35,7 +35,41 @@ command. Before the final freeze it applies the same default as turn hooks:
 commit in-workspace changes, remember non-workspace changes as kept in the
 branch, and leave the session reviewable if anything still needs later
 attention. The SSH shell router uses this mode automatically for detected
-Codex/Claude remote commands.
+Codex/Claude/Hermes remote commands.
+
+## Adaptive SSH process lifecycle
+
+`--serve` controls protocol-safe output and review defaults; it does not decide
+whether the command is foreground or a daemon. The packaged SSH router invokes
+all broadly detected Claude, Codex, and Hermes requests with:
+
+```text
+--lifecycle adaptive
+```
+
+The router does not inspect private operations such as `--serve`, `--bridge`,
+`app-server`, or `proxy`. Inside bwrap, namespace PID 1 classifies the opaque
+process behavior:
+
+- a command that remains alive through the bootstrap window is permanently
+  foreground; when it exits, leaked helpers are killed with the PID namespace;
+- an early nonzero exit fails normally;
+- an early zero exit with no descendants is a one-shot command;
+- an early zero exit with descendants becomes a handoff candidate and is accepted
+  only after descendant stability plus authoritative stdout and stderr EOF;
+- candidates that retain either output stream are rejected and cleaned up within
+  the detach timeout.
+
+A small trusted supervisor owns bwrap and BranchFS after a clean handoff, while
+the bootstrap SSH command returns. Later bridge/proxy commands continue to use
+ordinary separate ccc-agent sessions and shared agent runtime sockets; there is no
+active-lane or namespace-attachment router. Multiple services therefore keep
+independent session IDs and branch views.
+
+Interactive SSH commands with a TTY stay on the existing foreground lifecycle so
+terminal ownership/job control is preserved. Ordinary local `ccc-agent run`
+commands also remain foreground unless `--lifecycle adaptive` is explicitly
+selected.
 
 If no plugin matches, the plugin directory is missing, the command uses a mode
 that disables plugins, or the agent version ignores hooks, the run degrades to

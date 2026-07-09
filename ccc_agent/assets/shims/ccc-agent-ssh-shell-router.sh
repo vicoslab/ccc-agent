@@ -101,6 +101,8 @@ def token_agent(token):
         return "claude"
     if base in ("codex", "codex.exe"):
         return "codex"
+    if base in ("hermes", "hermes.exe"):
+        return "hermes"
     if "/.claude/remote/srv/" in path and base == "server":
         return "claude"
     if "/.claude/remote/src/" in path and base == "server":
@@ -272,4 +274,4 @@ if [ -z "${CCC_AGENT_SHIM_UNDERLYING_PATH:-}" ]; then
     CCC_AGENT_SHIM_UNDERLYING_PATH="$(_path_without_shims "${PATH:-}" "${agent}")"
     export CCC_AGENT_SHIM_UNDERLYING_PATH
 fi
-exec "${launcher}" run --serve "${agent}" -- "${shell}" -c "${original_command}"
+exec "${launcher}" run --serve "${agent}" --lifecycle adaptive -- "${shell}" -c "${original_command}"

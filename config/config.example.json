@@ -14,6 +14,10 @@
   "confinement": "bwrap",
   "bwrap_bin": "/usr/bin/bwrap",
   "bwrap_proc_mode": "bind",
+  "_adaptive_lifecycle_comment": "The SSH router selects adaptive lifecycle for broadly detected Claude/Codex/Hermes traffic. A child alive beyond the bootstrap window is permanently foreground and leftover helpers are killed at exit. An early successful exit becomes a service only when descendants remain stable and release stdout+stderr. Ordinary ccc-agent run remains foreground unless --lifecycle adaptive is explicit.",
+  "adaptive_bootstrap_seconds": 2.0,
+  "adaptive_stability_seconds": 0.2,
+  "adaptive_detach_seconds": 2.0,
   "_run_access_comment": "Default true: bind the existing CCC/container /run runtime namespace, read-only /var, and device-capable /dev into bwrap so agents can use container-provided sockets/devices (Docker via /var/run/docker.sock or /run/docker.sock, ssh-agent, /dev/fuse, etc.). Rootless bwrap maps the uid plus one gid, not every supplementary group; when Docker socket access depends on a supplementary group, ccc-agent maps that socket gid automatically. Set bwrap_gid explicitly to override. Set container_run_access false, or run ccc-agent run --full-isolation, for no-ambient-runtime mode. This protects normal /home and /storage writes, not full escape prevention from a container that already exposes powerful sockets/devices.",
   "container_run_access": true,
 

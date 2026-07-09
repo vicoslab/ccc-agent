@@ -16,7 +16,9 @@ commit decision, and the agent process never does.
 import binascii
 import json
 import os
+import selectors
 import shutil
+import socket
 import stat
 import subprocess
 
@@ -51,6 +53,8 @@ BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
 # now bound into the sandbox and may be root-owned, so bwrap cannot create
 # /run/ccc-agent as an unprivileged user.
 SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
+SANDBOX_LIFECYCLE_SOCK = "/tmp/ccc-agent/lifecycle.sock"
+SANDBOX_ADAPTIVE_RUNNER = "/tmp/ccc-agent/adaptive_pid1.py"
 
 # Run the sandbox command under a tiny PID-1 lifecycle wrapper.  Without this,
 # bubblewrap's default PID-1 reaper keeps the namespace alive until every helper
@@ -153,6 +157,7 @@ class RootSpec(object):
 # debugging the policy/commit pipeline without bwrap, never for confinement.
 CONFINEMENT_MODES = ("none", "bwrap")
 BWRAP_PROC_MODES = ("bind", "ro", "fresh")
+LIFECYCLE_MODES = ("foreground", "adaptive")
 
 
 class RunnerConfig(object):
@@ -166,7 +171,10 @@ class RunnerConfig(object):
                  bwrap_uid=None, bwrap_gid=None, agent_plugins=None,
                  agent_state_binds=None, protect_agent_state=False,
                  ensure_agent_state_dirs=False, on_session_start=None,
-                 server_mode=False):
+                 server_mode=False, lifecycle="foreground",
+                 adaptive_bootstrap_seconds=2.0,
+                 adaptive_stability_seconds=0.2,
+                 adaptive_detach_seconds=2.0):
         self.store = store              # SessionStore
         self.backend = backend          # BranchfsCli or FakeBranchFS
         self.alias_map = alias_map
@@ -239,6 +247,28 @@ class RunnerConfig(object):
         self.ensure_agent_state_dirs = bool(ensure_agent_state_dirs)
         self.on_session_start = on_session_start
         self.server_mode = bool(server_mode)
+        if lifecycle not in LIFECYCLE_MODES:
+            raise ValueError("unknown lifecycle %r (expected one of %s)"
+                             % (lifecycle, ", ".join(LIFECYCLE_MODES)))
+        if lifecycle == "adaptive" and confinement != "bwrap":
+            raise ValueError("adaptive lifecycle requires bwrap confinement")
+        self.lifecycle = lifecycle
+        self.adaptive_bootstrap_seconds = self._positive_seconds(
+            "adaptive_bootstrap_seconds", adaptive_bootstrap_seconds)
+        self.adaptive_stability_seconds = self._positive_seconds(
+            "adaptive_stability_seconds", adaptive_stability_seconds)
+        self.adaptive_detach_seconds = self._positive_seconds(
+            "adaptive_detach_seconds", adaptive_detach_seconds)
+
+    @staticmethod
+    def _positive_seconds(name, value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("%s must be a positive number" % name)
+        if value <= 0:
+            raise ValueError("%s must be a positive number" % name)
+        return value
 
 
 def _agent_cwd(session, alias_map):
@@ -783,7 +813,8 @@ def _bwrap_gid(config):
     return os.getgid()
 
 
-def _bwrap_command(session, config, control=None, env=None):
+def _bwrap_command(session, config, control=None, env=None,
+                   lifecycle_socket=None):
     """Build a bubblewrap command that confines the agent rootlessly.
 
     This needs no container CAP_SYS_ADMIN and no privileged helper: bwrap
@@ -914,6 +945,11 @@ def _bwrap_command(session, config, control=None, env=None):
     if control is not None:
         host_sock, token, hook_token = control
         argv += ["--bind", host_sock, SANDBOX_CONTROL_SOCK]
+    if lifecycle_socket is not None:
+        adaptive_runner = os.path.join(os.path.dirname(__file__),
+                                       "adaptive_pid1.py")
+        argv += ["--bind", lifecycle_socket, SANDBOX_LIFECYCLE_SOCK,
+                 "--ro-bind", adaptive_runner, SANDBOX_ADAPTIVE_RUNNER]
 
     sandbox_path = env.get(ENV_SHIM_UNDERLYING_PATH) or BWRAP_DEFAULT_PATH
     argv += ["--setenv", ENV_SESSION, session.session_id,
@@ -927,6 +963,16 @@ def _bwrap_command(session, config, control=None, env=None):
                  "--setenv", ENV_CONTROL_TOKEN, control[1],
                  "--setenv", ENV_HOOK_TOKEN, control[2],
                  "--setenv", ENV_HOOK_SESSION, session.session_id]
+    if lifecycle_socket is not None:
+        argv += [
+            "--setenv", "CCC_AGENT_LIFECYCLE_SOCKET", SANDBOX_LIFECYCLE_SOCK,
+            "--setenv", "CCC_AGENT_BOOTSTRAP_SECONDS",
+            str(config.adaptive_bootstrap_seconds),
+            "--setenv", "CCC_AGENT_STABILITY_SECONDS",
+            str(config.adaptive_stability_seconds),
+            "--setenv", "CCC_AGENT_DETACH_SECONDS",
+            str(config.adaptive_detach_seconds),
+        ]
     # Credentials via env (read from the host auth files; never bound in).
     for var, spec in sorted(config.cred_env.items()):
         value = _extract_cred(spec)
@@ -945,8 +991,11 @@ def _bwrap_command(session, config, control=None, env=None):
     argv += ["--chdir", workdir, "--"]
     command = _agent_command_with_plugin(
         config.agent_command, plugin_spec if plugin_launch_activation else None)
-    argv += ["/usr/bin/python3", "-c", BWRAP_AGENT_RUNNER,
-             BWRAP_AGENT_RUNNER_ARG0] + command
+    if lifecycle_socket is not None:
+        argv += ["/usr/bin/python3", SANDBOX_ADAPTIVE_RUNNER, "--"] + command
+    else:
+        argv += ["/usr/bin/python3", "-c", BWRAP_AGENT_RUNNER,
+                 BWRAP_AGENT_RUNNER_ARG0] + command
     return argv
 
 
@@ -1218,6 +1267,348 @@ def _active_mounts(session, backend=None):
     return active
 
 
+def _adaptive_status(fd, event, **fields):
+    payload = dict(fields)
+    payload["event"] = event
+    data = (json.dumps(payload, sort_keys=True,
+                       separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        os.write(fd, data)
+        return True
+    except OSError:
+        return False
+
+
+def _adaptive_relay_write(fd, data):
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except InterruptedError:
+            continue
+        except (BrokenPipeError, OSError):
+            return False
+        view = view[written:]
+    return True
+
+
+def _adaptive_stop_process(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+    except OSError:
+        pass
+
+
+def _adaptive_event_name(event):
+    return {
+        "started": "adaptive-started",
+        "foreground-locked": "adaptive-foreground-locked",
+        "handoff-candidate": "adaptive-handoff-candidate",
+        "handoff-rejected": "adaptive-handoff-rejected",
+        "handoff": "adaptive-handoff",
+        "service-exited": "adaptive-service-exited",
+        "one-shot": "adaptive-one-shot",
+        "failed": "adaptive-child-failed",
+        "stopping": "adaptive-stopping",
+    }.get(event)
+
+
+def _adaptive_supervise_process(proc, listener, session, config, status_fd,
+                                frontend_pid):
+    """Relay one bwrap invocation until completion or clean service handoff."""
+    selector = selectors.DefaultSelector()
+    listener.setblocking(False)
+    selector.register(listener, selectors.EVENT_READ, "listener")
+    for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, name)
+    try:
+        os.fstat(0)
+        selector.register(0, selectors.EVENT_READ, "stdin")
+    except OSError:
+        pass
+    os.set_blocking(proc.stdin.fileno(), False)
+
+    lifecycle_conn = None
+    lifecycle_buffer = b""
+    stdin_buffer = bytearray()
+    stdin_write_registered = False
+    stdin_eof = False
+    handed_off = False
+
+    def close_stdin():
+        nonlocal stdin_write_registered
+        if stdin_write_registered:
+            try:
+                selector.unregister(proc.stdin)
+            except Exception:
+                pass
+            stdin_write_registered = False
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    while proc.poll() is None:
+        if not handed_off and os.getppid() != frontend_pid:
+            session.add_event("adaptive-frontend-disconnected")
+            config.store.save(session)
+            _adaptive_stop_process(proc)
+            break
+
+        for key, mask in selector.select(0.05):
+            kind = key.data
+            if kind == "listener":
+                conn, _ = listener.accept()
+                conn.setblocking(False)
+                lifecycle_conn = conn
+                selector.register(conn, selectors.EVENT_READ, "lifecycle")
+                selector.unregister(listener)
+                listener.close()
+                continue
+
+            if kind in ("stdout", "stderr"):
+                try:
+                    data = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if data:
+                    _adaptive_relay_write(1 if kind == "stdout" else 2, data)
+                else:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                continue
+
+            if kind == "stdin":
+                try:
+                    data = os.read(0, 65536)
+                except BlockingIOError:
+                    continue
+                if data:
+                    stdin_buffer.extend(data)
+                    if not stdin_write_registered:
+                        selector.register(proc.stdin, selectors.EVENT_WRITE,
+                                          "proc-stdin")
+                        stdin_write_registered = True
+                else:
+                    selector.unregister(0)
+                    stdin_eof = True
+                    if not stdin_buffer:
+                        close_stdin()
+                continue
+
+            if kind == "proc-stdin" and mask & selectors.EVENT_WRITE:
+                try:
+                    written = os.write(proc.stdin.fileno(), stdin_buffer)
+                    del stdin_buffer[:written]
+                except BlockingIOError:
+                    continue
+                except (BrokenPipeError, OSError):
+                    stdin_buffer[:] = b""
+                    stdin_eof = True
+                if not stdin_buffer:
+                    selector.unregister(proc.stdin)
+                    stdin_write_registered = False
+                    if stdin_eof:
+                        close_stdin()
+                continue
+
+            if kind == "lifecycle":
+                try:
+                    data = lifecycle_conn.recv(4096)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    selector.unregister(lifecycle_conn)
+                    lifecycle_conn.close()
+                    lifecycle_conn = None
+                    continue
+                lifecycle_buffer += data
+                while b"\n" in lifecycle_buffer:
+                    line, lifecycle_buffer = lifecycle_buffer.split(b"\n", 1)
+                    if not line:
+                        continue
+                    try:
+                        message = json.loads(line.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    event = message.get("event")
+                    durable = _adaptive_event_name(event)
+                    if durable:
+                        detail = message.get("reason")
+                        session.add_event(durable, detail)
+                        config.store.save(session)
+                    if event == "handoff" and not handed_off:
+                        handed_off = True
+                        _adaptive_status(status_fd, "handoff")
+                        try:
+                            os.close(status_fd)
+                        except OSError:
+                            pass
+                        close_stdin()
+                        # The adaptive PID-1 runner proved that all descendants
+                        # released their output streams. Stop owning the SSH
+                        # channel before the frontend returns.
+                        for fd in (0, 1, 2):
+                            try:
+                                devnull = os.open(os.devnull, os.O_RDWR)
+                                os.dup2(devnull, fd)
+                                os.close(devnull)
+                            except OSError:
+                                pass
+                        break
+
+        if handed_off:
+            # No service descendant owns protocol stdout/stderr after the EOF
+            # gates. The outer bwrap process can retain its pipes, so close our
+            # read ends and wait without keeping the SSH channel alive.
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    selector.unregister(stream)
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            break
+
+    return handed_off, proc.wait()
+
+
+def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
+                             frontend_pid):
+    control_server = None
+    listener = None
+    lifecycle_path = os.path.join(config.store.control_dir(session.session_id),
+                                  "lifecycle.sock")
+    try:
+        os.makedirs(os.path.dirname(lifecycle_path), exist_ok=True)
+        try:
+            os.unlink(lifecycle_path)
+        except OSError:
+            pass
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(lifecycle_path)
+        listener.listen(1)
+
+        cwd = _agent_cwd(session, config.alias_map)
+        os.makedirs(cwd, exist_ok=True)
+        run_env = dict(env)
+        run_env[ENV_SESSION] = session.session_id
+        run_env[ENV_STATE_DIR] = config.store.state_dir
+        control = None
+        if config.per_turn:
+            token = binascii.hexlify(os.urandom(16)).decode("ascii")
+            hook_token = binascii.hexlify(os.urandom(16)).decode("ascii")
+            host_sock = config.store.control_socket(session.session_id)
+            turn_ctl = TurnController(session, config.store, config.backend,
+                                      config.alias_map)
+            turn_ctl.reset_agent_workspaces()
+            control_server = ControlServer(host_sock, turn_ctl.handle, token,
+                                           hook_token=hook_token)
+            control_server.start()
+            session.add_event("control-server", host_sock)
+            control = (host_sock, token, hook_token)
+
+        session.transition("running")
+        session.add_event("adaptive-supervisor", str(os.getpid()))
+        config.store.save(session)
+        if config.on_session_start is not None:
+            config.on_session_start(session)
+
+        argv = _bwrap_command(session, config, control=control, env=run_env,
+                              lifecycle_socket=lifecycle_path)
+        session.add_event("bwrap-launch", argv[0])
+        config.store.save(session)
+        proc = subprocess.Popen(argv, env=run_env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                bufsize=0)
+        _handed_off, returncode = _adaptive_supervise_process(
+            proc, listener, session, config, status_fd, frontend_pid)
+        listener = None
+        session.exit_status = returncode
+        session.add_event("agent-exit", str(returncode))
+
+        session.transition("finalizing")
+        config.store.save(session)
+        if before_finalize is not None:
+            before_finalize(session)
+        finalize_session(session, config.store, config.backend,
+                         config.alias_map)
+    except Exception as exc:
+        _fail(config.store, session, "adaptive launch failed: %s" % exc)
+    finally:
+        if control_server is not None:
+            control_server.stop()
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        try:
+            os.unlink(lifecycle_path)
+        except OSError:
+            pass
+        _unmount_all(session, config.backend)
+
+    _adaptive_status(status_fd, "finished")
+    try:
+        os.close(status_fd)
+    except OSError:
+        pass
+
+
+def _run_adaptive_session(session, config, env, before_finalize=None):
+    """Fork a trusted supervisor; return on foreground finish or daemon handoff."""
+    status_read, status_write = os.pipe()
+    frontend_pid = os.getpid()
+    try:
+        supervisor_pid = os.fork()
+    except OSError as exc:
+        os.close(status_read)
+        os.close(status_write)
+        _fail(config.store, session, "adaptive supervisor fork failed: %s" % exc)
+        _unmount_all(session, config.backend)
+        return session
+
+    if supervisor_pid == 0:
+        os.close(status_read)
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        _run_adaptive_supervisor(session, config, env, before_finalize,
+                                 status_write, frontend_pid)
+        os._exit(0)
+
+    os.close(status_write)
+    with os.fdopen(status_read, "rb", buffering=0) as status_stream:
+        line = status_stream.readline()
+    try:
+        message = json.loads(line.decode("utf-8")) if line else {}
+    except (UnicodeDecodeError, ValueError):
+        message = {}
+    if message.get("event") != "handoff":
+        try:
+            os.waitpid(supervisor_pid, 0)
+        except OSError:
+            pass
+    try:
+        return config.store.load(session.session_id)
+    except KeyError:
+        return session
+
+
 def _run_agent_and_finalize(session, config, env, before_finalize=None,
                             enter_running=False):
     """Launch config.agent_command against an already-mounted session."""
@@ -1349,6 +1740,12 @@ def run_session(config, env=None, before_finalize=None):
         _unmount_all(session, config.backend)
         return session
 
+    if config.lifecycle == "adaptive" and not os.isatty(0):
+        return _run_adaptive_session(session, config, env,
+                                     before_finalize=before_finalize)
+    if config.lifecycle == "adaptive":
+        session.add_event("adaptive-tty-foreground")
+        config.store.save(session)
     return _run_agent_and_finalize(session, config, env,
                                    before_finalize=before_finalize,
                                    enter_running=True)
