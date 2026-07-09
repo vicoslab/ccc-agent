@@ -22,7 +22,6 @@ SHIM_DIR=""
 case "$SHIM_PATH" in
     */*) SHIM_DIR="${SHIM_PATH%/*}" ;;
 esac
-CODEX_DISABLE_INNER_SANDBOX_ARG="--dangerously-bypass-approvals-and-sandbox"
 
 ccc_agent_path_without_this_shim() {
     _input_path=${1:-}
@@ -60,34 +59,6 @@ if [ -z "$UNSHIMMED_PATH" ]; then
     UNSHIMMED_PATH="$(ccc_agent_path_without_this_shim "${PATH:-}")"
 fi
 
-codex_inner_sandbox_state() {
-    # Return codes:
-    #   0: nested Codex should receive CODEX_DISABLE_INNER_SANDBOX_ARG
-    #   1: no change needed (non-Codex, --yolo, explicit no-sandbox mode)
-    #   2: explicit nested Codex sandbox requested; refuse before it hangs
-    [ "$AGENT_NAME" = "codex" ] || return 1
-    expect_sandbox_value=0
-    for arg in "$@"; do
-        if [ "$expect_sandbox_value" = "1" ]; then
-            [ "$arg" = "danger-full-access" ] && return 1
-            return 2
-        fi
-        case "$arg" in
-            "$CODEX_DISABLE_INNER_SANDBOX_ARG"|--yolo|--sandbox=danger-full-access|-s=danger-full-access)
-                return 1
-                ;;
-            --sandbox|-s)
-                expect_sandbox_value=1
-                ;;
-            --sandbox=*|-s=*)
-                return 2
-                ;;
-        esac
-    done
-    [ "$expect_sandbox_value" = "1" ] && return 2
-    return 0
-}
-
 exec_underlying_agent() {
     PATH="$UNSHIMMED_PATH"
     export PATH
@@ -102,20 +73,8 @@ fi
 if [ -n "${CCC_AGENT_SESSION:-}" ]; then
     # Already inside a contained session: run the underlying agent command from
     # the unshimmed PATH, staying in the existing branch instead of redirecting
-    # to another ccc-agent run.
-    set +e
-    codex_inner_sandbox_state "$@"
-    codex_sandbox_state=$?
-    set -e
-    if [ "$codex_sandbox_state" = "0" ]; then
-        echo "ccc-agent-shim: nested codex inside ccc-agent; disabling Codex inner sandbox (outer containment active)" >&2
-        PATH="$UNSHIMMED_PATH"
-        export PATH
-        exec "$AGENT_NAME" "$CODEX_DISABLE_INNER_SANDBOX_ARG" "$@"
-    elif [ "$codex_sandbox_state" = "2" ]; then
-        echo "ccc-agent-shim: refusing nested Codex sandbox inside ccc-agent; use --yolo/--sandbox danger-full-access or omit --sandbox so the shim can disable Codex's inner sandbox" >&2
-        exit 2
-    fi
+    # to another ccc-agent run. Do not alter agent-specific sandbox flags here;
+    # users may opt into Codex --yolo/--sandbox modes themselves.
     exec_underlying_agent "$@"
 fi
 

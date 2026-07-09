@@ -224,26 +224,19 @@ class TestSetupConfig(unittest.TestCase):
         )
 
         self.assertEqual(cfg["cred_mounts"], [])
-        # Native plugin injection: Codex needs its plugin to appear as an
-        # installed/enabled plugin, not merely as a raw ~/.codex/plugins dir.
+        # Default runtime plugin wiring is mount/config only. ccc-agent setup
+        # persists tool config where needed; ccc-agent run must not append
+        # interactive CLI args such as Codex YOLO flags or Claude --plugin-dir.
         self.assertEqual(cfg["agent_hook_mode"], "plugins")
         plugins = cfg["agent_plugins"]
-        self.assertEqual(plugins["claude"]["argv"],
-                         ["--plugin-dir",
-                          "/ccc-agent/plugins/claude-ccc-containment"])
-        self.assertTrue(plugins["claude"]["src"].endswith(
-            "/plugins/claude-ccc-containment"))
+        self.assertEqual(sorted(plugins), ["codex"])
         self.assertEqual(plugins["codex"]["sandbox_path"],
                          "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0")
         self.assertEqual(plugins["codex"]["ensure_dirs"],
                          ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"])
-        self.assertEqual(plugins["codex"]["argv"],
-                         [setup_mod.CODEX_DISABLE_INNER_SANDBOX_ARG])
+        self.assertNotIn("argv", plugins["codex"])
         self.assertEqual(plugins["codex"]["plugin_id"],
                          "ccc@ccc-agent")
-        self.assertEqual(
-            plugins["hermes"]["setenv"]["HERMES_BUNDLED_PLUGINS"],
-            "/ccc-agent/plugins/hermes")
         for spec in plugins.values():
             self.assertNotIn("settings.json", spec.get("sandbox_path", ""))
         ignore = cfg["policy"]["ignore_patterns"]
@@ -277,15 +270,12 @@ class TestSetupConfig(unittest.TestCase):
 
         self.assertEqual(cfg["cred_mounts"], [])
         plugins = cfg["agent_plugins"]
+        self.assertEqual(sorted(plugins), ["codex"])
         self.assertEqual(plugins["codex"]["sandbox_path"],
                          "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0")
         self.assertEqual(plugins["codex"]["plugin_id"],
                          "ccc@ccc-agent")
-        self.assertEqual(plugins["codex"]["argv"],
-                         [setup_mod.CODEX_DISABLE_INNER_SANDBOX_ARG])
-        self.assertEqual(plugins["claude"]["argv"],
-                         ["--plugin-dir",
-                          "/ccc-agent/plugins/claude-ccc-containment"])
+        self.assertNotIn("argv", plugins["codex"])
         ignore = cfg["policy"]["ignore_patterns"]
         self.assertNotIn("/home/domen/.codex*", ignore)
         self.assertNotIn("/home/domen/.claude*", ignore)
@@ -301,7 +291,7 @@ class TestSetupConfig(unittest.TestCase):
         self.assertFalse(cfg["protect_agent_state"])
         self.assertNotIn("workspace", cfg)
 
-    def test_setup_enables_codex_plugin_with_explanatory_config_comment(self):
+    def test_setup_enables_codex_plugin_and_claude_hooks_with_persistent_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
             os.makedirs(home)
@@ -314,11 +304,8 @@ class TestSetupConfig(unittest.TestCase):
                     "--state-dir", state_dir,
                 ])
             self.assertEqual(rc, 0)
-            # Codex 0.136+ loads plugin hooks only from enabled plugins. Keep a
-            # small managed config entry so contained ccc-agent Codex sessions
-            # see the read-only plugin cache bind. The comments tell users why
-            # this entry should remain even when the cache is absent outside
-            # ccc-agent.
+            # Codex loads enabled/trusted plugins from config; user-mode setup
+            # writes the managed block to ~/.codex/config.toml.
             codex_config = os.path.join(home, ".codex", "config.toml")
             self.assertTrue(os.path.isfile(codex_config))
             with open(codex_config) as fh:
@@ -332,15 +319,66 @@ class TestSetupConfig(unittest.TestCase):
             for key, trusted_hash in setup_mod.CODEX_HOOK_TRUSTED_HASHES:
                 self.assertIn('hooks.state."%s".trusted_hash = "%s"'
                               % (key, trusted_hash), codex_toml)
-            self.assertFalse(os.path.exists(os.path.join(home, ".claude", "settings.json")))
+
+            # Claude uses standalone persistent settings instead of --plugin-dir.
+            claude_settings = os.path.join(home, ".claude", "settings.json")
+            self.assertTrue(os.path.isfile(claude_settings))
+            with open(claude_settings) as fh:
+                claude = json.load(fh)
+            hooks = claude["hooks"]
+            self.assertIn("SessionStart", hooks)
+            self.assertIn("Stop", hooks)
+            hook_commands = json.dumps(hooks)
+            self.assertIn("claude-ccc-containment/hooks/ccc-context-hook.sh",
+                          hook_commands)
+            self.assertIn("claude-ccc-containment/hooks/ccc-stop-hook.sh",
+                          hook_commands)
+            self.assertNotIn("--plugin-dir", hook_commands)
 
             with open(config_path) as fh:
                 cfg = json.load(fh)
             self.assertEqual(cfg["agent_hook_mode"], "plugins")
-            # the plugin sources are the bundled package assets and exist on disk
-            for agent in ("codex", "claude", "hermes"):
-                src = cfg["agent_plugins"][agent]["src"]
-                self.assertTrue(os.path.isdir(src), src)
+            self.assertEqual(sorted(cfg["agent_plugins"]), ["codex"])
+            src = cfg["agent_plugins"]["codex"]["src"]
+            self.assertTrue(os.path.isdir(src), src)
+            self.assertNotIn("argv", cfg["agent_plugins"]["codex"])
+
+    def test_system_setup_can_write_tool_managed_config_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home)
+            config_path = os.path.join(tmp, "ccc-agent.json")
+            codex_config = os.path.join(tmp, "etc", "codex", "config.toml")
+            claude_settings = os.path.join(
+                tmp, "etc", "claude-code", "managed-settings.d",
+                "50-ccc-agent.json")
+            with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False):
+                rc = setup_mod.main([
+                    "--system",
+                    "--config", config_path,
+                    "--state-dir", os.path.join(tmp, "state"),
+                    "--storage-root", os.path.join(tmp, "storage"),
+                    "--branch-store", os.path.join(tmp, "branches"),
+                    "--codex-config", codex_config,
+                    "--claude-settings", claude_settings,
+                ])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(codex_config))
+            self.assertTrue(os.path.isfile(claude_settings))
+            self.assertFalse(os.path.exists(
+                os.path.join(home, ".codex", "config.toml")))
+            self.assertFalse(os.path.exists(
+                os.path.join(home, ".claude", "settings.json")))
+            with open(codex_config) as fh:
+                self.assertIn('plugins."ccc@ccc-agent".enabled = true',
+                              fh.read())
+            with open(claude_settings) as fh:
+                hook_json = fh.read()
+            self.assertIn("claude-ccc-containment/hooks/ccc-context-hook.sh",
+                          hook_json)
+            self.assertIn("claude-ccc-containment/hooks/ccc-stop-hook.sh",
+                          hook_json)
+            self.assertNotIn("--plugin-dir", hook_json)
 
     def test_setup_preserves_existing_codex_config_when_adding_managed_block(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -395,6 +433,8 @@ class TestSetupConfig(unittest.TestCase):
                 self.assertEqual(cfg["agent_hook_mode"], "disabled")
                 self.assertFalse(os.path.exists(
                     os.path.join(home, ".codex", "config.toml")))
+                self.assertFalse(os.path.exists(
+                    os.path.join(home, ".claude", "settings.json")))
 
     def test_setup_protect_agent_state_flag_sets_config(self):
         with tempfile.TemporaryDirectory() as tmp:

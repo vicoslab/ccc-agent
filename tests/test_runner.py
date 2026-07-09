@@ -1021,12 +1021,11 @@ class TestBwrapConfinement(unittest.TestCase):
             self._wrapped_agent_command(argv),
             ["codex", "--dangerously-bypass-approvals-and-sandbox"])
 
-    def test_bwrap_does_not_inject_codex_plugin_into_ssh_payload_shell(self):
+    def test_bwrap_mounts_codex_plugin_without_launch_args_for_ssh_payload_shell(self):
         src = self._make_plugin("codex-ccc-containment")
         sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         plugins = {"codex": {"src": src, "sandbox_path": sandbox,
-                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
-                             "argv": ["--dangerously-bypass-approvals-and-sandbox"]}}
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"]}}
 
         command = [
             "/bin/bash", "-c",
@@ -1034,8 +1033,10 @@ class TestBwrapConfinement(unittest.TestCase):
             "sh 'PATH=\"${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH\"; export PATH; codex --version'",
         ]
         argv = self._capture_argv(command, "codex", plugins)
+        triples = [(argv[k], argv[k + 1], argv[k + 2])
+                   for k in range(len(argv) - 2)]
 
-        self.assertNotIn(src, argv)
+        self.assertIn(("--ro-bind", src, sandbox), triples)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertEqual(self._wrapped_agent_command(argv), command)
 
@@ -1481,15 +1482,14 @@ class TestBwrapConfinement(unittest.TestCase):
         self.assertEqual(self._wrapped_agent_command(argv),
                          [absolute_codex, "exec", "x"])
 
-    def test_explicit_agent_kind_does_not_decorate_different_executable(self):
+    def test_explicit_agent_kind_can_mount_only_without_decorating_different_executable(self):
         codex_src = self._make_plugin("codex-ccc-containment")
         claude_src = self._make_plugin("claude-ccc-containment")
         codex_sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         claude_sandbox = "/ccc-agent/plugins/claude-ccc-containment"
         plugins = {
             "codex": {"src": codex_src, "sandbox_path": codex_sandbox,
-                      "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
-                      "argv": []},
+                      "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"]},
             "claude": {"src": claude_src, "sandbox_path": claude_sandbox,
                        "argv": ["--plugin-dir", claude_sandbox]},
         }
@@ -1500,7 +1500,7 @@ class TestBwrapConfinement(unittest.TestCase):
 
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
-        self.assertNotIn(("--ro-bind", codex_src, codex_sandbox), triples)
+        self.assertIn(("--ro-bind", codex_src, codex_sandbox), triples)
         self.assertNotIn(("--ro-bind", claude_src, claude_sandbox), triples)
         self.assertNotIn("--plugin-dir", argv)
         self.assertEqual(self._wrapped_agent_command(argv),

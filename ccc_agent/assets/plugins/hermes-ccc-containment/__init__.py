@@ -1,8 +1,8 @@
 """CCC agent-containment Hermes plugin.
 
-Loaded only inside a bwrap-contained CCC session (``ccc-agent run`` points
-``HERMES_BUNDLED_PLUGINS`` at the read-only plugin store and sets
-``HERMES_ACCEPT_HOOKS=1``). A direct ``hermes`` run does not see this plugin.
+Packaged for explicit/operator Hermes plugin configuration. Setup-generated
+``ccc-agent`` configs no longer point ``HERMES_BUNDLED_PLUGINS`` at this plugin
+by default; process-exit review remains authoritative when the plugin is absent.
 
 Hermes' native equivalent of Claude's ``additionalContext`` is the
 ``pre_llm_call`` plugin hook: returning ``{"context": text}`` injects text into

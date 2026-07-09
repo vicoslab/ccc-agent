@@ -688,9 +688,10 @@ class TestShim(unittest.TestCase):
     def test_nested_session_runs_real_binary_directly(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"})
         self.assertIn("REAL:", proc.stdout)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox do thing",
-                      proc.stdout)
-        self.assertIn("disabling Codex inner sandbox", proc.stderr)
+        self.assertIn("do thing", proc.stdout)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
+                         proc.stdout)
+        self.assertNotIn("disabling Codex inner sandbox", proc.stderr)
         self.assertNotIn("LAUNCH:", proc.stdout)
 
     def test_nested_session_respects_explicit_codex_no_sandbox_arg(self):
@@ -701,12 +702,12 @@ class TestShim(unittest.TestCase):
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
                          proc.stdout)
 
-    def test_nested_session_rejects_explicit_codex_sandbox_arg(self):
+    def test_nested_session_preserves_explicit_codex_sandbox_arg(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"},
                              args=("--sandbox", "workspace-write", "do"))
-        self.assertEqual(proc.returncode, 2)
-        self.assertNotIn("REAL:", proc.stdout)
-        self.assertIn("refusing nested Codex sandbox", proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REAL:", proc.stdout)
+        self.assertIn("--sandbox workspace-write do", proc.stdout)
 
     def test_nested_session_respects_explicit_codex_yolo_arg(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"},

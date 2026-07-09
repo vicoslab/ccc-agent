@@ -120,16 +120,18 @@ credential mounts.
 
 ## Agent plugins
 
-`agent_plugins` maps agent names to read-only plugin assets:
+`agent_plugins` maps agent names to read-only assets that `ccc-agent run` may
+mount for contained sessions. Setup-generated defaults are mount/config only:
 
 ```json
 {
   "agent_hook_mode": "plugins",
   "agent_plugins": {
-    "claude": {
-      "src": "/usr/lib/python3/dist-packages/ccc_agent/assets/plugins/claude-ccc-containment",
-      "sandbox_path": "/ccc-agent/plugins/claude-ccc-containment",
-      "argv": ["--plugin-dir", "/ccc-agent/plugins/claude-ccc-containment"]
+    "codex": {
+      "src": "/usr/lib/python3/dist-packages/ccc_agent/assets/plugins/codex-ccc-containment",
+      "sandbox_path": "/home/<user>/.codex/plugins/cache/ccc-agent/ccc/0.2.0",
+      "ensure_dirs": ["/home/<user>/.codex/plugins/cache/ccc-agent/ccc"],
+      "plugin_id": "ccc@ccc-agent"
     }
   }
 }
@@ -137,13 +139,22 @@ credential mounts.
 
 For matching contained commands, the launcher:
 
-1. bind-mounts `src` read-only at `sandbox_path`;
-2. inserts any `argv` immediately after the agent executable;
-3. exports any `setenv` keys;
-4. degrades to process-exit review if the plugin asset is missing.
+1. validates the configured asset directory on the trusted host;
+2. bind-mounts `src` read-only at `sandbox_path` when present;
+3. creates `ensure_dirs` mount parents inside the sandbox;
+4. degrades to process-exit review if the asset is missing.
+
+Generated defaults do not append Codex YOLO args, do not append Claude
+`--plugin-dir`, and do not set Hermes plugin environment variables. Manual
+operator config may still include `argv` or `setenv`; those activation fields are
+opt-in and are only applied to direct agent CLI invocations.
+
+`ccc-agent setup --system` writes persistent tool config to `/etc/codex` and
+`/etc/claude-code/managed-settings.d` where supported. `ccc-agent setup --user`
+writes the equivalent user config under `~/.codex` and `~/.claude`.
 
 Set `agent_hook_mode: "disabled"` and `agent_plugins: {}` to disable native
-plugin injection.
+plugin/config setup.
 
 ## Policy keys
 

@@ -127,12 +127,13 @@ and a human-readable summary.
 
 `ccc-agent run` already knows how to integrate with common agent CLIs:
 
-- **Codex**: injects the bundled Codex containment plugin for contained runs and
-  disables Codex's nested Linux sandbox because `ccc-agent` is already the
-  filesystem boundary.
-- **Claude Code**: adds the bundled Claude plugin with `--plugin-dir` for the
-  contained invocation.
-- **Hermes**: exposes the bundled Hermes plugin through `HERMES_BUNDLED_PLUGINS`.
+- **Codex**: setup enables/trusts the bundled Codex containment plugin in Codex
+  config; contained runs only receive a read-only plugin-cache bind. `ccc-agent`
+  no longer adds Codex YOLO/sandbox-bypass flags by default.
+- **Claude Code**: setup writes standalone Claude hooks to user or managed
+  settings; contained runs do not receive `--plugin-dir` from `ccc-agent`.
+- **Hermes**: no default per-run plugin environment is injected; process-exit
+  review remains authoritative until Hermes is configured explicitly.
 - **OpenCode or any other command**: still benefits from process-exit review even
   without a native turn hook.
 

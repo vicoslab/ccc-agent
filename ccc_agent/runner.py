@@ -401,16 +401,17 @@ def _direct_agent_command_matches(config, agent):
     return _agent_token(config.agent_command[0]) == str(agent or "").lower()
 
 
-def _matched_agent_plugin(config):
-    """Return the validated plugin spec for the contained direct agent, or None.
+def _plugin_has_launch_activation(spec):
+    return bool(spec and (spec.get("argv") or spec.get("setenv")))
 
-    Returns None when no plugin matches the agent, when the trusted plugin
-    source does not exist on the host (graceful degradation -> process-exit
-    review still runs), or when the direct agent command uses ``--bare`` (which
-    disables plugins/hooks, so per-turn injection would be a silent no-op).
-    SSH-routed server/bootstrap commands may be labelled with ``--agent`` for
-    session metadata, but they are not decorated unless argv[0] is the agent CLI
-    itself.
+
+def _matched_agent_plugin(config):
+    """Return the validated plugin spec for the contained agent, or None.
+
+    Mount-only specs may be selected by explicit ``--agent`` even when the
+    direct command is an SSH/server shell wrapper, because they do not mutate the
+    command argv/env. Specs that append argv or set launch env are selected only
+    when argv[0] is the direct agent CLI.
     """
     if "--bare" in config.agent_command:
         return None
@@ -428,8 +429,10 @@ def _matched_agent_plugin(config):
     if explicit_kind and explicit_kind != "command":
         explicit_agent = _plugin_key_for_token(config, explicit_kind)
         if explicit_agent:
-            if _direct_agent_command_matches(config, explicit_agent):
-                return validated(explicit_agent)
+            spec = validated(explicit_agent)
+            if spec and (not _plugin_has_launch_activation(spec)
+                         or _direct_agent_command_matches(config, explicit_agent)):
+                return spec
             return None
 
     names = _inferred_agent_plugin_names(config)

@@ -8,25 +8,31 @@ process-exit freeze/status/policy review.
 
 | Invocation | Boundary | Plugin behavior | Review behavior |
 |---|---|---|---|
-| `ccc-agent run -- codex exec "..."` | Process exit | Codex plugin may be injected, but one-shot exit is enough. | Session-end finalize. |
-| `ccc-agent run -- claude -p "..."` | Process exit | Claude plugin may be injected, but one-shot exit is enough. | Session-end finalize. |
-| `ccc-agent run -- hermes "..."` | Process exit / Hermes hooks | Hermes plugin can report turns/session end. | Turn and session finalize when hooks run; process exit remains authoritative. |
+| `ccc-agent run -- codex exec "..."` | Process exit | Codex plugin cache may be mounted; one-shot exit is enough. | Session-end finalize. |
+| `ccc-agent run -- claude -p "..."` | Process exit | Claude standalone hooks may be configured, but one-shot exit is enough. | Session-end finalize. |
+| `ccc-agent run -- hermes "..."` | Process exit | No default Hermes per-run plugin env. | Session-end finalize. |
 | `ccc-agent run -- codex` | Interactive turns + process exit | Codex plugin Stop hook, version-dependent. | Workspace changes may commit per turn; kept paths reviewed later. |
-| `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude plugin via `--plugin-dir`. | Workspace changes may commit per turn; kept paths reviewed later. |
+| `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude hooks from persistent settings, if active. | Workspace changes may commit per turn; kept paths reviewed later. |
 | `ccc-agent run -- <other command>` | Process exit | No native plugin required. | Session-end finalize. |
 
-## Plugin injection model
+## Plugin/config model
 
-For a matching contained run, `ccc-agent run`:
+For default setup-generated configs, `ccc-agent run` does **not** append
+agent-specific argv or set agent-specific plugin environment variables. Instead:
 
-1. identifies the agent from `--agent` or the executable basename;
-2. validates the configured plugin asset directory on the trusted host;
-3. bind-mounts that asset read-only into the bwrap sandbox;
-4. inserts activation argv or environment variables for the contained command;
-5. starts a trusted control socket for turn operations when enabled.
+1. setup writes persistent tool config where the tool supports it;
+2. `ccc-agent run` may bind trusted package assets read-only when a matching
+   contained agent needs files inside its runtime state;
+3. the trusted control socket is available for best-effort turn operations when
+   hooks run.
 
-If no plugin matches, the plugin directory is missing, the command uses a mode
-that disables plugins, or the agent version ignores hooks, the run degrades to
+Manually configured `agent_plugins` may still specify `argv` or `setenv`, but
+those launch mutations are opt-in/operator configuration. Mount-only specs can be
+selected for SSH/server wrapper commands because they do not alter argv/env;
+argv/env activation is restricted to direct agent CLI invocations.
+
+If no plugin/config matches, the asset directory is missing, the command uses a
+mode that disables hooks, or the agent version ignores hooks, the run degrades to
 session-end review. Hook failure never grants commit authority.
 
 Disable plugin injection at setup/config time with:
@@ -42,19 +48,16 @@ Configuration-level disabling uses `agent_hook_mode: "disabled"` and an empty
 ## Codex
 
 Contained Codex receives the bundled Codex plugin mounted at its in-sandbox plugin
-cache path. `ccc-agent setup` also maintains a narrow marked block in
-`~/.codex/config.toml` so Codex 0.136+ treats the plugin as enabled/trusted when
-that read-only plugin cache is present.
+cache path. `ccc-agent setup --system` writes the enable/trust block to
+`/etc/codex/config.toml`; `ccc-agent setup --user` writes the same marked block to
+`~/.codex/config.toml`. Codex 0.136+ then treats the read-only cache bind as an
+enabled/trusted installed plugin when the contained run provides it.
 
-For contained Codex commands, `ccc-agent` also inserts:
-
-```text
---dangerously-bypass-approvals-and-sandbox
-```
-
-Codex is already running inside the `ccc-agent` BranchFS/bwrap boundary. Disabling
-Codex's nested Linux sandbox avoids incompatible nested-bwrap behavior while
-preserving the outer filesystem containment and review boundary.
+`ccc-agent` no longer adds `--dangerously-bypass-approvals-and-sandbox` or any
+other Codex sandbox/Yolo flag by default. If you want Codex's danger-full-access
+mode inside the outer CCC boundary, pass the Codex flag yourself; otherwise Codex
+owns its own sandbox behavior and any nested-sandbox incompatibility is surfaced
+by Codex.
 
 Interactive Codex Stop hooks are version-dependent. If the hook runs, it calls
 `turn-finalize --default-keep`. If it does not run, changes are handled at
@@ -62,29 +65,23 @@ session end.
 
 ## Claude Code
 
-Contained Claude Code receives the bundled Claude plugin by adding a session-only
-plugin directory:
+Contained Claude Code uses persistent standalone hook settings instead of a
+session-only plugin directory. `ccc-agent setup --system` writes a managed drop-in
+under `/etc/claude-code/managed-settings.d/`; `ccc-agent setup --user` writes the
+same hooks to `~/.claude/settings.json`. The hook commands point at the installed
+ccc-agent package assets.
 
-```text
-claude --plugin-dir /ccc-agent/plugins/claude-ccc-containment ...
-```
-
-The plugin directory is a read-only bwrap mount from package assets. The Stop
-hook reports turn boundaries to the trusted supervisor. `--bare` disables
-plugins/hooks, so a contained `--bare` run falls back to process-exit review.
+`ccc-agent run` does not append `--plugin-dir` to Claude by default. If Claude
+settings/hooks are absent or disabled, contained Claude runs fall back to
+process-exit review.
 
 ## Hermes
 
-Contained Hermes receives a bundled plugin through environment variables:
-
-```text
-HERMES_BUNDLED_PLUGINS=/ccc-agent/plugins/hermes
-HERMES_ACCEPT_HOOKS=1
-```
-
-The plugin injects CCC review/commit reminders, reports turn/session boundaries,
-and surfaces kept-file choices in final responses when needed. It still does not
-own commit authority; it calls trusted `ccc-agent turn-*` operations.
+`ccc-agent` no longer injects `HERMES_BUNDLED_PLUGINS` or `HERMES_ACCEPT_HOOKS`
+by default. Hermes runs still get the BranchFS/bwrap boundary and process-exit
+freeze/status/policy review. Operators who want a Hermes native plugin can
+configure Hermes explicitly; commit authority remains in the trusted supervisor,
+not in the plugin.
 
 ## OpenCode and generic commands
 

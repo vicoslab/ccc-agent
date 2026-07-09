@@ -1,18 +1,17 @@
 """``ccc-agent setup``: wire the pip-installed runtime into a system/user env.
 
 `pip install ccc-agent` places the Python package, the unified ``ccc-agent``
-console script, and the shell hooks/shims as package
-data. pip cannot (and should not) mutate a user's normal Codex/Claude config, so
-this command writes ccc-agent-owned config plus confined-only hook snippets:
+console script, and shell/plugin assets as package data. This command writes
+ccc-agent-owned runtime config plus optional transparent shims:
 
-  ccc-agent setup --system   # /etc/ccc-agent/config.json + optional shims
-  ccc-agent setup --user     # ~/.config/ccc-agent/config.json + optional shims
+  ccc-agent setup --system   # /etc/ccc-agent/config.json + /etc tool config
+  ccc-agent setup --user     # ~/.config/ccc-agent/config.json + user config
 
-`ccc-agent run` consumes that config and bind-mounts bundled native agent
-plugins read-only into bwrap only for a matching contained agent. Direct
-codex/claude runs do not see or use CCC hooks.
-The plugin entries point at bundled hook scripts under the installed package (under
-/usr for a system install, which the bwrap sandbox exposes read-only).
+`ccc-agent run` consumes that config and provides BranchFS/bwrap containment.
+Default agent integration is persistent-config/mount-only: Codex gets a plugin
+cache bind plus config enablement, Claude gets standalone settings hooks, and
+Hermes gets no default per-run plugin environment. Direct codex/claude/hermes
+argv/env is not modified by setup-generated defaults.
 """
 
 import argparse
@@ -34,14 +33,13 @@ def assets_dir():
 
 
 def plugins_dir():
-    """On-disk path to the bundled agent plugin packages.
+    """On-disk path to bundled agent integration assets.
 
-    These directories (codex-/claude-/hermes-ccc-containment) are root-owned and
-    read-only in a system install; ccc-agent run bind-mounts the matching one
-    read-only into the bwrap sandbox so a contained agent loads the CCC
-    lifecycle hooks through its NATIVE plugin mechanism.  Codex additionally
-    needs a persistent enabled-plugin entry in ~/.codex/config.toml; the plugin
-    files themselves are still injected read-only only inside ccc-agent."""
+    Codex assets are mounted read-only into its plugin-cache path for contained
+    sessions. Claude uses the same installed assets through standalone settings
+    hook commands. Hermes assets remain packaged for explicit/operator use but
+    are not injected by default.
+    """
     return os.path.join(assets_dir(), "plugins")
 
 
@@ -196,17 +194,6 @@ def write_conda_shim_hooks(conda_prefix, shim_dir):
 
 _SECRETS = [".ssh", ".gnupg", ".netrc", ".aws", ".kube", ".docker/config.json"]
 
-# Neutral in-sandbox mount root for plugin packages (outside any BranchFS view,
-# so bwrap does not mkdir mountpoints into the FUSE view).
-SANDBOX_PLUGIN_ROOT = "/ccc-agent/plugins"
-
-# Codex already runs inside ccc-agent's BranchFS/bwrap boundary.  Its own Linux
-# command sandbox nests another bwrap which is incompatible with CCC containers
-# that bind outer /proc into an unshared PID namespace (and may be forbidden
-# from mounting a fresh procfs).  Disable Codex's inner sandbox for contained
-# Codex sessions; ccc-agent remains the write-protection boundary.
-CODEX_DISABLE_INNER_SANDBOX_ARG = "--dangerously-bypass-approvals-and-sandbox"
-
 CODEX_PLUGIN_NAME = "ccc"
 CODEX_PLUGIN_MARKETPLACE = "ccc-agent"
 CODEX_PLUGIN_VERSION = "0.2.0"
@@ -322,18 +309,21 @@ def _strip_managed_codex_hook_state(text):
     return "".join(out)
 
 
-def ensure_codex_plugin_enabled(home, user=None):
+def ensure_codex_plugin_enabled(home, user=None, config_path=None):
     """Persist Codex config needed for ccc-agent's Codex plugin hooks.
 
     The plugin files are still supplied by ccc-agent's bwrap bind. Keeping only
-    the enabled-plugin setting in the user's config is safe outside ccc-agent:
+    the enabled-plugin setting in Codex config is safe outside ccc-agent:
     current Codex tolerates a missing plugin cache, and the bundled hook exits
-    immediately when CCC_AGENT_SESSION is absent.
+    immediately when CCC_AGENT_SESSION is absent.  System installs can write the
+    same managed block to /etc/codex/config.toml so user config remains theirs.
     """
-    codex_dir = os.path.join(home, ".codex")
-    config_path = os.path.join(codex_dir, "config.toml")
+    config_path = config_path or os.path.join(home, ".codex", "config.toml")
+    codex_dir = os.path.dirname(config_path)
     created_dir = not os.path.exists(codex_dir)
-    os.makedirs(codex_dir, mode=0o700, exist_ok=True)
+    under_home = os.path.abspath(config_path).startswith(
+        os.path.abspath(home).rstrip(os.sep) + os.sep)
+    os.makedirs(codex_dir, mode=0o700 if under_home else 0o755, exist_ok=True)
     try:
         with open(config_path) as fh:
             existing = fh.read()
@@ -350,7 +340,7 @@ def ensure_codex_plugin_enabled(home, user=None):
 
     # If setup runs as root in a system install and creates the user's Codex
     # config, do not leave it root-owned.
-    if user and hasattr(os, "geteuid") and os.geteuid() == 0:
+    if under_home and user and hasattr(os, "geteuid") and os.geteuid() == 0:
         try:
             pw = pwd.getpwnam(user)
         except KeyError:
@@ -364,52 +354,123 @@ def ensure_codex_plugin_enabled(home, user=None):
     return config_path
 
 
-def build_agent_plugins(home, src_dir=None):
-    """Describe per-agent CCC plugin injection (replaces the old config-file
-    overlay ``agent_hooks``).  Each entry is consumed by ccc-agent run, which
-    bind-mounts ``src`` read-only at ``sandbox_path`` for a matching contained
-    agent, inserts ``argv`` right after the agent executable, and exports
-    ``setenv`` into the sandbox.  Direct claude/hermes runs get none of this;
-    Codex keeps only a persistent enabled-plugin config entry and receives the
-    plugin files through this read-only cache bind when contained.
+CLAUDE_SYSTEM_SETTINGS = "/etc/claude-code/managed-settings.d/50-ccc-agent.json"
 
-      claude  -- native ``--plugin-dir`` session-only plugin load (verified).
-      codex   -- plugin mounted at Codex's installed-plugin cache path, paired
-                 with a persistent enabled/trusted plugin entry in
-                 ~/.codex/config.toml. The Stop hook commits the turn with
-                 default-keep and blocks final idle/stop once with a kept-file
-                 prompt when user review is required. ``argv`` disables Codex's
-                 nested Linux sandbox because ccc-agent is already the
-                 containment boundary.
-      hermes  -- native bundled-plugin dir via HERMES_BUNDLED_PLUGINS, with
-                 HERMES_ACCEPT_HOOKS=1 to skip the interactive consent prompt.
+
+def _claude_plugin_root(src_dir=None):
+    return os.path.join(src_dir or plugins_dir(), "claude-ccc-containment")
+
+
+def claude_standalone_hooks(plugin_root=None):
+    """Claude settings.json hook config equivalent to the old plugin hooks.
+
+    Commands are absolute paths into the installed ccc-agent assets.  In the CCC
+    system image these live under /opt and are already visible through bwrap's
+    read-only /opt bind, so Claude can load them without a per-launch
+    --plugin-dir.
+    """
+    root = plugin_root or _claude_plugin_root()
+    context = os.path.join(root, "hooks", "ccc-context-hook.sh")
+    stop = os.path.join(root, "hooks", "ccc-stop-hook.sh")
+
+    def command(path):
+        return {"type": "command", "command": path}
+
+    return {
+        "SessionStart": [{"hooks": [command(context)]}],
+        "SessionEnd": [{"hooks": [command(context)]}],
+        "SessionStop": [{"hooks": [command(context)]}],
+        "UserPromptSubmit": [{"hooks": [command(context)]}],
+        "Stop": [{"hooks": [command(stop), command(context)]}],
+    }
+
+
+def _is_managed_claude_hook_group(group):
+    for hook in group.get("hooks", ()) if isinstance(group, dict) else ():
+        command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
+        if "claude-ccc-containment/hooks/ccc-" in command:
+            return True
+    return False
+
+
+def _merge_claude_hooks(settings, managed_hooks):
+    settings = dict(settings or {})
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    else:
+        hooks = {key: list(value) if isinstance(value, list) else []
+                 for key, value in hooks.items()}
+    for event, groups in managed_hooks.items():
+        existing = [group for group in hooks.get(event, [])
+                    if not _is_managed_claude_hook_group(group)]
+        hooks[event] = existing + list(groups)
+    settings["hooks"] = hooks
+    return settings
+
+
+def ensure_claude_hooks_enabled(home, user=None, settings_path=None,
+                                plugin_root=None):
+    """Persist Claude Code hooks without using per-launch --plugin-dir.
+
+    User mode writes ~/.claude/settings.json.  System mode can pass
+    /etc/claude-code/managed-settings.d/50-ccc-agent.json, which Claude Code
+    documents as a managed drop-in settings source on Linux/WSL.
+    """
+    settings_path = settings_path or os.path.join(home, ".claude", "settings.json")
+    settings_dir = os.path.dirname(settings_path)
+    under_home = os.path.abspath(settings_path).startswith(
+        os.path.abspath(home).rstrip(os.sep) + os.sep)
+    created_dir = not os.path.exists(settings_dir)
+    os.makedirs(settings_dir, mode=0o700 if under_home else 0o755, exist_ok=True)
+    try:
+        with open(settings_path) as fh:
+            existing = json.load(fh)
+    except OSError:
+        existing = {}
+    settings = _merge_claude_hooks(existing, claude_standalone_hooks(plugin_root))
+    with open(settings_path, "w") as fh:
+        json.dump(settings, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.chmod(settings_path, 0o644)
+
+    if under_home and user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            return settings_path
+        try:
+            if created_dir:
+                os.chown(settings_dir, pw.pw_uid, pw.pw_gid)
+            os.chown(settings_path, pw.pw_uid, pw.pw_gid)
+        except OSError:
+            pass
+    return settings_path
+
+
+def build_agent_plugins(home, src_dir=None):
+    """Describe mount-only plugin assets used by ccc-agent run.
+
+    Runtime config should not mutate the launched CLI argv/env by default.
+    Setup persists agent configuration where supported:
+
+      codex  -- /etc/codex/config.toml or ~/.codex/config.toml enables/trusts
+                the plugin; ccc-agent run only supplies the read-only plugin
+                cache mount.
+      claude -- /etc/claude-code/managed-settings.d or ~/.claude/settings.json
+                loads standalone hooks, so no --plugin-dir is needed.
+      hermes -- no default per-run plugin env injection; process-exit review
+                remains authoritative.
     """
     src = src_dir or plugins_dir()
     codex_cache_path = codex_plugin_cache_path(home)
     codex_cache_parent = os.path.dirname(codex_cache_path)
-    claude_sandbox = os.path.join(SANDBOX_PLUGIN_ROOT, "claude-ccc-containment")
-    hermes_bundle_root = os.path.join(SANDBOX_PLUGIN_ROOT, "hermes")
     return {
         "codex": {
             "src": os.path.join(src, "codex-ccc-containment"),
             "sandbox_path": codex_cache_path,
             "ensure_dirs": [codex_cache_parent],
             "plugin_id": CODEX_PLUGIN_ID,
-            "argv": [CODEX_DISABLE_INNER_SANDBOX_ARG],
-        },
-        "claude": {
-            "src": os.path.join(src, "claude-ccc-containment"),
-            "sandbox_path": claude_sandbox,
-            "argv": ["--plugin-dir", claude_sandbox],
-        },
-        "hermes": {
-            "src": os.path.join(src, "hermes-ccc-containment"),
-            "sandbox_path": os.path.join(hermes_bundle_root,
-                                         "ccc-agent"),
-            "setenv": {
-                "HERMES_BUNDLED_PLUGINS": hermes_bundle_root,
-                "HERMES_ACCEPT_HOOKS": "1",
-            },
         },
     }
 
@@ -517,14 +578,15 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "cred_mounts": [],
         "cred_mask": [],
         "cred_env": {},
-        "_agent_plugins_comment": "Native CCC lifecycle-hook plugins, injected "
-                                  "read-only into bwrap ONLY for a matching "
-                                  "contained agent (codex/claude/hermes). The "
-                                  "launcher mounts 'src' at 'sandbox_path', "
-                                  "inserts 'argv' after the agent executable, "
-                                  "and exports 'setenv'. Direct codex/claude/"
-                                  "hermes runs load none of this and the user's "
-                                  "own config is never edited or hidden.",
+        "_agent_plugins_comment": "Mount-only CCC plugin assets for tools that "
+                                  "load persistent config. By default this is "
+                                  "Codex only: setup enables/trusts the plugin "
+                                  "in Codex config, while ccc-agent run only "
+                                  "binds the read-only plugin cache. Claude "
+                                  "hooks are written to Claude settings and "
+                                  "Hermes gets no default per-run plugin env. "
+                                  "No default entry appends agent CLI argv or "
+                                  "sets launch env.",
         "agent_hook_mode": "plugins",
         "agent_plugins": agent_plugins,
         "roots": [root],
@@ -570,6 +632,8 @@ def main(argv=None, prog="ccc-agent setup"):
     parser.add_argument("--shell-path-hook",
                         help="write a sourceable shell snippet that prepends "
                              "--link-dir to PATH (for profile/rc integration)")
+    parser.add_argument("--codex-config", help=argparse.SUPPRESS)
+    parser.add_argument("--claude-settings", help=argparse.SUPPRESS)
     parser.add_argument("--ssh-shell-router",
                         help="symlink the bundled SSH shell router to this "
                              "stable executable path")
@@ -630,13 +694,26 @@ def main(argv=None, prog="ccc-agent setup"):
         config["agent_plugins"] = {}
         config["agent_hook_mode"] = "disabled"
     else:
-        codex_config = ensure_codex_plugin_enabled(home, user=user)
+        if mode == "system":
+            codex_config_path = args.codex_config or "/etc/codex/config.toml"
+            claude_settings_path = args.claude_settings or CLAUDE_SYSTEM_SETTINGS
+        else:
+            codex_config_path = args.codex_config or None
+            claude_settings_path = args.claude_settings or None
+        codex_config = ensure_codex_plugin_enabled(
+            home, user=user, config_path=codex_config_path)
+        claude_settings = ensure_claude_hooks_enabled(
+            home, user=user, settings_path=claude_settings_path)
         sys.stderr.write(
-            "ccc-agent setup: agent plugins reference bundled assets under %s "
-            "(read-only, injected per contained run)\n" % plugins_dir())
+            "ccc-agent setup: agent plugin assets under %s are mounted "
+            "read-only when needed; launch argv/env is not modified by "
+            "default\n" % plugins_dir())
         sys.stderr.write(
             "ccc-agent setup: ensured Codex plugin enablement in %s\n"
             % codex_config)
+        sys.stderr.write(
+            "ccc-agent setup: ensured Claude standalone hooks in %s\n"
+            % claude_settings)
 
     _write_json(config_file, config)
     sys.stderr.write("ccc-agent setup: wrote %s\n" % config_file)
