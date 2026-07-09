@@ -14,6 +14,7 @@ AGENT_DIR = os.path.dirname(HERE)
 ASSETS = os.path.join(AGENT_DIR, "ccc_agent", "assets")
 PLUGINS = os.path.join(ASSETS, "plugins")
 SHIM_SH = os.path.join(ASSETS, "shims", "ccc-agent-shim.sh")
+SSH_ROUTER_SH = os.path.join(ASSETS, "shims", "ccc-agent-ssh-shell-router.sh")
 SOFTSANDBOX_SH = os.path.join(ASSETS, "scripts", "softsandbox.sh")
 HOOKS = [os.path.join(ASSETS, "hooks", name)
          for name in ("claude-stop-hook.sh", "codex-stop-hook.sh",
@@ -34,8 +35,8 @@ HERMES_PLUGIN_INIT = os.path.join(
 
 class TestShellSyntax(unittest.TestCase):
     def test_all_scripts_parse(self):
-        for script in ([SHIM_SH, SOFTSANDBOX_SH, CLAUDE_CONTEXT_HOOK] +
-                       HOOKS + PLUGIN_STOP_HOOKS):
+        for script in ([SHIM_SH, SSH_ROUTER_SH, SOFTSANDBOX_SH,
+                       CLAUDE_CONTEXT_HOOK] + HOOKS + PLUGIN_STOP_HOOKS):
             proc = subprocess.run(["bash", "-n", script],
                                   stderr=subprocess.PIPE, text=True)
             self.assertEqual(proc.returncode, 0,
@@ -627,6 +628,104 @@ class TestShim(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("REAL:", proc.stdout)
         self.assertIn("refusing", proc.stderr)
+
+
+class TestSshShellRouter(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        tmp = self._tmp.name
+        self.bin = os.path.join(tmp, "bin")
+        os.makedirs(self.bin)
+        self.home = os.path.join(tmp, "home")
+        os.makedirs(self.home)
+        self.launcher = os.path.join(self.bin, "ccc-agent")
+        with open(self.launcher, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "i=0\n"
+                     "for arg in \"$@\"; do\n"
+                     "  i=$((i + 1))\n"
+                     "  printf 'ARG%d:%s\\n' \"$i\" \"$arg\"\n"
+                     "done\n"
+                     "printf 'ORIG:%s\\n' \"${CCC_AGENT_SSH_ORIGINAL_COMMAND:-}\"\n")
+        os.chmod(self.launcher, 0o755)
+        self.real_shell = os.path.join(self.bin, "real-shell")
+        with open(self.real_shell, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "i=0\n"
+                     "for arg in \"$@\"; do\n"
+                     "  i=$((i + 1))\n"
+                     "  printf 'SHELLARG%d:%s\\n' \"$i\" \"$arg\"\n"
+                     "done\n")
+        os.chmod(self.real_shell, 0o755)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_router(self, command, enabled=True, extra_env=None):
+        env = {
+            "PATH": "%s:/usr/bin:/bin" % self.bin,
+            "HOME": self.home,
+            "CCC_AGENT_CLI": self.launcher,
+            "CCC_AGENT_REAL_SHELL": self.real_shell,
+            "CCC_AGENT_ENABLE_SHIMS": "1" if enabled else "0",
+        }
+        env.update(extra_env or {})
+        return subprocess.run([SSH_ROUTER_SH, "-c", command], env=env,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              text=True)
+
+    def assert_routed(self, command, agent):
+        proc = self.run_router(command)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ARG1:run", proc.stdout)
+        self.assertIn("ARG2:--agent", proc.stdout)
+        self.assertIn("ARG3:%s" % agent, proc.stdout)
+        self.assertIn("ARG4:--", proc.stdout)
+        self.assertIn("ARG5:%s" % self.real_shell, proc.stdout)
+        self.assertIn("ARG6:-c", proc.stdout)
+        self.assertIn("ARG7:%s" % command, proc.stdout)
+        self.assertIn("ORIG:%s" % command, proc.stdout)
+        self.assertIn("redirect active", proc.stderr)
+
+    def test_routes_direct_claude_and_codex_commands(self):
+        self.assert_routed("claude --app", "claude")
+        self.assert_routed("codex exec task", "codex")
+
+    def test_routes_absolute_agent_paths(self):
+        self.assert_routed("/home/domen/.local/bin/claude --version", "claude")
+        self.assert_routed("/storage/user/conda-envs/codex/bin/codex --help", "codex")
+
+    def test_routes_claude_remote_server_and_cli_paths(self):
+        self.assert_routed(
+            "/home/domen/.claude/remote/srv/abc123/server --stdio", "claude")
+        self.assert_routed(
+            "bash -lc '/home/domen/.claude/remote/ccd-cli/2.1.202 --continue'",
+            "claude")
+
+    def test_routes_codex_state_executables(self):
+        self.assert_routed(
+            "/home/domen/.codex/remote/exec-server --stdio", "codex")
+
+    def test_does_not_route_mentions_that_are_not_executables(self):
+        proc = self.run_router("grep claude ~/.claude/remote/run/log")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SHELLARG1:-c", proc.stdout)
+        self.assertIn("SHELLARG2:grep claude ~/.claude/remote/run/log", proc.stdout)
+        self.assertNotIn("ARG1:run", proc.stdout)
+
+    def test_disabled_or_nested_sessions_pass_through(self):
+        proc = self.run_router("claude --app", enabled=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SHELLARG1:-c", proc.stdout)
+        self.assertIn("SHELLARG2:claude --app", proc.stdout)
+        self.assertNotIn("ARG1:run", proc.stdout)
+
+        proc = self.run_router("claude --app", extra_env={"CCC_AGENT_SESSION": "agent-x"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SHELLARG1:-c", proc.stdout)
+        self.assertIn("SHELLARG2:claude --app", proc.stdout)
+        self.assertNotIn("ARG1:run", proc.stdout)
 
 
 class TestStopHookSelfRepair(unittest.TestCase):

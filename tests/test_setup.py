@@ -121,6 +121,25 @@ class TestCondaShimActivation(unittest.TestCase):
             self.shimdir, self.local_bin_for_test(), self.conda_bin))
         self.assertEqual(lines[1], self.shimdir)
 
+    def test_setup_links_ssh_shell_router_when_requested(self):
+        config = os.path.join(self.tmp, "config.json")
+        router = os.path.join(self.tmp, "install", "bin", "ccc-ssh-shell-router")
+        with mock.patch.dict(os.environ, {"HOME": self.home}, clear=False):
+            rc = setup_mod.main([
+                "--user",
+                "--config", config,
+                "--state-dir", os.path.join(self.tmp, "state"),
+                "--no-hooks",
+                "--enable-shims",
+                "--link-dir", self.shimdir,
+                "--ssh-shell-router", router,
+            ])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.islink(router), router)
+        target = os.readlink(router)
+        self.assertTrue(target.endswith("ccc-agent-ssh-shell-router.sh"), target)
+        self.assertTrue(os.access(router, os.X_OK), router)
+
     def local_bin_for_test(self):
         local_bin = os.path.join(self.home, ".local", "bin")
         os.makedirs(local_bin, exist_ok=True)

@@ -532,6 +532,9 @@ def main(argv=None, prog="ccc-agent setup"):
     parser.add_argument("--shell-path-hook",
                         help="write a sourceable shell snippet that prepends "
                              "--link-dir to PATH (for profile/rc integration)")
+    parser.add_argument("--ssh-shell-router",
+                        help="symlink the bundled SSH shell router to this "
+                             "stable executable path")
     parser.add_argument("--conda-prefix",
                         help="conda env prefix for --conda-activate-shims "
                              "(default: $CONDA_PREFIX)")
@@ -546,7 +549,8 @@ def main(argv=None, prog="ccc-agent setup"):
     shims = os.path.join(assets, "shims")
     for name in os.listdir(hooks):
         _make_executable(os.path.join(hooks, name))
-    _make_executable(os.path.join(shims, "ccc-agent-shim.sh"))
+    for name in os.listdir(shims):
+        _make_executable(os.path.join(shims, name))
     # Plugin-bundled hook scripts must stay executable through the read-only
     # bwrap mount (pip can drop the +x bit on package data).
     for root, _dirs, files in os.walk(plugins_dir()):
@@ -615,6 +619,19 @@ def main(argv=None, prog="ccc-agent setup"):
             hook_path = write_shell_path_hook(args.shell_path_hook, args.link_dir)
             sys.stderr.write("ccc-agent setup: wrote shim PATH hook %s\n"
                              % hook_path)
+        if args.ssh_shell_router:
+            router_src = os.path.join(shims, "ccc-agent-ssh-shell-router.sh")
+            router_link = args.ssh_shell_router
+            os.makedirs(os.path.dirname(router_link), exist_ok=True)
+            try:
+                if os.path.islink(router_link) or os.path.exists(router_link):
+                    os.unlink(router_link)
+                os.symlink(router_src, router_link)
+                sys.stderr.write("ccc-agent setup: linked SSH shell router %s\n"
+                                 % router_link)
+            except OSError as exc:
+                sys.stderr.write("ccc-agent setup: SSH shell router %s failed: %s\n"
+                                 % (router_link, exc))
 
     if args.conda_activate_shims:
         conda_prefix = args.conda_prefix or os.environ.get("CONDA_PREFIX")
