@@ -387,19 +387,30 @@ def _inferred_agent_plugin_names(config):
     return names
 
 
+def _direct_agent_command_matches(config, agent):
+    """Return true when argv[0] is the agent CLI that can accept plugin argv.
+
+    SSH routers often label containment sessions as codex/claude because the
+    payload eventually starts those tools, but the direct command is a shell or
+    server helper such as `/bin/bash -c ...` or `~/.claude/remote/.../server`.
+    Those commands cannot accept Codex YOLO flags or Claude `--plugin-dir`; only
+    decorate direct agent CLI invocations.
+    """
+    if not config.agent_command:
+        return False
+    return _agent_token(config.agent_command[0]) == str(agent or "").lower()
+
+
 def _matched_agent_plugin(config):
-    """Return the validated plugin spec for the contained agent, or None.
+    """Return the validated plugin spec for the contained direct agent, or None.
 
     Returns None when no plugin matches the agent, when the trusted plugin
     source does not exist on the host (graceful degradation -> process-exit
-    review still runs), or when the agent command uses ``--bare`` (which
+    review still runs), or when the direct agent command uses ``--bare`` (which
     disables plugins/hooks, so per-turn injection would be a silent no-op).
-    Direct, uncontained codex/claude/hermes runs never reach here -- the
-    launcher only injects for a command it identified as that agent.
-
-    Explicit agent selection (``--agent codex``) wins over the executable
-    basename.  If no configured plugin matches that explicit kind,
-    fall back to basename inference so existing descriptive labels still work.
+    SSH-routed server/bootstrap commands may be labelled with ``--agent`` for
+    session metadata, but they are not decorated unless argv[0] is the agent CLI
+    itself.
     """
     if "--bare" in config.agent_command:
         return None
@@ -417,11 +428,13 @@ def _matched_agent_plugin(config):
     if explicit_kind and explicit_kind != "command":
         explicit_agent = _plugin_key_for_token(config, explicit_kind)
         if explicit_agent:
-            return validated(explicit_agent)
+            if _direct_agent_command_matches(config, explicit_agent):
+                return validated(explicit_agent)
+            return None
 
     names = _inferred_agent_plugin_names(config)
     for agent in sorted(config.agent_plugins):
-        if agent.lower() in names:
+        if agent.lower() in names and _direct_agent_command_matches(config, agent):
             return validated(agent)
     return None
 
