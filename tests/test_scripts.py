@@ -866,6 +866,14 @@ class TestSshShellRouter(unittest.TestCase):
         self.assert_routed(
             "/home/domen/.codex/remote/exec-server --stdio", "codex")
 
+    def test_routes_codex_app_server_after_path_prepending_snippet(self):
+        command = 'PATH="${CODEX_INSTALL_PATH:-$HOME/.local/bin}:$PATH"; export PATH; codex app-server proxy'
+        self.assert_routed(command, "codex")
+
+    def test_routes_codex_app_server_inside_shell_after_path_prepending_snippet(self):
+        command = "bash -lc 'PATH=\"${CODEX_INSTALL_PATH:-$HOME/.local/bin}:$PATH\"; export PATH; codex app-server proxy'"
+        self.assert_routed(command, "codex")
+
     def test_does_not_route_mentions_that_are_not_executables(self):
         proc = self.run_router("grep claude ~/.claude/remote/run/log")
         self.assertEqual(proc.returncode, 0, proc.stderr)

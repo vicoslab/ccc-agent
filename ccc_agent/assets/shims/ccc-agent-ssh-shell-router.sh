@@ -115,11 +115,18 @@ def token_agent(token):
     return None
 
 
+def shell_tokens(command_string):
+    lexer = shlex.shlex(command_string, posix=True, punctuation_chars=";&|")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
 def detect_command(command_string, depth=0):
     if depth > 3:
         return None
     try:
-        tokens = shlex.split(command_string, posix=True)
+        tokens = shell_tokens(command_string)
     except ValueError:
         return None
     i = 0
