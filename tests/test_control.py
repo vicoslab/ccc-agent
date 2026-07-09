@@ -23,8 +23,9 @@ class TestControlChannel(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _server(self, handler):
-        srv = ControlServer(self.sock, handler, self.token)
+    def _server(self, handler, hook_token=None):
+        srv = ControlServer(self.sock, handler, self.token,
+                            hook_token=hook_token)
         srv.start()
         self.addCleanup(srv.stop)
         return srv
@@ -109,6 +110,31 @@ class TestControlChannel(unittest.TestCase):
         self.assertEqual(resp["echo_op"], "turn-resolve")
         self.assertEqual(resp["echo_decision"], "discard")
         self.assertEqual(resp["echo_paths"], ["/storage/user/held.txt"])
+
+    def test_workspace_commands_require_hook_token_and_session(self):
+        def handler(req):
+            return {"echo_op": req["op"], "echo_path": req.get("path"),
+                    "echo_hook_session": req.get("hook_session")}
+
+        self._server(handler, hook_token="hook-tok")
+
+        with self.assertRaises(ControlError) as ctx:
+            ControlClient(self.sock, self.token).add_workspace(
+                "/storage/user/Projects/b", hook_session="hook-a")
+        self.assertIn("hook-only", str(ctx.exception))
+
+        client = ControlClient(self.sock, self.token, hook_token="hook-tok")
+
+        self.assertEqual(client.add_workspace("/storage/user/Projects/b",
+                                             hook_session="hook-a"),
+                         {"ok": True, "echo_op": "turn-add-workspace",
+                          "echo_path": "/storage/user/Projects/b",
+                          "echo_hook_session": "hook-a"})
+        self.assertEqual(client.remove_workspace("/storage/user/Projects/b",
+                                                hook_session="hook-a"),
+                         {"ok": True, "echo_op": "turn-remove-workspace",
+                          "echo_path": "/storage/user/Projects/b",
+                          "echo_hook_session": "hook-a"})
 
     def test_kept_status_and_review_kept_pass_control_ops(self):
         def handler(req):

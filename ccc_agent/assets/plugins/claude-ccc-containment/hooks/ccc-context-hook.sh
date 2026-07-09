@@ -36,6 +36,7 @@ if [ -z "$PLUGIN_ROOT" ]; then
     PLUGIN_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 fi
 SKILL_PATH="$PLUGIN_ROOT/skills/ccc-commit/SKILL.md"
+CTL="${CCC_AGENT_CLI:-ccc-agent}"
 
 emit_context() {
     hook_event=$1
@@ -68,14 +69,63 @@ print(text.strip())
 PY
 }
 
+HOOK_WORKSPACE=$(printf '%s' "$INPUT" | python3 -c 'import json, os, sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    data={}
+for key in ("workspace", "workspace_dir", "cwd", "current_working_directory"):
+    value=data.get(key)
+    if value:
+        print(value)
+        break
+else:
+    print(os.getcwd())' 2>/dev/null || pwd)
+HOOK_SESSION=$(printf '%s' "$INPUT" | python3 -c 'import json, os, sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    data={}
+for key in ("session_id", "conversation_id", "thread_id", "transcript_path"):
+    value=data.get(key)
+    if value:
+        print(value)
+        break
+else:
+    print(os.environ.get("CCC_AGENT_HOOK_SESSION") or os.environ.get("CCC_AGENT_SESSION", ""))' 2>/dev/null || true)
+
+workspace_scope() {
+    action=$1
+    if [ -z "${CCC_AGENT_CONTROL_SOCK:-}" ] || [ -z "${CCC_AGENT_HOOK_TOKEN:-}" ]; then
+        return 0
+    fi
+    if [ -z "$HOOK_SESSION" ] || [ -z "$HOOK_WORKSPACE" ]; then
+        return 0
+    fi
+    if ! command -v "$CTL" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$action" = "add" ]; then
+        workspace_cmd=turn-add-workspace
+    else
+        workspace_cmd=turn-remove-workspace
+    fi
+    "$CTL" "$workspace_cmd" --agent-session "$HOOK_SESSION" \
+        "$HOOK_WORKSPACE" >/dev/null 2>&1 || true
+}
+
 case "$EVENT" in
     SessionStart)
+        workspace_scope add
         BODY=$(skill_body)
         if [ -n "$BODY" ]; then
             printf '%s\n\n%s\n' \
                 "CCC contained-session skill ccc-commit is active because CCC_AGENT_SESSION is set. Its rules are part of the current session context." \
                 "$BODY" | emit_context SessionStart
         fi
+        ;;
+    SessionEnd|SessionStop)
+        workspace_scope remove
         ;;
     UserPromptSubmit)
         printf '%s\n' \
@@ -90,7 +140,6 @@ case "$EVENT" in
         if [ "$STOP_ACTIVE" = "1" ]; then
             exit 0
         fi
-        CTL="${CCC_AGENT_CLI:-ccc-agent}"
         if ! command -v "$CTL" >/dev/null 2>&1; then
             exit 0
         fi

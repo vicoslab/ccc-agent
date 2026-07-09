@@ -22,8 +22,9 @@ class TestCtlSocket(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _serve(self, handler):
-        srv = ControlServer(self.sock, handler, self.token)
+    def _serve(self, handler, hook_token=None):
+        srv = ControlServer(self.sock, handler, self.token,
+                            hook_token=hook_token)
         srv.start()
         self.addCleanup(srv.stop)
 
@@ -75,6 +76,39 @@ class TestCtlSocket(unittest.TestCase):
         code, _out, _err = self._run(["turn-approve", "appr-9"], self._env())
         self.assertEqual(code, 0)
         self.assertEqual(self.calls[-1]["decision"], "yes")
+
+    def test_workspace_commands_require_hook_token_and_session(self):
+        self._serve(self._record({"verdict": "workspace-updated",
+                                  "action": "add",
+                                  "workspace": "/storage/user/Projects/proj-b",
+                                  "workspaces": ["/storage/user/Projects/proj-b"],
+                                  "added": True,
+                                  "owned": True}),
+                    hook_token="hook-tok")
+        env = self._env()
+        env["CCC_AGENT_HOOK_TOKEN"] = "hook-tok"
+
+        code, out, _err = self._run(["turn-add-workspace", "--agent-session",
+                                     "claude-session-1",
+                                     "/storage/user/Projects/proj-b"], env)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls[-1]["op"], "turn-add-workspace")
+        self.assertEqual(self.calls[-1]["path"], "/storage/user/Projects/proj-b")
+        self.assertEqual(self.calls[-1]["hook_session"], "claude-session-1")
+        self.assertIn("workspace added", out)
+
+    def test_workspace_commands_reject_non_hook_callers(self):
+        self._serve(self._record({"verdict": "workspace-updated"}),
+                    hook_token="hook-tok")
+
+        code, _out, err = self._run(["turn-add-workspace", "--agent-session",
+                                     "claude-session-1",
+                                     "/storage/user/Projects/proj-b"], self._env())
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.calls, [])
+        self.assertIn("hook-only", err)
 
     def test_no_socket_degrades_to_zero(self):
         # outside a contained session (no control env): never block the stop

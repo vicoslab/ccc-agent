@@ -142,6 +142,17 @@ A plugin may also expose agent-native commands such as `/ccc:status`,
 `/ccc:commit`, `/ccc:discard`, and `/ccc:op`. Those commands translate the user's
 request into the trusted `ccc-agent turn-*` control operations.
 
+Hook-only workspace updates are for server-style agents whose active project can
+change inside a single outer `ccc-agent run` containment session. The outer
+session may contain several inner agent sessions, such as Codex app-server
+clients, Hermes gateway conversations, or Claude agent commands. Trusted hooks
+identify the inner agent session with `--agent-session`, set one current
+workspace for that inner session, and remove only that workspace when the inner
+session ends. These commands are intentionally not agent self-service commands;
+they require the hook token on the control socket. They do not `cd` the running
+agent or remount anything. Additional static `--scope` paths stay allowed;
+anything still outside the active scopes is kept for review.
+
 ## Resuming and recovering
 
 Resume an interrupted or reviewable session:

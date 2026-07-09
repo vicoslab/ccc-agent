@@ -44,13 +44,14 @@ from .branchfs import BranchfsCli, FakeBranchFS
 from .commit_failures import has_permission_failures, permission_failures
 from .control import (ControlClient, VERDICT_COMMITTED, VERDICT_DISCARDED,
                       VERDICT_HELD, VERDICT_KEPT_STATUS,
-                      VERDICT_NEEDS_APPROVAL, VERDICT_NEEDS_KEPT_REVIEW)
+                      VERDICT_NEEDS_APPROVAL, VERDICT_NEEDS_KEPT_REVIEW,
+                      VERDICT_WORKSPACE_UPDATED)
 from .control import ControlError as ChannelError
 from .ctl import CHECK_REPAIR, Controller, ControlError
 from .paths import AliasMap
-from .runner import (ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN, ENV_SESSION,
-                     ResumeError, RootSpec, RunnerConfig, resume_session,
-                     run_session)
+from .runner import (ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN, ENV_HOOK_SESSION,
+                     ENV_HOOK_TOKEN, ENV_SESSION, ResumeError, RootSpec,
+                     RunnerConfig, resume_session, run_session)
 from .session import SessionStore
 
 CONFIG_ENV = "CCC_AGENT_CONFIG"
@@ -935,10 +936,15 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     # per-invocation overrides.
     workspace = args.workspace or os.getcwd()
     config_policy = config.get("policy", {})
+    static_scopes = (list(args.scope) +
+                     list(config_policy.get("allowed_scopes", ())))
     policy = {
         "mode": config_policy.get("mode", args.policy),
-        "allowed_scopes": ([workspace] + list(args.scope)
-                           + list(config_policy.get("allowed_scopes", ()))),
+        "allowed_scopes": [workspace] + static_scopes,
+        # Dynamic turn workspace commands mutate only this list and its matching
+        # allowed_scopes entries. Extra --scope/config scopes and per-turn
+        # approved paths remain preserved allowed scopes.
+        "workspace_scopes": [workspace],
         "hide_patterns": (list(args.hide) + list(config.get("hide_patterns", ()))
                           + list(config_policy.get("hide_patterns", ()))),
         "ignore_patterns": list(config_policy.get("ignore_patterns", ())),
@@ -1229,6 +1235,13 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
     return 0
 
 
+def _turn_workspace_path(value):
+    path = value or os.getcwd()
+    if not str(path).startswith("/"):
+        path = os.path.abspath(path)
+    return path
+
+
 def _ctl_socket(args, env):
     """Per-turn control ops that run from INSIDE the sandbox.  They reach the
     supervisor over the control socket (CCC_AGENT_CONTROL_SOCK/TOKEN) — the
@@ -1238,12 +1251,23 @@ def _ctl_socket(args, env):
     env = os.environ if env is None else env
     sock = env.get(ENV_CONTROL_SOCK)
     token = env.get(ENV_CONTROL_TOKEN)
+    workspace_op = args.cmd in ("turn-add-workspace", "turn-remove-workspace")
     if not sock or not token:
         sys.stderr.write(
             "ccc-agent: no control socket; per-turn control unavailable "
             "(not inside a contained session)\n")
-        return 0
-    client = ControlClient(sock, token)
+        return 1 if workspace_op else 0
+    hook_token = env.get(ENV_HOOK_TOKEN)
+    hook_session = getattr(args, "hook_session", None) or env.get(ENV_HOOK_SESSION)
+    if workspace_op and (not hook_token or not hook_session):
+        sys.stderr.write(
+            "ccc-agent: hook-only workspace command requires "
+            "CCC_AGENT_HOOK_TOKEN and --agent-session or CCC_AGENT_HOOK_SESSION\n")
+        return 1
+    if workspace_op:
+        client = ControlClient(sock, token, hook_token=hook_token)
+    else:
+        client = ControlClient(sock, token)
     try:
         if args.cmd == "turn-finalize":
             resp = client.finalize_turn(
@@ -1262,6 +1286,12 @@ def _ctl_socket(args, env):
                                        commit_paths=commit_paths,
                                        keep_paths=keep_paths,
                                        discard_paths=discard_paths)
+        elif args.cmd == "turn-add-workspace":
+            resp = client.add_workspace(_turn_workspace_path(args.path),
+                                        hook_session=hook_session)
+        elif args.cmd == "turn-remove-workspace":
+            resp = client.remove_workspace(_turn_workspace_path(args.path),
+                                           hook_session=hook_session)
         else:  # turn-resolve
             if getattr(args, "all_kept", False):
                 status = client.kept_status()
@@ -1271,7 +1301,7 @@ def _ctl_socket(args, env):
             resp = client.resolve_turn(args.decision, paths)
     except ChannelError as exc:
         sys.stderr.write("ccc-agent: control error: %s\n" % exc)
-        return 0
+        return 1 if workspace_op else 0
     verdict = resp.get("verdict")
     if (args.cmd == "turn-finalize" and
             getattr(args, "default_keep", False) and
@@ -1286,6 +1316,9 @@ def _ctl_socket(args, env):
         _write_kept_review_prompt(resp, sys.stderr,
                                   details=getattr(args, "details", False))
         return 2
+    if verdict == VERDICT_WORKSPACE_UPDATED:
+        _write_workspace_update(resp, sys.stdout)
+        return 0
     if verdict == VERDICT_NEEDS_APPROVAL:
         paths = resp.get("out_of_scope", [])
         token2 = resp.get("approval_token")
@@ -1375,6 +1408,21 @@ def _write_default_keep_summary(resp, stream):
         kept_paths = resp.get("held")
     kept = len(kept_paths or [])
     stream.write("committed (%d), kept local (%d)\n" % (committed, kept))
+
+
+def _write_workspace_update(resp, stream):
+    action = resp.get("action") or "update"
+    label = {
+        "set": "set",
+        "add": "added",
+        "remove": "removed",
+    }.get(action, "updated")
+    workspace = resp.get("workspace") or "(unknown)"
+    workspaces = list(resp.get("workspaces") or [])
+    stream.write("workspace %s: %s\n" % (label, workspace))
+    stream.write("active workspaces: %d\n" % len(workspaces))
+    for path in workspaces:
+        stream.write("  - %s\n" % path)
 
 
 def _write_discarded_paths(paths, stale=None, stream=None, details=False):
@@ -1477,6 +1525,10 @@ def _split_csv_paths(value):
     return [p for p in str(value).split(",") if p]
 
 
+_TURN_SOCKET_OPS = (
+    "turn-finalize", "turn-approve", "turn-resolve", "turn-kept-status",
+    "turn-review-kept", "turn-add-workspace", "turn-remove-workspace",
+)
 _SESSION_ID_CTL_OPS = (
     "show", "status", "commit", "abort", "thaw", "finish",
     "turn-record", "turn-check",
@@ -1509,6 +1561,10 @@ _CTL_COMMAND_HELP = {
                          "non-workspace paths"),
     "turn-review-kept": ("inside-session plugin op: ask about remembered "
                          "kept non-workspace paths"),
+    "turn-add-workspace": ("hook-only plugin op: add a session-owned dynamic "
+                           "workspace scope for turn commits"),
+    "turn-remove-workspace": ("hook-only plugin op: remove a session-owned "
+                              "dynamic workspace scope from turn commits"),
 }
 
 
@@ -1685,13 +1741,20 @@ def main_ctl(argv=None, env=None, prog="ccc-agent"):
     rvk = _add_ctl_parser(sub, "turn-review-kept")
     rvk.add_argument("--details", action="store_true",
                      help="list exact paths instead of the compact user prompt")
+    for workspace_op in ("turn-add-workspace", "turn-remove-workspace"):
+        wp = _add_ctl_parser(sub, workspace_op)
+        wp.add_argument("--agent-session", dest="hook_session",
+                        help="inner agent-session id that owns this temporary workspace")
+        wp.add_argument("--hook-session", dest="hook_session",
+                        help=argparse.SUPPRESS)
+        wp.add_argument("path", nargs="?",
+                        help="workspace path (default: current directory)")
     args = parser.parse_args(argv)
 
     if args.cmd == "turn-resolve" and not args.paths and not args.all_kept:
         parser.error("turn-resolve requires --paths or --all-kept")
 
-    if args.cmd in ("turn-finalize", "turn-approve", "turn-resolve",
-                    "turn-kept-status", "turn-review-kept"):
+    if args.cmd in _TURN_SOCKET_OPS:
         return _ctl_socket(args, env)
 
     config = load_config(args.config, env=env)
@@ -1766,10 +1829,8 @@ def main_softsandbox(argv=None, env=None):
         return subprocess.call(["bash", str(script)] + argv, env=env)
 
 
-_CTL_OPS = (set(_SESSION_ID_CTL_OPS) | {
-    "list", "ls", "cleanup", "diff", "review", "turn-finalize",
-    "turn-approve", "turn-resolve", "turn-kept-status",
-    "turn-review-kept",
+_CTL_OPS = (set(_SESSION_ID_CTL_OPS) | set(_TURN_SOCKET_OPS) | {
+    "list", "ls", "cleanup", "diff", "review",
 })
 _SESSION_ID_COMPLETION_OPS = (
     set(_SESSION_ID_CTL_OPS) | {"diff", "review", "list", "ls", "resume"}
@@ -2036,6 +2097,9 @@ def _print_main_help(stream=None):
         "token\n"
         "  turn-resolve    inside session: commit/keep/discard a previously "
         "remembered path\n"
+        "  turn-add-workspace / turn-remove-workspace\n"
+        "                   hook-only: add/remove session-owned dynamic "
+        "workspace scopes\n"
         "  turn-check      hook adapter: ask a running session to repair "
         "policy/conflict issues before finalizing\n"
         "  turn-record     hook adapter: record a turn-boundary event for a "

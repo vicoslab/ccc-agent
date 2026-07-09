@@ -37,8 +37,43 @@ policy mode = workspace-auto/training-run:
   otherwise                               -> pending-review
 ```
 
-`allowed_scopes` defaults to the run workspace. Add scopes with `ccc-agent run
---scope PATH` or config `policy.allowed_scopes`.
+`allowed_scopes` defaults to the run workspace. Add static scopes with
+`ccc-agent run --scope PATH` or config `policy.allowed_scopes`.
+
+During a live interactive session, bundled hooks/plugins may update dynamic
+workspace scopes for inner agent sessions. Terminology:
+
+- **Containment session**: the outer `ccc-agent run` session, with one BranchFS
+  branch and one control socket.
+- **Agent session**: an inner Codex app-server client session, Hermes gateway
+  conversation, Claude agent command, or similar runtime session inside the
+  containment session.
+- **Workspace**: a policy scope for one agent session's current project. It does
+  not imply a mount or `chdir` change.
+
+Hook-only workspace commands are:
+
+```bash
+ccc-agent turn-add-workspace --agent-session <inner-session-id> [PATH]
+ccc-agent turn-remove-workspace --agent-session <inner-session-id> [PATH]
+```
+
+If `PATH` is omitted, the command uses the current directory. The add command
+sets the current workspace for that inner agent session; if the same inner
+session already owned a different workspace, that old owned workspace is released
+first. Remove only drops a workspace if that inner agent session actually added
+it, so static scopes and pre-existing workspaces are not removed accidentally.
+Paths must be absolute (or resolvable from the current directory) and inside a
+protected BranchFS root. Static `--scope`/config scopes and previously approved
+kept paths are preserved. Writes outside the active dynamic/static scopes
+continue to be kept for user review instead of being auto-committed.
+
+When the outer containment session is resumed, stale hook-owned inner-session
+workspace scopes from the previous contained process are cleared. Runtimes with a
+start/resume hook should re-add the current workspace with `turn-add-workspace
+--agent-session ...`; this works out of the box for hooks that expose a start
+signal, while runtimes with only Stop hooks need a corresponding start/resume
+integration point before dynamic workspaces can be automatic.
 
 ## Policy modes
 
@@ -139,7 +174,7 @@ Interactive plugins call `turn-finalize --default-keep` by default. That means:
 - the user can later resolve kept paths with `turn-resolve` or normal final
   review.
 
-Useful commands inside a live session:
+Useful user-facing commands inside a live session:
 
 ```bash
 ccc-agent turn-kept-status --details
@@ -148,6 +183,9 @@ ccc-agent turn-resolve commit --paths a,b
 ccc-agent turn-resolve discard --paths c
 ccc-agent turn-resolve keep --paths d
 ```
+
+Hook-only workspace commands exist for agent runtime integrations and require a
+hook token plus `--agent-session`; they are not model self-service commands.
 
 Discarding a live kept path asks the trusted supervisor to revert the path in the
 BranchFS branch. Added files disappear, modified inherited files fall back to the

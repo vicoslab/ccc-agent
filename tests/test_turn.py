@@ -181,6 +181,115 @@ class TestTurnController(unittest.TestCase):
             persisted.policy["turn_path_decisions"]["/storage/user/escape.txt"],
             "kept")
 
+    def test_hook_session_add_workspace_allows_new_workspace_changes(self):
+        resp = self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                       hook_session="hook-a")
+        self.assertEqual(resp["verdict"], "workspace-updated")
+        self.assertTrue(resp["added"])
+        self.assertTrue(resp["owned"])
+        self.assertEqual(resp["workspaces"], [
+            "/storage/user/Projects/proj-a",
+            "/storage/user/Projects/proj-b",
+        ])
+
+        self.h.write("Projects/proj-b/b.txt", "two")
+        commit = self.h.tc.finalize_turn()
+
+        self.assertEqual(commit["verdict"], VERDICT_COMMITTED)
+        self.assertTrue(self.h.base_has("Projects/proj-b/b.txt"))
+
+    def test_hook_session_remove_workspace_only_removes_scope_it_added(self):
+        self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                hook_session="hook-a")
+        resp = self.h.tc.remove_workspace("/storage/user/Projects/proj-b",
+                                          hook_session="hook-a")
+        self.assertEqual(resp["verdict"], "workspace-updated")
+        self.assertTrue(resp["removed"])
+        self.assertEqual(resp["workspaces"], ["/storage/user/Projects/proj-a"])
+
+        self.h.write("Projects/proj-b/b.txt", "two")
+        commit = self.h.tc.finalize_turn()
+
+        self.assertEqual(commit["verdict"], VERDICT_NEEDS_APPROVAL)
+        self.assertIn("/storage/user/Projects/proj-b/b.txt",
+                      commit["out_of_scope"])
+        self.assertFalse(self.h.base_has("Projects/proj-b/b.txt"))
+
+    def test_hook_session_does_not_remove_preexisting_workspace(self):
+        add = self.h.tc.add_workspace("/storage/user/Projects/proj-a",
+                                      hook_session="hook-a")
+        self.assertFalse(add["added"])
+        self.assertFalse(add["owned"])
+
+        remove = self.h.tc.remove_workspace("/storage/user/Projects/proj-a",
+                                            hook_session="hook-a")
+
+        self.assertFalse(remove["removed"])
+        self.assertEqual(remove["workspaces"], ["/storage/user/Projects/proj-a"])
+        self.h.write("Projects/proj-a/still-ok.txt", "ok")
+        self.assertEqual(self.h.tc.finalize_turn()["verdict"], VERDICT_COMMITTED)
+        self.assertTrue(self.h.base_has("Projects/proj-a/still-ok.txt"))
+
+    def test_shared_hook_workspace_is_removed_after_last_owner_finishes(self):
+        self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                hook_session="hook-a")
+        add_b = self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                        hook_session="hook-b")
+        self.assertFalse(add_b["added"])
+        self.assertTrue(add_b["owned"])
+
+        remove_a = self.h.tc.remove_workspace("/storage/user/Projects/proj-b",
+                                              hook_session="hook-a")
+        self.assertFalse(remove_a["removed"])
+        self.assertIn("/storage/user/Projects/proj-b", remove_a["workspaces"])
+
+        remove_b = self.h.tc.remove_workspace("/storage/user/Projects/proj-b",
+                                              hook_session="hook-b")
+        self.assertTrue(remove_b["removed"])
+        self.assertNotIn("/storage/user/Projects/proj-b", remove_b["workspaces"])
+
+    def test_agent_session_workspace_update_replaces_only_that_session_workspace(self):
+        self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                hook_session="agent-session-a")
+        update = self.h.tc.add_workspace("/storage/user/Projects/proj-c",
+                                         hook_session="agent-session-a")
+
+        self.assertIn("/storage/user/Projects/proj-c", update["workspaces"])
+        self.assertNotIn("/storage/user/Projects/proj-b", update["workspaces"])
+
+        self.h.write("Projects/proj-b/old.txt", "old")
+        self.h.write("Projects/proj-c/new.txt", "new")
+        commit = self.h.tc.finalize_turn()
+
+        self.assertEqual(commit["verdict"], VERDICT_NEEDS_APPROVAL)
+        self.assertIn("/storage/user/Projects/proj-b/old.txt",
+                      commit["out_of_scope"])
+        self.assertTrue(self.h.base_has("Projects/proj-c/new.txt"))
+        self.assertFalse(self.h.base_has("Projects/proj-b/old.txt"))
+
+    def test_turn_workspace_must_be_under_a_protected_root(self):
+        with self.assertRaises(ValueError):
+            self.h.tc.add_workspace("/tmp/not-protected", hook_session="hook-a")
+
+    def test_turn_workspace_requires_hook_session_identifier(self):
+        with self.assertRaises(ValueError):
+            self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                    hook_session="")
+
+    def test_reset_agent_workspaces_drops_stale_hook_owned_scopes_for_resume(self):
+        self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                hook_session="agent-session-a")
+
+        reset = self.h.tc.reset_agent_workspaces()
+
+        self.assertEqual(reset["removed"], ["/storage/user/Projects/proj-b"])
+        self.assertEqual(reset["workspaces"], ["/storage/user/Projects/proj-a"])
+        self.h.write("Projects/proj-b/stale.txt", "stale")
+        commit = self.h.tc.finalize_turn()
+        self.assertEqual(commit["verdict"], VERDICT_NEEDS_APPROVAL)
+        self.assertIn("/storage/user/Projects/proj-b/stale.txt",
+                      commit["out_of_scope"])
+
     def test_keep_decision_is_persisted_and_not_reprompted(self):
         self.h.write("escape.txt", "x")
         token = self.h.tc.finalize_turn()["approval_token"]

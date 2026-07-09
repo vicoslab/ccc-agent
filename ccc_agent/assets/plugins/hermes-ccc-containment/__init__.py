@@ -9,7 +9,8 @@ Hermes' native equivalent of Claude's ``additionalContext`` is the
 the current turn's user message.  This plugin uses that hook to make the bundled
 ``ccc-commit`` skill mandatory session context instead of relying on the model to
 choose a skill by description.  At final-response/idle boundaries it also
-signals the trusted CCC supervisor, then appends or queues a kept-file review
+signals the trusted CCC supervisor, maintains hook-owned workspace scopes, then
+appends or queues a kept-file review
 prompt when non-workspace/out-of-policy files remain in the branch.
 
 The plugin never freezes, commits, or aborts directly.  It shells out only to
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 _FINALIZED_TURNS = set()
 _LAST_REVIEW_DIGEST = None
+_WORKSPACE_SESSION_ID = None
+_WORKSPACE_PATH = None
 
 
 CCC_REVIEW_HEADER = "CCC contained-session review is pending."
@@ -106,6 +109,70 @@ def _run_ctl(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:
         timeout=timeout,
         check=False,
     )
+
+
+def _workspace_from_kwargs(**kwargs) -> str:
+    for key in ("workspace", "workspace_dir", "cwd", "current_working_directory"):
+        value = kwargs.get(key)
+        if value:
+            return str(value)
+    return os.getcwd()
+
+
+def _hook_session_from_kwargs(**kwargs) -> str:
+    for key in ("session_id", "conversation_id", "thread_id"):
+        value = kwargs.get(key)
+        if value:
+            return str(value)
+    return os.environ.get("CCC_AGENT_HOOK_SESSION") or os.environ.get("CCC_AGENT_SESSION", "")
+
+
+def _signal_workspace_start(**kwargs) -> None:
+    """Best-effort hook-owned workspace add for server-style Hermes sessions."""
+    global _WORKSPACE_SESSION_ID, _WORKSPACE_PATH
+    if not _contained() or not _has_control_socket():
+        return
+    if not os.environ.get("CCC_AGENT_HOOK_TOKEN"):
+        return
+    hook_session = _hook_session_from_kwargs(**kwargs)
+    workspace = _workspace_from_kwargs(**kwargs)
+    if not hook_session or not workspace:
+        return
+    try:
+        proc = _run_ctl("turn-add-workspace", "--agent-session", hook_session,
+                        workspace)
+        if proc.returncode == 0:
+            _WORKSPACE_SESSION_ID = hook_session
+            _WORKSPACE_PATH = workspace
+        else:
+            logger.debug("ccc turn-add-workspace exited %s: %s",
+                         proc.returncode, proc.stderr.strip())
+    except Exception as exc:
+        logger.debug("ccc turn-add-workspace signal failed: %s", exc)
+
+
+def _signal_workspace_end(**kwargs) -> None:
+    """Best-effort hook-owned workspace remove for server-style Hermes sessions."""
+    global _WORKSPACE_SESSION_ID, _WORKSPACE_PATH
+    if not _contained() or not _has_control_socket():
+        return
+    if not os.environ.get("CCC_AGENT_HOOK_TOKEN"):
+        return
+    hook_session = _WORKSPACE_SESSION_ID or _hook_session_from_kwargs(**kwargs)
+    workspace = _WORKSPACE_PATH or _workspace_from_kwargs(**kwargs)
+    if not hook_session or not workspace:
+        return
+    try:
+        proc = _run_ctl("turn-remove-workspace", "--agent-session", hook_session,
+                        workspace)
+        if proc.returncode not in (0,):
+            logger.debug("ccc turn-remove-workspace exited %s: %s",
+                         proc.returncode, proc.stderr.strip())
+    except Exception as exc:
+        logger.debug("ccc turn-remove-workspace signal failed: %s", exc)
+    finally:
+        _WORKSPACE_SESSION_ID = None
+        _WORKSPACE_PATH = None
 
 
 def _signal_turn_boundary(turn_id: Optional[str] = None) -> None:
@@ -184,6 +251,7 @@ def _pre_llm_context(is_first_turn: bool = False, **_) -> Optional[dict]:
         return None
     parts = []
     if is_first_turn:
+        _signal_workspace_start(**_)
         body = _skill_body("ccc-commit")
         if body:
             parts.append("%s\n\n%s" % (FIRST_TURN_PREFIX, body))
@@ -239,6 +307,7 @@ def register(ctx) -> None:
 
     def on_session_end(**kwargs):
         _signal_turn_boundary(turn_id=kwargs.get("turn_id"))
+        _signal_workspace_end(**kwargs)
         _queue_review_message(ctx, "on_session_end")
 
     ctx.register_hook("pre_llm_call", pre_llm_call)

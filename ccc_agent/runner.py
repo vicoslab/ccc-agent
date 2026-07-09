@@ -40,6 +40,8 @@ ENV_SESSION = "CCC_AGENT_SESSION"
 ENV_STATE_DIR = "CCC_AGENT_STATE_DIR"
 ENV_CONTROL_SOCK = "CCC_AGENT_CONTROL_SOCK"
 ENV_CONTROL_TOKEN = "CCC_AGENT_CONTROL_TOKEN"
+ENV_HOOK_TOKEN = "CCC_AGENT_HOOK_TOKEN"
+ENV_HOOK_SESSION = "CCC_AGENT_HOOK_SESSION"
 ENV_SHIM_UNDERLYING_PATH = "CCC_AGENT_SHIM_UNDERLYING_PATH"
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -891,10 +893,10 @@ def _bwrap_command(session, config, control=None, env=None):
     _append_agent_plugin_binds(argv, plugin_spec)
 
     # Per-turn control socket: bind the host socket to a fixed in-sandbox path
-    # so the Stop hook can signal the supervisor.  `control` is (host_sock,
-    # token) or None.
+    # so hooks can signal the supervisor.  `control` is (host_sock, token,
+    # hook_token) or None.
     if control is not None:
-        host_sock, token = control
+        host_sock, token, hook_token = control
         argv += ["--bind", host_sock, SANDBOX_CONTROL_SOCK]
 
     sandbox_path = env.get(ENV_SHIM_UNDERLYING_PATH) or BWRAP_DEFAULT_PATH
@@ -906,7 +908,9 @@ def _bwrap_command(session, config, control=None, env=None):
              "--setenv", "TERM", env.get("TERM", os.environ.get("TERM", "xterm"))]
     if control is not None:
         argv += ["--setenv", ENV_CONTROL_SOCK, SANDBOX_CONTROL_SOCK,
-                 "--setenv", ENV_CONTROL_TOKEN, control[1]]
+                 "--setenv", ENV_CONTROL_TOKEN, control[1],
+                 "--setenv", ENV_HOOK_TOKEN, control[2],
+                 "--setenv", ENV_HOOK_SESSION, session.session_id]
     # Credentials via env (read from the host auth files; never bound in).
     for var, spec in sorted(config.cred_env.items()):
         value = _extract_cred(spec)
@@ -1213,15 +1217,20 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
         control = None
         if config.per_turn:
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
+            hook_token = binascii.hexlify(os.urandom(16)).decode("ascii")
             host_sock = config.store.control_socket(session.session_id)
             turn_ctl = TurnController(session, config.store, config.backend,
                                       config.alias_map)
-            control_server = ControlServer(host_sock, turn_ctl.handle, token)
+            turn_ctl.reset_agent_workspaces()
+            control_server = ControlServer(host_sock, turn_ctl.handle, token,
+                                           hook_token=hook_token)
             control_server.start()
             session.add_event("control-server", host_sock)
             run_env[ENV_CONTROL_SOCK] = host_sock
             run_env[ENV_CONTROL_TOKEN] = token
-            control = (host_sock, token)
+            run_env[ENV_HOOK_TOKEN] = hook_token
+            run_env[ENV_HOOK_SESSION] = session.session_id
+            control = (host_sock, token, hook_token)
 
         if enter_running:
             session.transition("running")

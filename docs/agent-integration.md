@@ -134,6 +134,36 @@ ccc-agent turn-resolve commit|keep|discard --paths a,b
 ccc-agent turn-resolve commit|keep|discard --all-kept
 ```
 
+Hook-only workspace operations are reserved for trusted lifecycle hooks:
+
+```bash
+ccc-agent turn-add-workspace --agent-session <inner-session-id> [PATH]
+ccc-agent turn-remove-workspace --agent-session <inner-session-id> [PATH]
+```
+
+Server-mode integrations may call the workspace commands when the agent runtime
+starts, resumes, updates, or ends an inner agent session inside the outer
+`ccc-agent run` containment session. Each inner agent session has one current
+workspace. Starting/updating that workspace releases only the previous workspace
+owned by that same inner session; ending it removes only the workspace that the
+hook actually added. The commands require the hook token and update only dynamic
+policy scopes used by later turn/session finalization. They are not a process
+`cd`, and they do not expose the real underlay. Changes outside the active
+workspaces and static scopes remain review/keep candidates.
+
+Bundled lifecycle coverage:
+
+- Hermes: first-turn `pre_llm_call` adds the current workspace; `on_session_end`
+  removes it.
+- Claude: `SessionStart` adds the current workspace; `SessionEnd`/`SessionStop`
+  are wired to remove it when those events are emitted. `Stop` remains a
+  turn-boundary finalize/review hook.
+- Codex: documented `SessionStart` adds the root thread workspace;
+  `SubagentStart`/`SubagentStop` add/remove subagent workspaces. Codex does not
+  currently document a root `SessionEnd` event, so the root thread workspace is
+  cleared by the outer `ccc-agent run` lifecycle/resume reset rather than by an
+  in-Codex end hook.
+
 ## Security rules for integrations
 
 - Plugin assets must be package/root-owned and read-only in the sandbox.

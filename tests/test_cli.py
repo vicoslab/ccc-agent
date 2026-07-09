@@ -1070,6 +1070,59 @@ class TestMainCtl(unittest.TestCase):
         self.assertIn("committed (1), kept local (1)", out.getvalue())
         self.assertNotIn("outside.txt", out.getvalue())
 
+    def test_turn_workspace_cli_relays_hook_session_add_remove_commands(self):
+        seen = []
+
+        class FakeControlClient(object):
+            def __init__(self, sock, token, hook_token=None):
+                seen.append(("init", sock, token, hook_token))
+
+            def add_workspace(self, path, hook_session):
+                seen.append(("add", path, hook_session))
+                return {"verdict": "workspace-updated", "action": "add",
+                        "workspace": path, "workspaces": [path],
+                        "added": True, "owned": True}
+
+            def remove_workspace(self, path, hook_session):
+                seen.append(("remove", path, hook_session))
+                return {"verdict": "workspace-updated", "action": "remove",
+                        "workspace": path, "workspaces": [],
+                        "removed": True}
+
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok",
+               cli_mod.ENV_HOOK_TOKEN: "hook-tok",
+               cli_mod.ENV_HOOK_SESSION: "hook-session-1"}
+        out = io.StringIO()
+        with mock.patch("ccc_agent.cli.ControlClient", FakeControlClient):
+            with mock.patch("ccc_agent.cli.os.getcwd",
+                            return_value="/storage/user/Projects/proj-c"):
+                with contextlib.redirect_stdout(out):
+                    code1 = main_ctl(["turn-add-workspace"], env=env)
+                    code2 = main_ctl(["turn-remove-workspace",
+                                      "/storage/user/Projects/proj-c"], env=env)
+
+        self.assertEqual((code1, code2), (0, 0))
+        self.assertIn(("init", "/tmp/ccc.sock", "tok", "hook-tok"), seen)
+        self.assertIn(("add", "/storage/user/Projects/proj-c",
+                       "hook-session-1"), seen)
+        self.assertIn(("remove", "/storage/user/Projects/proj-c",
+                       "hook-session-1"), seen)
+        self.assertIn("workspace added", out.getvalue())
+        self.assertIn("workspace removed", out.getvalue())
+
+    def test_turn_workspace_cli_rejects_missing_hook_token(self):
+        env = {cli_mod.ENV_CONTROL_SOCK: "/tmp/ccc.sock",
+               cli_mod.ENV_CONTROL_TOKEN: "tok",
+               cli_mod.ENV_HOOK_SESSION: "hook-session-1"}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = main_ctl(["turn-add-workspace", "/storage/user/Projects/proj-c"],
+                            env=env)
+
+        self.assertEqual(code, 1)
+        self.assertIn("hook-only", err.getvalue())
+
     def test_turn_finalize_cli_prompts_then_keeps_after_timeout(self):
         seen = {}
 

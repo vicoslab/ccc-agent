@@ -1,7 +1,7 @@
 {
   "name": "ccc",
   "version": "0.2.0",
-  "description": "CCC contained-session lifecycle hooks and /ccc commands for Codex. Injected read-only into the bwrap sandbox by ccc-agent run for contained Codex sessions only; never loaded by a direct `codex` run. The Stop hook signals turn boundaries to the trusted supervisor over the control socket; it never holds commit authority.",
+  "description": "CCC contained-session lifecycle hooks and /ccc commands for Codex. Injected read-only into the bwrap sandbox by ccc-agent run for contained Codex sessions only; never loaded by a direct `codex` run. SessionStart/SubagentStart/SubagentStop hooks maintain trusted workspace scopes, while the Stop hook signals turn boundaries to the supervisor over the control socket; hooks never hold direct commit authority.",
   "author": {
     "name": "CCC agent"
   }

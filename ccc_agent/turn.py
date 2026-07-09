@@ -40,12 +40,16 @@ import threading
 from .commit_failures import is_permission_denied
 from .control import (VERDICT_COMMITTED, VERDICT_DISCARDED, VERDICT_HELD,
                       VERDICT_KEPT_STATUS, VERDICT_NEEDS_APPROVAL,
-                      VERDICT_NEEDS_KEPT_REVIEW, VERDICT_NOOP)
+                      VERDICT_NEEDS_KEPT_REVIEW, VERDICT_NOOP,
+                      VERDICT_WORKSPACE_UPDATED)
+from .paths import is_within, normalize
 from .policy import PolicyConfig, classify, filter_ignored
 from .previous_commits import DECISION_COMMITTED, TURN_PATH_DECISIONS
 
 
 DECISION_KEPT = "kept"
+WORKSPACE_SCOPES = "workspace_scopes"
+HOOK_WORKSPACE_REFS = "hook_workspace_refs"
 
 
 def _new_token():
@@ -107,6 +111,245 @@ class TurnController(object):
         visible = self.alias_map.canonicalize(root.visible)
         rel = os.path.relpath(self.alias_map.canonicalize(ch.path), visible)
         return root, rel
+
+    def _canonical_key(self, path):
+        """Canonical comparison key for absolute visible paths/scopes."""
+        return self.alias_map.canonicalize(normalize(str(path)))
+
+    def _validate_workspace(self, path):
+        """Return (visible path, canonical path) for a safe workspace scope.
+
+        A turn workspace is only a commit/review policy scope. It must live in
+        one of this session's protected visible roots; otherwise adding it would
+        either be meaningless or accidentally bless writes that BranchFS is not
+        supervising.
+        """
+        visible_path = normalize(str(path or ""))
+        canonical = self.alias_map.canonicalize(visible_path)
+        for root in self.session.protected_roots.values():
+            root_visible = self.alias_map.canonicalize(root.visible)
+            if is_within(canonical, root_visible):
+                return visible_path, canonical
+        raise ValueError("workspace %s is not under a protected root" %
+                         visible_path)
+
+    def _unique_paths_by_canonical(self, paths):
+        result = []
+        seen = set()
+        for path in paths:
+            try:
+                visible, canonical = self._validate_workspace(path)
+            except ValueError:
+                # Legacy/corrupt dynamic workspace entries should not make
+                # every turn command unusable. They remain out of the dynamic
+                # workspace list; preserved non-workspace allowed scopes are
+                # handled separately by _rewrite_workspace_scopes().
+                continue
+            if canonical not in seen:
+                result.append(visible)
+                seen.add(canonical)
+        return result
+
+    def _workspace_scopes(self):
+        workspaces = self.session.policy.get(WORKSPACE_SCOPES)
+        if not isinstance(workspaces, list):
+            workspaces = [self.session.workspace] if self.session.workspace else []
+        workspaces = self._unique_paths_by_canonical(workspaces)
+        self.session.policy[WORKSPACE_SCOPES] = workspaces
+        return workspaces
+
+    def _rewrite_workspace_scopes(self, workspaces):
+        old_keys = {self._canonical_key(path)
+                    for path in self._workspace_scopes()}
+        new_workspaces = self._unique_paths_by_canonical(workspaces)
+        preserved = []
+        for scope in self.session.policy.get("allowed_scopes", ()):
+            try:
+                key = self._canonical_key(scope)
+            except ValueError:
+                continue
+            if key not in old_keys:
+                preserved.append(normalize(str(scope)))
+
+        allowed = []
+        seen = set()
+        for scope in list(new_workspaces) + preserved:
+            try:
+                key = self._canonical_key(scope)
+            except ValueError:
+                continue
+            if key not in seen:
+                allowed.append(scope)
+                seen.add(key)
+
+        self.session.policy[WORKSPACE_SCOPES] = new_workspaces
+        self.session.policy["allowed_scopes"] = allowed
+        return new_workspaces, allowed
+
+    def _workspace_response(self, action, workspace, workspaces, allowed,
+                            hook_session=None, added=False, owned=False,
+                            removed=False):
+        return {"verdict": VERDICT_WORKSPACE_UPDATED,
+                "action": action,
+                "workspace": workspace,
+                "workspaces": list(workspaces),
+                "allowed_scopes": list(allowed),
+                "hook_session": hook_session,
+                "added": bool(added),
+                "owned": bool(owned),
+                "removed": bool(removed)}
+
+    def _validate_hook_session(self, hook_session):
+        hook_session = str(hook_session or "").strip()
+        if not hook_session:
+            raise ValueError("hook workspace operation requires hook_session")
+        return hook_session
+
+    def _hook_workspace_refs(self):
+        refs = self.session.policy.get(HOOK_WORKSPACE_REFS)
+        if not isinstance(refs, dict):
+            refs = {}
+            self.session.policy[HOOK_WORKSPACE_REFS] = refs
+        clean = {}
+        for key, entry in refs.items():
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path")
+            owners = entry.get("owners")
+            if not path or not isinstance(owners, list):
+                continue
+            unique = []
+            seen = set()
+            for owner in owners:
+                owner = str(owner or "").strip()
+                if owner and owner not in seen:
+                    unique.append(owner)
+                    seen.add(owner)
+            if unique:
+                clean[str(key)] = {"path": path, "owners": unique}
+        self.session.policy[HOOK_WORKSPACE_REFS] = clean
+        return clean
+
+    def add_workspace(self, path, hook_session):
+        """Hook session start: add a workspace only if the session owns it.
+
+        If the path is already an allowed/static scope, the hook session does not
+        take ownership, so its finish event cannot remove the pre-existing scope.
+        If another hook session owns the same dynamic scope, we add a second owner
+        and remove the scope only after the last owner finishes.
+        """
+        with self._lock:
+            hook_session = self._validate_hook_session(hook_session)
+            workspace, canonical = self._validate_workspace(path)
+            workspaces = list(self._workspace_scopes())
+            refs = self._hook_workspace_refs()
+            key = canonical
+            for old_key, entry in list(refs.items()):
+                if old_key == key:
+                    continue
+                owners = [owner for owner in entry.get("owners", [])
+                          if owner != hook_session]
+                if len(owners) == len(entry.get("owners", [])):
+                    continue
+                if owners:
+                    entry["owners"] = owners
+                else:
+                    refs.pop(old_key, None)
+                    workspaces = [item for item in workspaces
+                                  if self._canonical_key(item) != old_key]
+            workspace_keys = {self._canonical_key(item) for item in workspaces}
+            allowed_keys = {self._canonical_key(item)
+                            for item in self.session.policy.get("allowed_scopes", ())}
+            added = False
+            owned = False
+
+            if key in refs:
+                owners = refs[key].setdefault("owners", [])
+                if hook_session not in owners:
+                    owners.append(hook_session)
+                owned = True
+            elif key in allowed_keys or key in workspace_keys:
+                owned = False
+            else:
+                workspaces.append(workspace)
+                refs[key] = {"path": workspace, "owners": [hook_session]}
+                added = True
+                owned = True
+
+            workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
+            if not self.session.workspace:
+                self.session.workspace = workspace
+            self.session.add_event("turn-workspace-add",
+                                   "%s %s" % (hook_session, workspace))
+            self.store.save(self.session)
+            return self._workspace_response("add", workspace, workspaces,
+                                            allowed, hook_session=hook_session,
+                                            added=added, owned=owned)
+
+    def remove_workspace(self, path, hook_session):
+        """Hook session finish: remove only scopes this hook session added."""
+        with self._lock:
+            hook_session = self._validate_hook_session(hook_session)
+            workspace, canonical = self._validate_workspace(path)
+            workspaces = list(self._workspace_scopes())
+            refs = self._hook_workspace_refs()
+            key = canonical
+            removed = False
+            entry = refs.get(key)
+            if entry is not None:
+                owners = [owner for owner in entry.get("owners", [])
+                          if owner != hook_session]
+                if owners:
+                    entry["owners"] = owners
+                else:
+                    refs.pop(key, None)
+                    workspaces = [item for item in workspaces
+                                  if self._canonical_key(item) != key]
+                    removed = True
+
+            workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
+            try:
+                current_key = self._canonical_key(self.session.workspace)
+            except ValueError:
+                current_key = None
+            if current_key == key and removed and workspaces:
+                self.session.workspace = workspaces[0]
+            self.session.add_event("turn-workspace-remove",
+                                   "%s %s" % (hook_session, workspace))
+            self.store.save(self.session)
+            return self._workspace_response("remove", workspace, workspaces,
+                                            allowed, hook_session=hook_session,
+                                            removed=removed)
+
+    def reset_agent_workspaces(self):
+        """Drop stale hook-owned inner agent-session workspace scopes.
+
+        Called before launching/resuming a contained agent process. Any live
+        inner agent sessions from the previous process are gone; fresh
+        SessionStart hooks will re-add their current workspace.
+        """
+        with self._lock:
+            refs = self._hook_workspace_refs()
+            stale_keys = set(refs)
+            removed = []
+            workspaces = []
+            for item in self._workspace_scopes():
+                key = self._canonical_key(item)
+                if key in stale_keys:
+                    removed.append(item)
+                else:
+                    workspaces.append(item)
+            self.session.policy[HOOK_WORKSPACE_REFS] = {}
+            workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
+            if removed:
+                self.session.add_event("turn-workspace-reset",
+                                       "%d stale scope(s)" % len(removed))
+            self.store.save(self.session)
+            return {"verdict": VERDICT_WORKSPACE_UPDATED,
+                    "action": "reset",
+                    "removed": removed,
+                    "workspaces": list(workspaces),
+                    "allowed_scopes": list(allowed)}
 
     def _apply(self, changes):
         """Copy each change from the live view into the base (or delete it).
@@ -489,4 +732,10 @@ class TurnController(object):
             return self.kept_status()
         if op == "turn-review-kept":
             return self.review_kept()
+        if op == "turn-add-workspace":
+            return self.add_workspace(request.get("path"),
+                                      request.get("hook_session"))
+        if op == "turn-remove-workspace":
+            return self.remove_workspace(request.get("path"),
+                                         request.get("hook_session"))
         return {"ok": False, "error": "unknown op %r" % (op,)}

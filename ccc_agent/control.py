@@ -10,12 +10,16 @@ Trust model (deliberately naive/accidental — see docs/architecture.md): the
 agent and the trusted hook share a uid and namespaces, so they are mutually
 indistinguishable to the supervisor.  The per-session token below is therefore
 *best effort* — it stops unrelated processes from poking the socket, not a
-determined agent forging a request.  The supervisor never commits out-of-scope
+determined agent forging a request. Hook-only workspace operations also require a
+second hook token to avoid accidental/model-instruction-level use, but with
+in-sandbox hooks this is still not a hard boundary against a malicious same-uid
+agent that can inspect its environment. A hard hook-only guarantee would require
+out-of-band trusted hook execution. The supervisor never commits out-of-scope
 changes without a relayed user approval; an agent can at worst spoof its OWN
 approval (accepted) but can never escape the in-scope policy.
 
 Protocol: one JSON object per line, request then response, connection per call.
-  request : {"version":1, "token":..., "op":"turn-finalize"|"turn-approve"|"turn-resolve"|"turn-kept-status"|"turn-review-kept", ...}
+  request : {"version":1, "token":..., "op":"turn-finalize"|"turn-approve"|"turn-resolve"|"turn-kept-status"|"turn-review-kept"|"turn-add-workspace"|"turn-remove-workspace", ...}
   response: {"ok":true, "verdict":..., ...} | {"ok":false, "error":...}
 """
 
@@ -34,6 +38,10 @@ VERDICT_HELD = "held"                    # approval denied: left uncommitted
 VERDICT_DISCARDED = "discarded"          # selected paths were removed from branch
 VERDICT_KEPT_STATUS = "kept-status"      # read-only remembered kept-path view
 VERDICT_NEEDS_KEPT_REVIEW = "needs-kept-review"  # final idle ask is needed
+VERDICT_WORKSPACE_UPDATED = "workspace-updated"  # allowed workspace scopes changed
+
+WORKSPACE_HOOK_OPS = frozenset(("turn-add-workspace",
+                                "turn-remove-workspace"))
 
 
 class ControlError(Exception):
@@ -62,10 +70,11 @@ class ControlServer(object):
     and error framing only.
     """
 
-    def __init__(self, socket_path, handler, token):
+    def __init__(self, socket_path, handler, token, hook_token=None):
         self.socket_path = socket_path
         self.handler = handler
         self.token = token
+        self.hook_token = hook_token
         self._sock = None
         self._thread = None
         self._stop = threading.Event()
@@ -110,6 +119,11 @@ class ControlServer(object):
             if req.get("token") != self.token:
                 _send_line(conn, {"ok": False, "error": "unauthorized"})
                 return
+            if req.get("op") in WORKSPACE_HOOK_OPS:
+                if not self.hook_token or req.get("hook_token") != self.hook_token:
+                    _send_line(conn, {"ok": False,
+                                      "error": "hook-only workspace operation unauthorized"})
+                    return
             try:
                 resp = self.handler(req)
                 if not isinstance(resp, dict):
@@ -154,10 +168,11 @@ class ControlServer(object):
 class ControlClient(object):
     """In-sandbox hook side: one short-lived connection per request."""
 
-    def __init__(self, socket_path, token, timeout=30):
+    def __init__(self, socket_path, token, timeout=30, hook_token=None):
         self.socket_path = socket_path
         self.token = token
         self.timeout = timeout
+        self.hook_token = hook_token
 
     def _request(self, payload):
         req = dict(payload, token=self.token, version=PROTOCOL_VERSION)
@@ -217,3 +232,20 @@ class ControlClient(object):
     def review_kept(self):
         """Ask whether remembered kept paths need a final user decision."""
         return self._request({"op": "turn-review-kept"})
+
+    def _hook_workspace_request(self, op, path, hook_session):
+        if not self.hook_token:
+            raise ControlError("hook-only workspace operation requires hook token")
+        return self._request({"op": op, "path": path,
+                              "hook_session": hook_session,
+                              "hook_token": self.hook_token})
+
+    def add_workspace(self, path, hook_session):
+        """Hook-only: add a session-owned dynamic workspace scope."""
+        return self._hook_workspace_request("turn-add-workspace", path,
+                                            hook_session)
+
+    def remove_workspace(self, path, hook_session):
+        """Hook-only: remove a dynamic workspace scope owned by this hook session."""
+        return self._hook_workspace_request("turn-remove-workspace", path,
+                                            hook_session)

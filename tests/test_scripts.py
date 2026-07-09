@@ -27,6 +27,8 @@ PLUGIN_STOP_HOOKS = [
     os.path.join(PLUGINS, "claude-ccc-containment", "hooks", "ccc-stop-hook.sh"),
     os.path.join(PLUGINS, "codex-ccc-containment", "hooks", "ccc-stop-hook.sh"),
 ]
+CODEX_WORKSPACE_HOOK = os.path.join(
+    PLUGINS, "codex-ccc-containment", "hooks", "ccc-workspace-hook.sh")
 CLAUDE_CONTEXT_HOOK = os.path.join(
     PLUGINS, "claude-ccc-containment", "hooks", "ccc-context-hook.sh")
 HERMES_PLUGIN_INIT = os.path.join(
@@ -36,7 +38,8 @@ HERMES_PLUGIN_INIT = os.path.join(
 class TestShellSyntax(unittest.TestCase):
     def test_all_scripts_parse(self):
         for script in ([SHIM_SH, SSH_ROUTER_SH, SOFTSANDBOX_SH,
-                       CLAUDE_CONTEXT_HOOK] + HOOKS + PLUGIN_STOP_HOOKS):
+                       CLAUDE_CONTEXT_HOOK, CODEX_WORKSPACE_HOOK]
+                       + HOOKS + PLUGIN_STOP_HOOKS):
             proc = subprocess.run(["bash", "-n", script],
                                   stderr=subprocess.PIPE, text=True)
             self.assertEqual(proc.returncode, 0,
@@ -56,13 +59,19 @@ class TestPluginAssets(unittest.TestCase):
         with open(os.path.join(root, "hooks", "hooks.json")) as fh:
             hooks = json.load(fh)
         self.assertIn("SessionStart", hooks["hooks"])
+        self.assertIn("SessionEnd", hooks["hooks"])
+        self.assertIn("SessionStop", hooks["hooks"])
         self.assertIn("UserPromptSubmit", hooks["hooks"])
         self.assertIn("Stop", hooks["hooks"])
         start_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        end_cmd = hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+        stop_session_cmd = hooks["hooks"]["SessionStop"][0]["hooks"][0]["command"]
         prompt_cmd = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
         stop_cmds = [hook["command"]
                      for hook in hooks["hooks"]["Stop"][0]["hooks"]]
         self.assertIn("ccc-context-hook.sh", start_cmd)
+        self.assertIn("ccc-context-hook.sh", end_cmd)
+        self.assertIn("ccc-context-hook.sh", stop_session_cmd)
         self.assertIn("ccc-context-hook.sh", prompt_cmd)
         self.assertTrue(any("ccc-stop-hook.sh" in cmd for cmd in stop_cmds))
         self.assertTrue(any("ccc-context-hook.sh" in cmd for cmd in stop_cmds))
@@ -70,6 +79,11 @@ class TestPluginAssets(unittest.TestCase):
             os.path.join(root, "hooks", "ccc-stop-hook.sh")))
         self.assertTrue(os.path.isfile(
             os.path.join(root, "hooks", "ccc-context-hook.sh")))
+        with open(os.path.join(root, "hooks", "ccc-context-hook.sh")) as fh:
+            context_body = fh.read()
+        self.assertIn("turn-add-workspace", context_body)
+        self.assertIn("turn-remove-workspace", context_body)
+        self.assertIn("--agent-session", context_body)
 
     def test_codex_plugin_layout(self):
         root = os.path.join(PLUGINS, "codex-ccc-containment")
@@ -80,13 +94,29 @@ class TestPluginAssets(unittest.TestCase):
         self.assertEqual(manifest["name"], "ccc")
         with open(os.path.join(root, "hooks", "hooks.json")) as fh:
             hooks = json.load(fh)
+        self.assertIn("SessionStart", hooks["hooks"])
+        self.assertIn("SubagentStart", hooks["hooks"])
+        self.assertIn("SubagentStop", hooks["hooks"])
         self.assertIn("Stop", hooks["hooks"])
+        start_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        subagent_start_cmd = hooks["hooks"]["SubagentStart"][0]["hooks"][0]["command"]
+        subagent_stop_cmd = hooks["hooks"]["SubagentStop"][0]["hooks"][0]["command"]
         stop_groups = hooks["hooks"]["Stop"]
         self.assertEqual(len(stop_groups), 1)
         stop_cmd = stop_groups[0]["hooks"][0]["command"]
         self.assertEqual(stop_cmd, "${PLUGIN_ROOT}/hooks/ccc-stop-hook.sh")
+        self.assertEqual(start_cmd, "${PLUGIN_ROOT}/hooks/ccc-workspace-hook.sh")
+        self.assertEqual(subagent_start_cmd, "${PLUGIN_ROOT}/hooks/ccc-workspace-hook.sh")
+        self.assertEqual(subagent_stop_cmd, "${PLUGIN_ROOT}/hooks/ccc-workspace-hook.sh")
         self.assertTrue(os.path.isfile(
             os.path.join(root, "hooks", "ccc-stop-hook.sh")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(root, "hooks", "ccc-workspace-hook.sh")))
+        with open(os.path.join(root, "hooks", "ccc-workspace-hook.sh")) as fh:
+            workspace_body = fh.read()
+        self.assertIn("turn-add-workspace", workspace_body)
+        self.assertIn("turn-remove-workspace", workspace_body)
+        self.assertIn("--agent-session", workspace_body)
 
     def test_ccc_commit_skill_is_bundled_for_claude_codex_and_hermes(self):
         bodies = []
@@ -154,6 +184,9 @@ class TestPluginAssets(unittest.TestCase):
         self.assertIn("transform_llm_output", src)
         self.assertIn("turn-finalize", src)
         self.assertIn("turn-review-kept", src)
+        self.assertIn("turn-add-workspace", src)
+        self.assertIn("turn-remove-workspace", src)
+        self.assertIn("--agent-session", src)
         self.assertIn("ccc-commit", src)
         self.assertTrue(os.path.isfile(
             os.path.join(root, "skills", "ccc-commit", "SKILL.md")))
@@ -223,9 +256,61 @@ class TestPluginAssets(unittest.TestCase):
             self.assertIn("turn-finalize --default-keep", call_log)
             self.assertIn("turn-review-kept", call_log)
 
-    def test_codex_stop_hook_degrades_safe_outside_contained_session(self):
+    def test_codex_workspace_hook_adds_and_removes_silently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "CCC_AGENT_SESSION": "outer-session",
+                "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                "CCC_AGENT_HOOK_TOKEN": "hook-token",
+                "CCC_AGENT_CLI": ctl,
+                "CCC_AGENT_TEST_CALLS": calls,
+            }
+
+            start = subprocess.run(
+                ["sh", CODEX_WORKSPACE_HOOK], env=env,
+                input=json.dumps({"hook_event_name": "SessionStart",
+                                  "session_id": "codex-inner-1",
+                                  "cwd": "/storage/user/Projects/proj-a"}),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sub_start = subprocess.run(
+                ["sh", CODEX_WORKSPACE_HOOK], env=env,
+                input=json.dumps({"hook_event_name": "SubagentStart",
+                                  "session_id": "codex-parent",
+                                  "agent_id": "sub-1",
+                                  "cwd": "/storage/user/Projects/proj-b"}),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sub_end = subprocess.run(
+                ["sh", CODEX_WORKSPACE_HOOK], env=env,
+                input=json.dumps({"hook_event_name": "SubagentStop",
+                                  "session_id": "codex-parent",
+                                  "agent_id": "sub-1",
+                                  "cwd": "/storage/user/Projects/proj-b"}),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(start.returncode, 0, start.stderr)
+            self.assertEqual(sub_start.returncode, 0, sub_start.stderr)
+            self.assertEqual(sub_end.returncode, 0, sub_end.stderr)
+            self.assertEqual(start.stdout, "")
+            self.assertEqual(sub_start.stdout, "")
+            self.assertEqual(sub_end.stdout, "")
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn("turn-add-workspace --agent-session codex-inner-1 /storage/user/Projects/proj-a", call_log)
+            self.assertIn("turn-add-workspace --agent-session codex-parent/sub-1 /storage/user/Projects/proj-b", call_log)
+            self.assertIn("turn-remove-workspace --agent-session codex-parent/sub-1 /storage/user/Projects/proj-b", call_log)
+
+    def test_codex_workspace_hook_degrades_safe_outside_contained_session(self):
         proc = subprocess.run(
-            ["sh", PLUGIN_STOP_HOOKS[1]],
+            ["sh", CODEX_WORKSPACE_HOOK],
+            input=json.dumps({"hook_event_name": "SessionStart"}),
             env={"PATH": "/usr/bin:/bin"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -278,6 +363,38 @@ class TestClaudeContextHook(unittest.TestCase):
         self.assertIn("ccc-commit", out["additionalContext"])
         self.assertIn("turn-kept-status", out["additionalContext"])
         self.assertIn("contained filesystem", out["additionalContext"])
+
+    def test_session_start_and_end_update_workspace_scope_with_hook_token(self):
+        calls = os.path.join(self._tmp.name, "calls")
+        with open(self.ctl, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                     "exit 0\n")
+        os.chmod(self.ctl, 0o755)
+        env = {
+            "CCC_AGENT_CONTROL_SOCK": os.path.join(self._tmp.name, "sock"),
+            "CCC_AGENT_HOOK_TOKEN": "hook-token",
+            "CCC_AGENT_TEST_CALLS": calls,
+        }
+
+        start = self.run_hook(
+            {"hook_event_name": "SessionStart",
+             "session_id": "claude-inner-1",
+             "cwd": "/storage/user/Projects/proj-a"},
+            extra_env=env)
+        end = self.run_hook(
+            {"hook_event_name": "SessionEnd",
+             "session_id": "claude-inner-1",
+             "cwd": "/storage/user/Projects/proj-a"},
+            extra_env=env)
+
+        self.assertEqual(start.returncode, 0, start.stderr)
+        self.assertEqual(end.returncode, 0, end.stderr)
+        self.assertEqual(end.stdout, "")
+        with open(calls) as fh:
+            call_log = fh.read()
+        self.assertIn("turn-add-workspace --agent-session claude-inner-1 /storage/user/Projects/proj-a", call_log)
+        self.assertIn("turn-remove-workspace --agent-session claude-inner-1 /storage/user/Projects/proj-a", call_log)
 
     def test_user_prompt_submit_injects_turn_reminder(self):
         proc = self.run_hook({"hook_event_name": "UserPromptSubmit",
@@ -388,6 +505,27 @@ class TestHermesContainmentPlugin(unittest.TestCase):
         self.assertIn("turn-kept-status", context)
         self.assertIn("contained filesystem", context)
         self.assertIn("Hermes would otherwise idle", context)
+
+    def test_pre_llm_and_session_end_update_workspace_scope_with_hook_token(self):
+        mod = self.load_plugin()
+        old = self.set_contained_env()
+        try:
+            os.environ["CCC_AGENT_HOOK_TOKEN"] = "hook-token"
+            self.fake_ctl_review(rc=0, text="")
+            result = mod._pre_llm_context(
+                is_first_turn=True,
+                session_id="hermes-inner-1",
+                cwd="/storage/user/Projects/proj-a")
+            mod._signal_workspace_end(
+                session_id="hermes-inner-1",
+                cwd="/storage/user/Projects/proj-a")
+        finally:
+            self.restore_env(old)
+        self.assertIsInstance(result, dict)
+        with open(self.calls) as fh:
+            call_log = fh.read()
+        self.assertIn("turn-add-workspace --agent-session hermes-inner-1 /storage/user/Projects/proj-a", call_log)
+        self.assertIn("turn-remove-workspace --agent-session hermes-inner-1 /storage/user/Projects/proj-a", call_log)
 
     def test_pre_llm_call_is_inert_outside_contained_session(self):
         mod = self.load_plugin()
