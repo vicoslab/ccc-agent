@@ -205,7 +205,29 @@ def inspect_at(tokens, start, depth):
                 continue
             if tok.startswith("-"):
                 if "c" in tok[1:] and j + 1 < len(tokens):
-                    return detect_command(tokens[j + 1], depth + 1)
+                    command_index = j + 1
+                    nested = detect_command(tokens[command_index], depth + 1)
+                    if nested:
+                        return nested
+                    # Codex remote SSH wraps the real launch as:
+                    #   sh -c 'CODEX_REMOTE_PAYLOAD="$1"; ... /bin/sh -c "$CODEX_REMOTE_PAYLOAD"' sh '<payload>'
+                    # The executable (`codex app-server proxy`) is therefore in
+                    # a shell positional argument, not in the -c script itself.
+                    script = tokens[command_index]
+                    uses_payload = (
+                        "CODEX_REMOTE_PAYLOAD" in script or
+                        "CLAUDE_REMOTE_PAYLOAD" in script or
+                        ("$1" in script and "/bin/sh" in script and "-c" in script)
+                    )
+                    if uses_payload:
+                        # Skip the optional shell $0 argument immediately after
+                        # the script; inspect later positional args as shell
+                        # snippets because $1 is the remote payload.
+                        for payload in tokens[command_index + 2:]:
+                            nested = detect_command(payload, depth + 1)
+                            if nested:
+                                return nested
+                    return None
                 j += 1
                 continue
             break
