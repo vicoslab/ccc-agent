@@ -53,14 +53,30 @@ from .runner import (ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN, ENV_HOOK_SESSION,
                      ENV_HOOK_TOKEN, ENV_SESSION, ResumeError, RootSpec,
                      RunnerConfig, resume_session, run_session)
 from .session import SessionStore
+from .turn import TurnController
 
 CONFIG_ENV = "CCC_AGENT_CONFIG"
 CONFIG_PATHS = ("/etc/ccc-agent/config.json",
                 "/opt/ccc-agent/config/config.json")
+SERVER_MODE_ENV_VARS = (
+    "CCC_AGENT_SERVER_MODE",
+    "CCC_AGENT_SERVE",
+    "CCC_AGENT_NON_INTERACTIVE",
+    "NON_INTERACTIVE",
+)
 _KNOWN_SHELL_NAMES = frozenset((
     "sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "pdksh",
     "tcsh", "csh",
 ))
+
+
+def _env_truthy(value):
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _server_mode_from_env(env=None):
+    env = os.environ if env is None else env
+    return any(_env_truthy(env.get(name)) for name in SERVER_MODE_ENV_VARS)
 
 
 def _is_shell_argv0(value):
@@ -889,6 +905,24 @@ def _handle_pending_review_finish(store, backend, alias_map, session, stream=Non
                                    prompt_stream=stream)
 
 
+def _default_keep_before_finish(store, backend, alias_map, session):
+    """Best-effort server-mode default: commit workspace, keep the rest.
+
+    Server-style launches must leave the SSH stream to the wrapped agent only, so
+    they cannot stop at a human review prompt when the outer process exits.  Reuse
+    the live turn controller once before the final freeze: it applies in-scope
+    changes to the real underlay and remembers new out-of-scope paths as kept in
+    the branch for later review.  If this best-effort pass fails, fall through to
+    normal process-exit finalization without printing from the supervisor.
+    """
+    controller = TurnController(session, store, backend, alias_map)
+    try:
+        controller.finalize_turn(default_keep=True)
+    except Exception as exc:
+        session.add_event("server-default-keep-failed", str(exc))
+        store.save(session)
+
+
 def main_run(argv=None, env=None, prog="ccc-agent run"):
     parser = argparse.ArgumentParser(
         prog=prog,
@@ -903,8 +937,14 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     parser.add_argument("--hide", action="append", default=[],
                         help="hide/deny pattern for sensitive paths "
                              "(repeatable)")
-    parser.add_argument("--agent", default="command",
-                        help="agent kind label, e.g. codex, claude, hermes")
+    agent_group = parser.add_mutually_exclusive_group()
+    agent_group.add_argument("--agent", default=None,
+                             help="agent kind label, e.g. codex, claude, hermes")
+    agent_group.add_argument("--serve", metavar="AGENT",
+                             help="server-style agent label; suppress "
+                                  "ccc-agent terminal output and default to "
+                                  "committing workspace changes while keeping "
+                                  "other paths for later review")
     parser.add_argument("--protect-agent-state", action="store_true",
                         help="keep Codex/Hermes state and Claude Code runtime "
                              "paths inside BranchFS review instead of the "
@@ -925,6 +965,10 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
         command = command[1:]
     if not command:
         command = _current_shell_command(env=env)
+
+    env_map = os.environ if env is None else env
+    server_mode = bool(args.serve) or _server_mode_from_env(env_map)
+    agent_kind = args.serve or args.agent or "command"
 
     config = load_config(args.config, env=env)
     store, backend, alias_map, user, roots = build_runtime(config)
@@ -957,15 +1001,15 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     # is a debug mode only (no isolation -- absolute-path writes bypass the
     # view), so warn loudly if it is selected.
     confinement = config.get("confinement", "bwrap")
-    if confinement == "none":
+    if confinement == "none" and not server_mode:
         sys.stderr.write(
             "ccc-agent: WARNING confinement=none is NOT a security boundary "
             "(debug only); the agent can write outside the view. Set "
             "confinement=bwrap for real containment.\n")
-    nested_invocation = bool((os.environ if env is None else env).get(ENV_SESSION))
+    nested_invocation = bool(env_map.get(ENV_SESSION))
     runner_config = RunnerConfig(
         store=store, backend=backend, alias_map=alias_map, owner=user,
-        agent_kind=args.agent, agent_command=command, workspace=workspace,
+        agent_kind=agent_kind, agent_command=command, workspace=workspace,
         policy=policy, roots=roots,
         confinement=confinement,
         bwrap_bin=config.get("bwrap_bin", "bwrap"),
@@ -984,44 +1028,59 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
         protect_agent_state=(args.protect_agent_state or
                              bool(config.get("protect_agent_state", False))),
         ensure_agent_state_dirs=bool(config.get("ensure_agent_state_dirs", False)),
-        on_session_start=lambda session: _write_session_start_banner(
-            session, alias_map, confinement))
-    session = run_session(runner_config, env=env)
+        on_session_start=(None if server_mode else
+                          lambda session: _write_session_start_banner(
+                              session, alias_map, confinement)),
+        server_mode=server_mode)
+    before_finalize = None
+    if server_mode:
+        before_finalize = lambda session: _default_keep_before_finish(
+            store, backend, alias_map, session)
+    if before_finalize is None:
+        session = run_session(runner_config, env=env)
+    else:
+        session = run_session(runner_config, env=env,
+                              before_finalize=before_finalize)
 
-    sys.stderr.write("ccc-agent: session %s finished: %s\n"
-                     % (session.session_id,
-                        _finish_state_label(store, session)))
+    if not server_mode:
+        sys.stderr.write("ccc-agent: session %s finished: %s\n"
+                         % (session.session_id,
+                            _finish_state_label(store, session)))
 
-    # Surface WHY it failed: the failure paths in run_session record the reason
-    # as an "error" event (mount/launch/finalize/commit detail, incl. branchfs
-    # stderr). Always print those on failure; --verbose dumps the full timeline.
-    errors = [e for e in session.events if e.get("event") == "error"]
-    if session.state == "failed":
-        if errors:
-            for e in errors:
-                sys.stderr.write("ccc-agent: error: %s\n"
-                                 % e.get("detail", "(no detail recorded)"))
-        else:
-            sys.stderr.write("ccc-agent: failed but no error detail was "
-                             "recorded; see the event log (-v) below\n")
-    if args.verbose:
-        sys.stderr.write("ccc-agent: event log:\n")
-        for e in session.events:
-            line = "  %s  %s" % (e.get("time", ""), e.get("event", ""))
-            if e.get("detail") is not None:
-                line += ": %s" % e["detail"]
-            sys.stderr.write(line + "\n")
-    if session.state == "failed":
-        sys.stderr.write(
-            "ccc-agent: full record: %s\n"
-            "ccc-agent: inspect with: ccc-agent show %s\n"
-            % (store.session_file(session.session_id), session.session_id))
+    # Surface WHY it failed for normal human-facing runs: the failure paths in
+    # run_session record the reason as an "error" event (mount/launch/finalize/
+    # commit detail, incl. branchfs stderr). Server-mode runs deliberately keep
+    # stdout/stderr reserved for the wrapped protocol and stay quiet here.
+    if not server_mode:
+        errors = [e for e in session.events if e.get("event") == "error"]
+        if session.state == "failed":
+            if errors:
+                for e in errors:
+                    sys.stderr.write("ccc-agent: error: %s\n"
+                                     % e.get("detail", "(no detail recorded)"))
+            else:
+                sys.stderr.write("ccc-agent: failed but no error detail was "
+                                 "recorded; see the event log (-v) below\n")
+        if args.verbose:
+            sys.stderr.write("ccc-agent: event log:\n")
+            for e in session.events:
+                line = "  %s  %s" % (e.get("time", ""), e.get("event", ""))
+                if e.get("detail") is not None:
+                    line += ": %s" % e["detail"]
+                sys.stderr.write(line + "\n")
+        if session.state == "failed":
+            sys.stderr.write(
+                "ccc-agent: full record: %s\n"
+                "ccc-agent: inspect with: ccc-agent show %s\n"
+                % (store.session_file(session.session_id), session.session_id))
 
-    if session.state == "pending-review" and not nested_invocation:
+    if (session.state == "pending-review" and not nested_invocation and
+            not server_mode):
         session = _handle_pending_review_finish(store, backend, alias_map,
                                                 session)
 
-    if session.state == "pending-review" and not nested_invocation:
+    if (session.state == "pending-review" and not nested_invocation and
+            not server_mode):
         sys.stderr.write(
             "ccc-agent: review with: ccc-agent review %s\n"
             "ccc-agent: diff only: ccc-agent diff %s\n"
@@ -1844,8 +1903,12 @@ _GLOBAL_VALUE_OPTIONS = frozenset(("--config",))
 _CLEANUP_VALUE_OPTIONS = frozenset(("--older-than", "-o"))
 _REVIEW_VALUE_OPTIONS = frozenset(("--commit", "--apply-patch"))
 _RESUME_VALUE_OPTIONS = frozenset(("--agent", "--cmd"))
+_RUN_VALUE_OPTIONS = frozenset((
+    "--agent", "--config", "--hide", "--policy", "--scope", "--serve",
+    "--workspace",
+))
 _RUN_OPTIONS = (
-    "--agent", "--full-isolation", "--hide", "--policy",
+    "--agent", "--serve", "--full-isolation", "--hide", "--policy",
     "--protect-agent-state", "--scope", "--verbose", "--workspace", "-v",
     "--config", "--help",
 )
@@ -1942,6 +2005,8 @@ def _value_options_for_completion(op):
         values.update(_REVIEW_VALUE_OPTIONS)
     if op == "resume":
         values.update(_RESUME_VALUE_OPTIONS)
+    if op == "run":
+        values.update(_RUN_VALUE_OPTIONS)
     return values
 
 

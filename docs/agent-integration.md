@@ -13,6 +13,7 @@ process-exit freeze/status/policy review.
 | `ccc-agent run -- hermes "..."` | Process exit / Hermes hooks | Hermes plugin can report turns/session end. | Turn and session finalize when hooks run; process exit remains authoritative. |
 | `ccc-agent run -- codex` | Interactive turns + process exit | Codex plugin Stop hook, version-dependent. | Workspace changes may commit per turn; kept paths reviewed later. |
 | `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude plugin via `--plugin-dir`. | Workspace changes may commit per turn; kept paths reviewed later. |
+| `ccc-agent run --serve codex -- <ssh/app-server wrapper>` | Server process + inner sessions | Treats the contained command as a server/runtime wrapper for the named agent. | `ccc-agent` prints nothing on the SSH stream; at process exit it commits workspace changes and keeps other paths for later review. |
 | `ccc-agent run -- <other command>` | Process exit | No native plugin required. | Session-end finalize. |
 
 ## Plugin injection model
@@ -24,6 +25,17 @@ For a matching contained run, `ccc-agent run`:
 3. bind-mounts that asset read-only into the bwrap sandbox;
 4. inserts activation argv or environment variables for the contained command;
 5. starts a trusted control socket for turn operations when enabled.
+
+Use `--serve AGENT` for server-style entrypoints such as Codex app-server, Claude
+remote server wrappers, or a Hermes gateway launched through SSH. Server mode is
+intended for protocols that parse stdout/stderr themselves: `ccc-agent` emits no
+banner, finish line, review text, or prompt during the wrapped server lifecycle,
+and it does not inject agent-interactive argv/env activation into the server
+command. Before the final freeze it applies the same default as turn hooks:
+commit in-workspace changes, remember non-workspace changes as kept in the
+branch, and leave the session reviewable if anything still needs later
+attention. The SSH shell router uses this mode automatically for detected
+Codex/Claude remote commands.
 
 If no plugin matches, the plugin directory is missing, the command uses a mode
 that disables plugins, or the agent version ignores hooks, the run degrades to
