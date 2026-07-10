@@ -1049,7 +1049,7 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
         adaptive_bootstrap_seconds=(
             args.adaptive_bootstrap_seconds
             if args.adaptive_bootstrap_seconds is not None else
-            config.get("adaptive_bootstrap_seconds", 2.0)),
+            config.get("adaptive_bootstrap_seconds", 10.0)),
         adaptive_stability_seconds=(
             args.adaptive_stability_seconds
             if args.adaptive_stability_seconds is not None else

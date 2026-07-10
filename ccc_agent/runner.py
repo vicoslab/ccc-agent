@@ -172,7 +172,7 @@ class RunnerConfig(object):
                  agent_state_binds=None, protect_agent_state=False,
                  ensure_agent_state_dirs=False, on_session_start=None,
                  server_mode=False, lifecycle="foreground",
-                 adaptive_bootstrap_seconds=2.0,
+                 adaptive_bootstrap_seconds=10.0,
                  adaptive_stability_seconds=0.2,
                  adaptive_detach_seconds=2.0):
         self.store = store              # SessionStore
@@ -952,11 +952,13 @@ def _bwrap_command(session, config, control=None, env=None,
                  "--ro-bind", adaptive_runner, SANDBOX_ADAPTIVE_RUNNER]
 
     sandbox_path = env.get(ENV_SHIM_UNDERLYING_PATH) or BWRAP_DEFAULT_PATH
+    sandbox_shell = env.get("SHELL") or os.environ.get("SHELL") or "/bin/sh"
     argv += ["--setenv", ENV_SESSION, session.session_id,
              "--setenv", "HOME", home,
              "--setenv", "USER", config.owner,
              "--setenv", "LOGNAME", config.owner,
              "--setenv", "PATH", sandbox_path,
+             "--setenv", "SHELL", sandbox_shell,
              "--setenv", "TERM", env.get("TERM", os.environ.get("TERM", "xterm"))]
     if control is not None:
         argv += ["--setenv", ENV_CONTROL_SOCK, SANDBOX_CONTROL_SOCK,

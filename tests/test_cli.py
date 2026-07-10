@@ -296,7 +296,7 @@ class TestMainRun(unittest.TestCase):
         self.assertEqual(seen[0].agent_command,
                          ["tool", "--lifecycle", "child-value"])
         self.assertEqual(seen[1].lifecycle, "foreground")
-        self.assertEqual(seen[1].adaptive_bootstrap_seconds, 2.0)
+        self.assertEqual(seen[1].adaptive_bootstrap_seconds, 10.0)
 
     def test_serve_run_suppresses_banner_finish_and_review_prompt(self):
         with open(self.h.config_path) as fh:

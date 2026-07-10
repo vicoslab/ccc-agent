@@ -667,6 +667,11 @@ os.execvpe(command[0], command, env)
         with self.assertRaisesRegex(ValueError, "requires bwrap"):
             self.h.config(["true"], lifecycle="adaptive")
 
+    def test_adaptive_default_allows_slow_remote_login_shell_bootstrap(self):
+        config = self._bwrap_config(["true"], lifecycle="adaptive")
+
+        self.assertEqual(config.adaptive_bootstrap_seconds, 10.0)
+
     def test_adaptive_tty_run_uses_foreground_lifecycle(self):
         seen = {}
 
@@ -819,6 +824,22 @@ time.sleep(0.18)
         path_i = next(k for k in range(len(argv) - 2)
                       if argv[k] == "--setenv" and argv[k + 1] == "PATH")
         self.assertEqual(argv[path_i + 2], path)
+
+    def test_bwrap_preserves_invoking_login_shell(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["true"]),
+                        env={"SHELL": "/bin/bash"})
+
+        argv = seen["argv"]
+        shell_i = next(k for k in range(len(argv) - 2)
+                       if argv[k:k + 2] == ["--setenv", "SHELL"])
+        self.assertEqual(argv[shell_i + 2], "/bin/bash")
 
     def test_bwrap_mode_builds_sandbox_and_wraps_command(self):
         seen = {}
