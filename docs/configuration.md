@@ -121,7 +121,15 @@ credential mounts.
 ## Agent plugins
 
 `agent_plugins` maps agent names to read-only assets that `ccc-agent run` may
-mount for contained sessions. Setup-generated defaults are mount/config only:
+mount for contained sessions. Setup-generated defaults use one native plugin path
+per tool:
+
+- Codex: setup enables/trusts the bundled plugin in Codex config; runtime mounts
+  the package-owned plugin cache path read-only.
+- Claude: the container image pre-seeds Claude's plugin cache at build time using
+  `CLAUDE_CODE_PLUGIN_SEED_DIR`; runtime mounts that seed read-only and sets the
+  same env var inside bwrap. Setup-managed settings contain only
+  `enabledPlugins["ccc@ccc-agent"] = true`; hooks stay inside the plugin.
 
 ```json
 {
@@ -132,26 +140,57 @@ mount for contained sessions. Setup-generated defaults are mount/config only:
       "sandbox_path": "/home/<user>/.codex/plugins/cache/ccc-agent/ccc/0.2.0",
       "ensure_dirs": ["/home/<user>/.codex/plugins/cache/ccc-agent/ccc"],
       "plugin_id": "ccc@ccc-agent"
+    },
+    "claude": {
+      "src": "/opt/claude-seed",
+      "sandbox_path": "/opt/claude-seed",
+      "setenv": {"CLAUDE_CODE_PLUGIN_SEED_DIR": "/opt/claude-seed"},
+      "plugin_id": "ccc@ccc-agent"
     }
   }
 }
 ```
 
+Build the Claude seed during the image build, not during runtime setup:
+
+```dockerfile
+RUN mkdir -p /opt/claude-seed/marketplaces && \
+    python -m ccc_agent.claude_plugin \
+      --write-to /opt/claude-seed/marketplaces/ccc-agent
+RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+      claude plugin marketplace add /opt/claude-seed/marketplaces/ccc-agent && \
+    CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+      claude plugin install ccc@ccc-agent
+ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed
+```
+
+The marketplace source must remain at `marketplaces/ccc-agent`: Claude resolves
+seed marketplace content from that location rather than trusting build-time
+absolute paths in `known_marketplaces.json`.
+
+During runtime setup, ccc-agent also mirrors the seed's CCC marketplace/install
+records into the user's `~/.claude/plugins` metadata while preserving unrelated
+plugins. Claude 2.1.x otherwise reconciles a pristine home too late for hooks to
+be active on the first invocation. Executable plugin files remain in the
+read-only seed.
+
 For matching contained commands, the launcher:
 
-1. validates the configured asset directory on the trusted host;
+1. validates the configured asset/seed directory on the trusted host;
 2. bind-mounts `src` read-only at `sandbox_path` when present;
 3. creates `ensure_dirs` mount parents inside the sandbox;
-4. degrades to process-exit review if the asset is missing.
+4. sets plugin env such as `CLAUDE_CODE_PLUGIN_SEED_DIR` when configured;
+5. degrades to process-exit review if the asset is missing.
 
-Generated defaults do not append Codex YOLO args, do not append Claude
-`--plugin-dir`, and do not set Hermes plugin environment variables. Manual
-operator config may still include `argv` or `setenv`; those activation fields are
-opt-in and are only applied to direct agent CLI invocations.
+Generated defaults do not append Codex YOLO args and do not append Claude
+`--plugin-dir`. Claude hook definitions stay inside the packaged Claude plugin;
+there are no separate Claude settings-level hooks. Manual operator config may
+still include `argv` or extra `setenv`, but that is an explicit override.
 
-`ccc-agent setup --system` writes persistent tool config to `/etc/codex` and
-`/etc/claude-code/managed-settings.d` where supported. `ccc-agent setup --user`
-writes the equivalent user config under `~/.codex` and `~/.claude`.
+`ccc-agent setup --system` writes persistent Codex config under `/etc/codex` and
+Claude plugin enablement under `/etc/claude-code/managed-settings.d`. User mode
+writes equivalent enablement under `~/.codex` and `~/.claude`. Claude plugin
+installation remains an image-build responsibility via the seed directory above.
 
 Set `agent_hook_mode: "disabled"` and `agent_plugins: {}` to disable native
 plugin/config setup.

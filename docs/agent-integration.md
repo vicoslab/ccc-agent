@@ -9,10 +9,10 @@ process-exit freeze/status/policy review.
 | Invocation | Boundary | Plugin behavior | Review behavior |
 |---|---|---|---|
 | `ccc-agent run -- codex exec "..."` | Process exit | Codex plugin cache may be mounted; one-shot exit is enough. | Session-end finalize. |
-| `ccc-agent run -- claude -p "..."` | Process exit | Claude standalone hooks may be configured, but one-shot exit is enough. | Session-end finalize. |
+| `ccc-agent run -- claude -p "..."` | Process exit | Claude plugin seed may be mounted, but one-shot exit is enough. | Session-end finalize. |
 | `ccc-agent run -- hermes "..."` | Process exit | No default Hermes per-run plugin env. | Session-end finalize. |
 | `ccc-agent run -- codex` | Interactive turns + process exit | Codex plugin Stop hook, version-dependent. | Workspace changes may commit per turn; kept paths reviewed later. |
-| `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude hooks from persistent settings, if active. | Workspace changes may commit per turn; kept paths reviewed later. |
+| `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude hooks from the enabled `ccc@ccc-agent` plugin, if active. | Workspace changes may commit per turn; kept paths reviewed later. |
 | `ccc-agent run -- <other command>` | Process exit | No native plugin required. | Session-end finalize. |
 
 ## Plugin/config model
@@ -65,14 +65,31 @@ session end.
 
 ## Claude Code
 
-Contained Claude Code uses persistent standalone hook settings instead of a
-session-only plugin directory. `ccc-agent setup --system` writes a managed drop-in
-under `/etc/claude-code/managed-settings.d/`; `ccc-agent setup --user` writes the
-same hooks to `~/.claude/settings.json`. The hook commands point at the installed
-ccc-agent package assets.
+Contained Claude Code uses the packaged `ccc@ccc-agent` Claude plugin, not
+settings-level hook duplication and not a session-only `--plugin-dir` flag.
+The production path is Anthropic's container/CI seed mechanism:
+`CLAUDE_CODE_PLUGIN_SEED_DIR` points to a read-only, pre-populated
+`~/.claude/plugins` tree baked into the image (normally `/opt/claude-seed`).
 
-`ccc-agent run` does not append `--plugin-dir` to Claude by default. If Claude
-settings/hooks are absent or disabled, contained Claude runs fall back to
+The pip package owns the static plugin files. During the image build, materialize
+the local marketplace source and let Claude Code perform the one-time install:
+
+```bash
+mkdir -p /opt/claude-seed/marketplaces
+python -m ccc_agent.claude_plugin \
+  --write-to /opt/claude-seed/marketplaces/ccc-agent
+CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+  claude plugin marketplace add /opt/claude-seed/marketplaces/ccc-agent
+CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+  claude plugin install ccc@ccc-agent
+```
+
+Setup-managed settings enable `ccc@ccc-agent` but do not duplicate hooks or
+declare another marketplace source. Setup initializes the user's Claude plugin
+metadata from the seed so hooks are active on the first invocation while
+preserving unrelated plugins. At runtime, `ccc-agent run` mounts the seed
+read-only and sets `CLAUDE_CODE_PLUGIN_SEED_DIR` inside bwrap. If the seed is
+absent or Claude does not load the plugin, contained Claude runs fall back to
 process-exit review.
 
 ## Hermes
@@ -152,9 +169,8 @@ Bundled lifecycle coverage:
 
 - Hermes: first-turn `pre_llm_call` adds the current workspace; `on_session_end`
   removes it.
-- Claude: `SessionStart` adds the current workspace; `SessionEnd`/`SessionStop`
-  are wired to remove it when those events are emitted. `Stop` remains a
-  turn-boundary finalize/review hook.
+- Claude: `SessionStart` adds the current workspace; `SessionEnd` removes it.
+  `Stop` remains a turn-boundary finalize/review hook.
 - Codex: documented `SessionStart` adds the root thread workspace;
   `SubagentStart`/`SubagentStop` add/remove subagent workspaces. Codex does not
   currently document a root `SessionEnd` event, so the root thread workspace is

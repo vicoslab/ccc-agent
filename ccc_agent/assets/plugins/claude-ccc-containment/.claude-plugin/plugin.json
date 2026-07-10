@@ -1,7 +1,7 @@
 {
   "name": "ccc",
   "version": "0.2.0",
-  "description": "CCC contained-session lifecycle hooks and /ccc commands. Injected read-only into the bwrap sandbox by ccc-agent run for contained Claude sessions only; never loaded by a direct `claude` run. Signals turn boundaries to the trusted supervisor over the control socket; it never holds commit authority.",
+  "description": "CCC contained-session lifecycle hooks and /ccc commands. Distributed through a read-only Claude plugin seed; hooks stay inert outside CCC sessions because they require CCC_AGENT_SESSION. Signals turn boundaries to the trusted supervisor over the control socket; it never holds commit authority.",
   "author": {
     "name": "CCC agent"
   }

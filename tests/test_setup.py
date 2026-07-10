@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -224,12 +225,20 @@ class TestSetupConfig(unittest.TestCase):
         )
 
         self.assertEqual(cfg["cred_mounts"], [])
-        # Default runtime plugin wiring is mount/config only. ccc-agent setup
-        # persists tool config where needed; ccc-agent run must not append
+        # Default runtime plugin wiring is plugin/seed based. ccc-agent setup
+        # persists Codex config where needed; ccc-agent run must not append
         # interactive CLI args such as Codex YOLO flags or Claude --plugin-dir.
         self.assertEqual(cfg["agent_hook_mode"], "plugins")
         plugins = cfg["agent_plugins"]
-        self.assertEqual(sorted(plugins), ["codex"])
+        self.assertEqual(sorted(plugins), ["claude", "codex"])
+        seed = "/opt/claude-seed"
+        self.assertEqual(plugins["claude"]["src"], seed)
+        self.assertEqual(plugins["claude"]["sandbox_path"], seed)
+        self.assertEqual(plugins["claude"]["setenv"],
+                         {"CLAUDE_CODE_PLUGIN_SEED_DIR": seed})
+        self.assertEqual(plugins["claude"]["plugin_id"],
+                         "ccc@ccc-agent")
+        self.assertNotIn("argv", plugins["claude"])
         self.assertEqual(plugins["codex"]["sandbox_path"],
                          "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0")
         self.assertEqual(plugins["codex"]["ensure_dirs"],
@@ -270,7 +279,15 @@ class TestSetupConfig(unittest.TestCase):
 
         self.assertEqual(cfg["cred_mounts"], [])
         plugins = cfg["agent_plugins"]
-        self.assertEqual(sorted(plugins), ["codex"])
+        self.assertEqual(sorted(plugins), ["claude", "codex"])
+        seed = "/opt/claude-seed"
+        self.assertEqual(plugins["claude"]["src"], seed)
+        self.assertEqual(plugins["claude"]["sandbox_path"], seed)
+        self.assertEqual(plugins["claude"]["setenv"],
+                         {"CLAUDE_CODE_PLUGIN_SEED_DIR": seed})
+        self.assertEqual(plugins["claude"]["plugin_id"],
+                         "ccc@ccc-agent")
+        self.assertNotIn("argv", plugins["claude"])
         self.assertEqual(plugins["codex"]["sandbox_path"],
                          "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0")
         self.assertEqual(plugins["codex"]["plugin_id"],
@@ -291,17 +308,19 @@ class TestSetupConfig(unittest.TestCase):
         self.assertFalse(cfg["protect_agent_state"])
         self.assertNotIn("workspace", cfg)
 
-    def test_setup_enables_codex_plugin_and_claude_hooks_with_persistent_config(self):
+    def test_setup_enables_codex_and_points_claude_at_preseeded_plugin_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
             os.makedirs(home)
             config_path = os.path.join(tmp, "config.json")
             state_dir = os.path.join(tmp, "state")
+            claude_seed = os.path.join(tmp, "opt", "claude-seed")
             with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False):
                 rc = setup_mod.main([
                     "--user",
                     "--config", config_path,
                     "--state-dir", state_dir,
+                    "--claude-plugin-seed-dir", claude_seed,
                 ])
             self.assertEqual(rc, 0)
             # Codex loads enabled/trusted plugins from config; user-mode setup
@@ -320,30 +339,30 @@ class TestSetupConfig(unittest.TestCase):
                 self.assertIn('hooks.state."%s".trusted_hash = "%s"'
                               % (key, trusted_hash), codex_toml)
 
-            # Claude uses standalone persistent settings instead of --plugin-dir.
+            # Claude is production-seeded at image build time. Runtime setup
+            # writes only plugin enablement: no hooks and no marketplace source.
             claude_settings = os.path.join(home, ".claude", "settings.json")
-            self.assertTrue(os.path.isfile(claude_settings))
             with open(claude_settings) as fh:
                 claude = json.load(fh)
-            hooks = claude["hooks"]
-            self.assertIn("SessionStart", hooks)
-            self.assertIn("Stop", hooks)
-            hook_commands = json.dumps(hooks)
-            self.assertIn("claude-ccc-containment/hooks/ccc-context-hook.sh",
-                          hook_commands)
-            self.assertIn("claude-ccc-containment/hooks/ccc-stop-hook.sh",
-                          hook_commands)
-            self.assertNotIn("--plugin-dir", hook_commands)
+            self.assertEqual(claude,
+                             {"enabledPlugins": {"ccc@ccc-agent": True}})
+            self.assertFalse(os.path.exists(claude_seed))
 
             with open(config_path) as fh:
                 cfg = json.load(fh)
             self.assertEqual(cfg["agent_hook_mode"], "plugins")
-            self.assertEqual(sorted(cfg["agent_plugins"]), ["codex"])
+            self.assertEqual(sorted(cfg["agent_plugins"]), ["claude", "codex"])
             src = cfg["agent_plugins"]["codex"]["src"]
             self.assertTrue(os.path.isdir(src), src)
             self.assertNotIn("argv", cfg["agent_plugins"]["codex"])
+            self.assertNotIn("argv", cfg["agent_plugins"]["claude"])
+            self.assertEqual(cfg["agent_plugins"]["claude"]["src"], claude_seed)
+            self.assertEqual(cfg["agent_plugins"]["claude"]["sandbox_path"], claude_seed)
+            self.assertEqual(
+                cfg["agent_plugins"]["claude"]["setenv"],
+                {"CLAUDE_CODE_PLUGIN_SEED_DIR": claude_seed})
 
-    def test_system_setup_can_write_tool_managed_config_paths(self):
+    def test_system_setup_can_write_codex_config_and_claude_seed_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
             os.makedirs(home)
@@ -352,6 +371,7 @@ class TestSetupConfig(unittest.TestCase):
             claude_settings = os.path.join(
                 tmp, "etc", "claude-code", "managed-settings.d",
                 "50-ccc-agent.json")
+            claude_seed = os.path.join(tmp, "opt", "claude-seed")
             with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False):
                 rc = setup_mod.main([
                     "--system",
@@ -361,6 +381,7 @@ class TestSetupConfig(unittest.TestCase):
                     "--branch-store", os.path.join(tmp, "branches"),
                     "--codex-config", codex_config,
                     "--claude-settings", claude_settings,
+                    "--claude-plugin-seed-dir", claude_seed,
                 ])
             self.assertEqual(rc, 0)
             self.assertTrue(os.path.isfile(codex_config))
@@ -369,16 +390,120 @@ class TestSetupConfig(unittest.TestCase):
                 os.path.join(home, ".codex", "config.toml")))
             self.assertFalse(os.path.exists(
                 os.path.join(home, ".claude", "settings.json")))
+            self.assertFalse(os.path.exists(claude_seed))
             with open(codex_config) as fh:
                 self.assertIn('plugins."ccc@ccc-agent".enabled = true',
                               fh.read())
             with open(claude_settings) as fh:
-                hook_json = fh.read()
-            self.assertIn("claude-ccc-containment/hooks/ccc-context-hook.sh",
-                          hook_json)
-            self.assertIn("claude-ccc-containment/hooks/ccc-stop-hook.sh",
-                          hook_json)
-            self.assertNotIn("--plugin-dir", hook_json)
+                self.assertEqual(
+                    json.load(fh),
+                    {"enabledPlugins": {"ccc@ccc-agent": True}})
+            with open(config_path) as fh:
+                cfg = json.load(fh)
+            self.assertEqual(cfg["agent_plugins"]["claude"]["src"], claude_seed)
+            self.assertEqual(
+                cfg["agent_plugins"]["claude"]["setenv"],
+                {"CLAUDE_CODE_PLUGIN_SEED_DIR": claude_seed})
+
+    def test_claude_seed_enablement_removes_only_legacy_ccc_wiring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            settings_path = os.path.join(home, ".claude", "settings.json")
+            os.makedirs(os.path.dirname(settings_path))
+            legacy = {
+                "extraKnownMarketplaces": {
+                    "ccc-agent": {"source": {"source": "directory",
+                                               "path": "/old/ccc"}},
+                    "keep-market": {"source": {"source": "github",
+                                                 "repo": "org/plugins"}},
+                },
+                "enabledPlugins": {"other@keep-market": False},
+                "hooks": {
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command":
+                                     "/old/claude-ccc-containment/hooks/ccc-stop-hook.sh"}]},
+                        {"hooks": [{"type": "command", "command":
+                                     "/keep/user-hook.sh"}]},
+                    ],
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command":
+                                     "/old/claude-ccc-containment/hooks/ccc-context-hook.sh"}]},
+                    ],
+                },
+            }
+            with open(settings_path, "w") as fh:
+                json.dump(legacy, fh)
+
+            setup_mod.ensure_claude_seed_plugin_enabled(
+                home, settings_path=settings_path)
+
+            with open(settings_path) as fh:
+                settings = json.load(fh)
+            self.assertNotIn("ccc-agent", settings["extraKnownMarketplaces"])
+            self.assertIn("keep-market", settings["extraKnownMarketplaces"])
+            self.assertEqual(settings["enabledPlugins"], {
+                "ccc@ccc-agent": True,
+                "other@keep-market": False,
+            })
+            self.assertEqual(len(settings["hooks"]["Stop"]), 1)
+            self.assertIn("/keep/user-hook.sh", json.dumps(settings["hooks"]))
+            self.assertNotIn("SessionStart", settings["hooks"])
+            self.assertNotIn("claude-ccc-containment/hooks/ccc-",
+                             json.dumps(settings))
+
+    def test_claude_seed_registry_initialization_preserves_other_plugins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            seed = os.path.join(tmp, "seed")
+            marketplace = os.path.join(seed, "marketplaces", "ccc-agent")
+            cache = os.path.join(seed, "cache", "ccc-agent", "ccc", "0.2.0")
+            os.makedirs(os.path.join(marketplace, ".claude-plugin"))
+            os.makedirs(os.path.join(cache, ".claude-plugin"))
+            with open(os.path.join(marketplace, ".claude-plugin",
+                                   "marketplace.json"), "w") as fh:
+                json.dump({"name": "ccc-agent", "plugins": []}, fh)
+            with open(os.path.join(cache, ".claude-plugin", "plugin.json"), "w") as fh:
+                json.dump({"name": "ccc", "version": "0.2.0"}, fh)
+            with open(os.path.join(seed, "known_marketplaces.json"), "w") as fh:
+                json.dump({"ccc-agent": {
+                    "source": {"source": "directory", "path": "/build/path"},
+                    "installLocation": "/build/path",
+                }}, fh)
+            with open(os.path.join(seed, "installed_plugins.json"), "w") as fh:
+                json.dump({"version": 2, "plugins": {"ccc@ccc-agent": [{
+                    "scope": "user", "installPath": "/build/cache",
+                    "version": "0.2.0", "installedAt": "then",
+                    "lastUpdated": "then",
+                }]}}, fh)
+
+            plugin_state = os.path.join(home, ".claude", "plugins")
+            os.makedirs(plugin_state)
+            os.chmod(os.path.join(home, ".claude"), 0o700)
+            with open(os.path.join(plugin_state, "known_marketplaces.json"), "w") as fh:
+                json.dump({"keep-market": {"source": {"source": "github",
+                                                        "repo": "org/keep"}}}, fh)
+            with open(os.path.join(plugin_state, "installed_plugins.json"), "w") as fh:
+                json.dump({"version": 2, "plugins": {
+                    "keep@keep-market": [{"scope": "user", "version": "1.0.0"}]
+                }}, fh)
+
+            paths = setup_mod.ensure_claude_seed_plugin_registry(home, seed)
+            self.assertIsNotNone(paths)
+            self.assertEqual(
+                stat.S_IMODE(os.stat(os.path.join(home, ".claude")).st_mode),
+                0o700)
+            with open(paths[0]) as fh:
+                known = json.load(fh)
+            with open(paths[1]) as fh:
+                installed = json.load(fh)
+            self.assertIn("keep-market", known)
+            self.assertEqual(
+                known["ccc-agent"]["installLocation"],
+                os.path.realpath(marketplace))
+            self.assertIn("keep@keep-market", installed["plugins"])
+            ccc_entry = installed["plugins"]["ccc@ccc-agent"][0]
+            self.assertEqual(ccc_entry["installPath"], os.path.realpath(cache))
+            self.assertEqual(ccc_entry["version"], "0.2.0")
 
     def test_setup_preserves_existing_codex_config_when_adding_managed_block(self):
         with tempfile.TemporaryDirectory() as tmp:

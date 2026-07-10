@@ -31,13 +31,19 @@
   "cred_mask": [],
   "cred_env": {},
 
-  "_agent_plugins_comment": "Mount-only CCC plugin assets for tools that load persistent config. By default this is Codex only: setup enables/trusts the plugin in Codex config, while ccc-agent run only binds the read-only plugin cache. Claude hooks are written to Claude settings and Hermes gets no default per-run plugin env. No default entry appends agent CLI argv or sets launch env. agent_hook_mode=plugins (default) | disabled. Per-turn hooks are best-effort: if a plugin fails to load, process-exit review still finalizes the session.",
+  "_agent_plugins_comment": "Mount-only CCC plugin assets for tools that load persistent config. Setup enables/trusts Codex. Claude uses Anthropic's production seed mechanism: bake the plugin into CLAUDE_CODE_PLUGIN_SEED_DIR (default /opt/claude-seed) at image build; setup enables it and initializes per-user metadata; ccc-agent run points contained Claude at that read-only seed. No default entry appends agent CLI argv. agent_hook_mode=plugins (default) | disabled. Per-turn hooks are best-effort: if a plugin fails to load, process-exit review still finalizes the session.",
   "agent_hook_mode": "plugins",
   "agent_plugins": {
     "codex": {
       "src": "/usr/lib/python3/dist-packages/ccc_agent/assets/plugins/codex-ccc-containment",
       "sandbox_path": "/home/<user>/.codex/plugins/cache/ccc-agent/ccc/0.2.0",
       "ensure_dirs": ["/home/<user>/.codex/plugins/cache/ccc-agent/ccc"],
+      "plugin_id": "ccc@ccc-agent"
+    },
+    "claude": {
+      "src": "/opt/claude-seed",
+      "sandbox_path": "/opt/claude-seed",
+      "setenv": {"CLAUDE_CODE_PLUGIN_SEED_DIR": "/opt/claude-seed"},
       "plugin_id": "ccc@ccc-agent"
     }
   },

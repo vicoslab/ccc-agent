@@ -965,38 +965,46 @@ class TestBwrapConfinement(unittest.TestCase):
         binds.append(paths["hermes"] + ":/home/domen/.hermes")
         return paths, binds
 
-    def test_bwrap_injects_claude_plugin_only_for_direct_claude(self):
+    def test_bwrap_mounts_claude_plugin_without_launch_args_for_direct_claude(self):
         src = self._make_plugin("claude-ccc-containment")
         sandbox = "/ccc-agent/plugins/claude-ccc-containment"
         plugins = {"claude": {"src": src, "sandbox_path": sandbox,
-                              "argv": ["--plugin-dir", sandbox]}}
+                              "setenv": {"CLAUDE_CODE_PLUGIN_SEED_DIR": sandbox}}}
 
         argv = self._capture_argv(["claude", "-p", "x"], "claude", plugins)
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
-        # plugin source mounted read-only at the neutral sandbox path
+        # plugin source mounted read-only at the configured plugin path
         self.assertIn(("--ro-bind", src, sandbox), triples)
-        # --plugin-dir inserted right after the claude executable, user args kept
+        # Claude plugin activation comes from the seed env, not --plugin-dir.
+        self.assertTrue(any(argv[k] == "--setenv" and
+                            argv[k + 1] == "CLAUDE_CODE_PLUGIN_SEED_DIR" and
+                            argv[k + 2] == sandbox
+                            for k in range(len(argv) - 2)))
         self.assertEqual(self._wrapped_agent_command(argv),
-                         ["claude", "--plugin-dir", sandbox, "-p", "x"])
+                         ["claude", "-p", "x"])
+        self.assertNotIn("--plugin-dir", argv)
 
-        # a non-claude command never receives the claude plugin
+        # a non-claude command never receives the claude plugin by inference
         other = self._capture_argv(["bash", "-lc", "claude"], "command", plugins)
         self.assertNotIn(src, other)
         self.assertNotIn("--plugin-dir", other)
 
-    def test_bwrap_does_not_inject_claude_plugin_into_ssh_server_shell(self):
+    def test_bwrap_mounts_claude_plugin_without_launch_args_for_ssh_server_shell(self):
         src = self._make_plugin("claude-ccc-containment")
         sandbox = "/ccc-agent/plugins/claude-ccc-containment"
         plugins = {"claude": {"src": src, "sandbox_path": sandbox,
-                              "argv": ["--plugin-dir", sandbox]}}
+                              "setenv": {"CLAUDE_CODE_PLUGIN_SEED_DIR": sandbox}}}
 
         argv = self._capture_argv(
             ["/bin/bash", "-c",
              "'/home/domen/.claude/remote/srv/hash/server' --version"],
             "claude", plugins)
 
-        self.assertNotIn(src, argv)
+        triples = [(argv[k], argv[k + 1], argv[k + 2])
+                   for k in range(len(argv) - 2)]
+        self.assertIn(("--ro-bind", src, sandbox), triples)
+        self.assertIn(("--setenv", "CLAUDE_CODE_PLUGIN_SEED_DIR", sandbox), triples)
         self.assertNotIn("--plugin-dir", argv)
         self.assertEqual(
             self._wrapped_agent_command(argv),

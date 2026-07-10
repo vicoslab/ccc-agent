@@ -393,25 +393,32 @@ def _direct_agent_command_matches(config, agent):
     SSH routers often label containment sessions as codex/claude because the
     payload eventually starts those tools, but the direct command is a shell or
     server helper such as `/bin/bash -c ...` or `~/.claude/remote/.../server`.
-    Those commands cannot accept Codex YOLO flags or Claude `--plugin-dir`; only
-    decorate direct agent CLI invocations.
+    Those commands cannot accept opt-in launch flags; only decorate direct agent
+    CLI invocations when an operator explicitly configured argv activation.
     """
     if not config.agent_command:
         return False
     return _agent_token(config.agent_command[0]) == str(agent or "").lower()
 
 
-def _plugin_has_launch_activation(spec):
-    return bool(spec and (spec.get("argv") or spec.get("setenv")))
+def _plugin_has_argv_activation(spec):
+    """Return true only for activation that mutates the command argv.
+
+    Environment such as ``CLAUDE_CODE_PLUGIN_SEED_DIR`` is safe and necessary
+    for explicitly identified SSH/server wrappers whose eventual child is the
+    requested agent. It must not make those wrappers fail plugin matching.
+    """
+    return bool(spec and spec.get("argv"))
 
 
 def _matched_agent_plugin(config):
     """Return the validated plugin spec for the contained agent, or None.
 
-    Mount-only specs may be selected by explicit ``--agent`` even when the
-    direct command is an SSH/server shell wrapper, because they do not mutate the
-    command argv/env. Specs that append argv or set launch env are selected only
-    when argv[0] is the direct agent CLI.
+    Specs without argv activation may be selected by explicit ``--agent`` even
+    when the direct command is an SSH/server shell wrapper. This permits safe
+    plugin binds and environment such as Claude's seed directory to reach the
+    eventual child agent. Specs that append argv are selected only when argv[0]
+    is the direct agent CLI.
     """
     if "--bare" in config.agent_command:
         return None
@@ -430,7 +437,7 @@ def _matched_agent_plugin(config):
         explicit_agent = _plugin_key_for_token(config, explicit_kind)
         if explicit_agent:
             spec = validated(explicit_agent)
-            if spec and (not _plugin_has_launch_activation(spec)
+            if spec and (not _plugin_has_argv_activation(spec)
                          or _direct_agent_command_matches(config, explicit_agent)):
                 return spec
             return None
@@ -463,9 +470,9 @@ def _append_agent_plugin_binds(argv, spec):
 def _agent_command_with_plugin(command, spec):
     """Insert the plugin's activation flags right after the agent executable.
 
-    e.g. ``claude -p x`` + ``--plugin-dir P`` -> ``claude --plugin-dir P -p x``.
-    User-supplied arguments are preserved; Claude accepts a repeated
-    ``--plugin-dir`` so a user-provided one coexists with the CCC one.
+    e.g. ``agent -p x`` + ``--flag P`` -> ``agent --flag P -p x``.
+    Setup-generated defaults do not use this for Codex or Claude; it remains an
+    explicit operator escape hatch for custom plugin integrations.
     """
     command = list(command)
     if spec is None or not command:
@@ -932,8 +939,8 @@ def _bwrap_command(session, config, control=None, env=None):
         value = _extract_cred(spec)
         if value:
             argv += ["--setenv", var, value]
-    # Plugin activation env (e.g. HERMES_BUNDLED_PLUGINS); operator bwrap_setenv
-    # below can still override.
+    # Plugin activation env (for example CLAUDE_CODE_PLUGIN_SEED_DIR); operator
+    # bwrap_setenv below can still override.
     if plugin_spec is not None:
         for key, value in sorted(plugin_spec.get("setenv", {}).items()):
             argv += ["--setenv", key, str(value)]

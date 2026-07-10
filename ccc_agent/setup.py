@@ -9,9 +9,9 @@ ccc-agent-owned runtime config plus optional transparent shims:
 
 `ccc-agent run` consumes that config and provides BranchFS/bwrap containment.
 Default agent integration is persistent-config/mount-only: Codex gets a plugin
-cache bind plus config enablement, Claude gets standalone settings hooks, and
-Hermes gets no default per-run plugin environment. Direct codex/claude/hermes
-argv/env is not modified by setup-generated defaults.
+cache bind plus config enablement, Claude gets a packaged plugin seed reference,
+and Hermes gets no default per-run plugin environment. Direct codex/claude/hermes
+argv is not modified by setup-generated defaults.
 """
 
 import argparse
@@ -36,9 +36,10 @@ def plugins_dir():
     """On-disk path to bundled agent integration assets.
 
     Codex assets are mounted read-only into its plugin-cache path for contained
-    sessions. Claude uses the same installed assets through standalone settings
-    hook commands. Hermes assets remain packaged for explicit/operator use but
-    are not injected by default.
+    sessions. Claude plugin files can be materialized for image-build seeding via
+    ``python -m ccc_agent.claude_plugin``; contained runs point Claude at the
+    baked seed with ``CLAUDE_CODE_PLUGIN_SEED_DIR``. Hermes assets remain packaged
+    for explicit/operator use but are not injected by default.
     """
     return os.path.join(assets_dir(), "plugins")
 
@@ -354,69 +355,79 @@ def ensure_codex_plugin_enabled(home, user=None, config_path=None):
     return config_path
 
 
+CLAUDE_PLUGIN_ID = CODEX_PLUGIN_ID
+CLAUDE_PLUGIN_MARKETPLACE = CODEX_PLUGIN_MARKETPLACE
+CLAUDE_PLUGIN_SEED_ENV = "CLAUDE_CODE_PLUGIN_SEED_DIR"
+DEFAULT_CLAUDE_PLUGIN_SEED_DIR = "/opt/claude-seed"
 CLAUDE_SYSTEM_SETTINGS = "/etc/claude-code/managed-settings.d/50-ccc-agent.json"
 
 
-def _claude_plugin_root(src_dir=None):
-    return os.path.join(src_dir or plugins_dir(), "claude-ccc-containment")
+def default_claude_plugin_seed_dir(mode=None, home=None):
+    """Runtime path to a pre-populated Claude Code plugin seed.
 
-
-def claude_standalone_hooks(plugin_root=None):
-    """Claude settings.json hook config equivalent to the old plugin hooks.
-
-    Commands are absolute paths into the installed ccc-agent assets.  In the CCC
-    system image these live under /opt and are already visible through bwrap's
-    read-only /opt bind, so Claude can load them without a per-launch
-    --plugin-dir.
+    This intentionally follows Anthropic's container/CI mechanism: the image
+    build creates the seed once, and ccc-agent only points contained Claude runs
+    at it. ``mode`` and ``home`` are accepted for call-site compatibility.
     """
-    root = plugin_root or _claude_plugin_root()
-    context = os.path.join(root, "hooks", "ccc-context-hook.sh")
-    stop = os.path.join(root, "hooks", "ccc-stop-hook.sh")
-
-    def command(path):
-        return {"type": "command", "command": path}
-
-    return {
-        "SessionStart": [{"hooks": [command(context)]}],
-        "SessionEnd": [{"hooks": [command(context)]}],
-        "SessionStop": [{"hooks": [command(context)]}],
-        "UserPromptSubmit": [{"hooks": [command(context)]}],
-        "Stop": [{"hooks": [command(stop), command(context)]}],
-    }
+    return os.environ.get(CLAUDE_PLUGIN_SEED_ENV,
+                          DEFAULT_CLAUDE_PLUGIN_SEED_DIR)
 
 
-def _is_managed_claude_hook_group(group):
-    for hook in group.get("hooks", ()) if isinstance(group, dict) else ():
-        command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
+def _is_legacy_claude_hook_group(group):
+    """Return true for settings-level hooks written by older ccc-agent setup."""
+    if not isinstance(group, dict):
+        return False
+    for hook in group.get("hooks", ()):
+        if not isinstance(hook, dict):
+            continue
+        command = str(hook.get("command", ""))
         if "claude-ccc-containment/hooks/ccc-" in command:
             return True
     return False
 
 
-def _merge_claude_hooks(settings, managed_hooks):
+def _migrate_claude_settings_to_seed_plugin(settings):
+    """Enable the seed plugin and remove obsolete duplicate integration paths."""
     settings = dict(settings or {})
+
+    # The seed owns marketplace registration. Remove only our old declaration;
+    # preserve every unrelated marketplace configured by the user/operator.
+    marketplaces = settings.get("extraKnownMarketplaces")
+    if isinstance(marketplaces, dict) and CLAUDE_PLUGIN_MARKETPLACE in marketplaces:
+        marketplaces = dict(marketplaces)
+        marketplaces.pop(CLAUDE_PLUGIN_MARKETPLACE, None)
+        if marketplaces:
+            settings["extraKnownMarketplaces"] = marketplaces
+        else:
+            settings.pop("extraKnownMarketplaces", None)
+
+    # Hooks now live exclusively in the plugin's hooks/hooks.json. Clean only
+    # the legacy ccc-agent hook groups while retaining unrelated user hooks.
     hooks = settings.get("hooks")
-    if not isinstance(hooks, dict):
-        hooks = {}
-    else:
-        hooks = {key: list(value) if isinstance(value, list) else []
-                 for key, value in hooks.items()}
-    for event, groups in managed_hooks.items():
-        existing = [group for group in hooks.get(event, [])
-                    if not _is_managed_claude_hook_group(group)]
-        hooks[event] = existing + list(groups)
-    settings["hooks"] = hooks
+    if isinstance(hooks, dict):
+        kept_hooks = {}
+        for event, groups in hooks.items():
+            if not isinstance(groups, list):
+                kept_hooks[event] = groups
+                continue
+            kept = [group for group in groups
+                    if not _is_legacy_claude_hook_group(group)]
+            if kept:
+                kept_hooks[event] = kept
+        if kept_hooks:
+            settings["hooks"] = kept_hooks
+        else:
+            settings.pop("hooks", None)
+
+    enabled = settings.get("enabledPlugins")
+    enabled = dict(enabled) if isinstance(enabled, dict) else {}
+    enabled[CLAUDE_PLUGIN_ID] = True
+    settings["enabledPlugins"] = enabled
     return settings
 
 
-def ensure_claude_hooks_enabled(home, user=None, settings_path=None,
-                                plugin_root=None):
-    """Persist Claude Code hooks without using per-launch --plugin-dir.
-
-    User mode writes ~/.claude/settings.json.  System mode can pass
-    /etc/claude-code/managed-settings.d/50-ccc-agent.json, which Claude Code
-    documents as a managed drop-in settings source on Linux/WSL.
-    """
+def ensure_claude_seed_plugin_enabled(home, user=None, settings_path=None):
+    """Persist only Claude plugin enablement; installation comes from the seed."""
     settings_path = settings_path or os.path.join(home, ".claude", "settings.json")
     settings_dir = os.path.dirname(settings_path)
     under_home = os.path.abspath(settings_path).startswith(
@@ -426,9 +437,9 @@ def ensure_claude_hooks_enabled(home, user=None, settings_path=None,
     try:
         with open(settings_path) as fh:
             existing = json.load(fh)
-    except OSError:
+    except (OSError, ValueError):
         existing = {}
-    settings = _merge_claude_hooks(existing, claude_standalone_hooks(plugin_root))
+    settings = _migrate_claude_settings_to_seed_plugin(existing)
     with open(settings_path, "w") as fh:
         json.dump(settings, fh, indent=2, sort_keys=True)
         fh.write("\n")
@@ -448,21 +459,121 @@ def ensure_claude_hooks_enabled(home, user=None, settings_path=None,
     return settings_path
 
 
-def build_agent_plugins(home, src_dir=None):
+def _load_json_object(path):
+    try:
+        with open(path) as fh:
+            value = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def ensure_claude_seed_plugin_registry(home, seed_dir, user=None):
+    """Initialize Claude's per-user plugin metadata from a read-only seed.
+
+    Claude 2.1.x reconciles seed metadata after initial plugin loading. On a
+    pristine home that makes a newly enabled seed plugin active only on the next
+    invocation. Mirroring the seed's marketplace/install records into user state
+    before launch makes the first invocation deterministic; plugin bytes remain
+    in the trusted read-only seed.
+    """
+    # Keep the logical absolute path: this is the path mounted inside bwrap and
+    # exported through CLAUDE_CODE_PLUGIN_SEED_DIR. Resolving a host symlink here
+    # could write user metadata pointing at a path not present in the sandbox.
+    seed_dir = os.path.abspath(seed_dir)
+    seed_known_path = os.path.join(seed_dir, "known_marketplaces.json")
+    seed_installed_path = os.path.join(seed_dir, "installed_plugins.json")
+    seed_known = _load_json_object(seed_known_path)
+    seed_installed = _load_json_object(seed_installed_path)
+    seed_market = seed_known.get(CLAUDE_PLUGIN_MARKETPLACE)
+    seed_plugins = seed_installed.get("plugins")
+    seed_entries = (seed_plugins.get(CLAUDE_PLUGIN_ID)
+                    if isinstance(seed_plugins, dict) else None)
+    if not isinstance(seed_market, dict) or not isinstance(seed_entries, list):
+        return None
+
+    entry = next((dict(item) for item in seed_entries
+                  if isinstance(item, dict) and
+                  str(item.get("version")) == CODEX_PLUGIN_VERSION), None)
+    if entry is None:
+        return None
+    marketplace_dir = os.path.join(seed_dir, "marketplaces",
+                                   CLAUDE_PLUGIN_MARKETPLACE)
+    cache_dir = os.path.join(seed_dir, "cache", CLAUDE_PLUGIN_MARKETPLACE,
+                             CODEX_PLUGIN_NAME, CODEX_PLUGIN_VERSION)
+    if not os.path.isfile(os.path.join(
+            marketplace_dir, ".claude-plugin", "marketplace.json")):
+        return None
+    if not os.path.isfile(os.path.join(
+            cache_dir, ".claude-plugin", "plugin.json")):
+        return None
+
+    claude_state_dir = os.path.join(home, ".claude")
+    created_claude_dir = not os.path.exists(claude_state_dir)
+    if created_claude_dir:
+        os.makedirs(claude_state_dir, mode=0o700, exist_ok=True)
+        os.chmod(claude_state_dir, 0o700)
+    plugin_state_dir = os.path.join(claude_state_dir, "plugins")
+    created_dir = not os.path.exists(plugin_state_dir)
+    os.makedirs(plugin_state_dir, mode=0o700, exist_ok=True)
+    known_path = os.path.join(plugin_state_dir, "known_marketplaces.json")
+    installed_path = os.path.join(plugin_state_dir, "installed_plugins.json")
+
+    known = _load_json_object(known_path)
+    market = dict(seed_market)
+    market["source"] = {"source": "directory", "path": marketplace_dir}
+    market["installLocation"] = marketplace_dir
+    known[CLAUDE_PLUGIN_MARKETPLACE] = market
+
+    installed = _load_json_object(installed_path)
+    installed["version"] = 2
+    plugins = installed.get("plugins")
+    plugins = dict(plugins) if isinstance(plugins, dict) else {}
+    entry["scope"] = "user"
+    entry["installPath"] = cache_dir
+    plugins[CLAUDE_PLUGIN_ID] = [entry]
+    installed["plugins"] = plugins
+
+    for path, value in ((known_path, known), (installed_path, installed)):
+        with open(path, "w") as fh:
+            json.dump(value, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.chmod(path, 0o644)
+
+    if user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            return known_path, installed_path
+        try:
+            if created_claude_dir:
+                os.chown(claude_state_dir, pw.pw_uid, pw.pw_gid)
+            if created_dir:
+                os.chown(plugin_state_dir, pw.pw_uid, pw.pw_gid)
+            os.chown(known_path, pw.pw_uid, pw.pw_gid)
+            os.chown(installed_path, pw.pw_uid, pw.pw_gid)
+        except OSError:
+            pass
+    return known_path, installed_path
+
+
+def build_agent_plugins(home, src_dir=None, claude_seed_dir=None):
     """Describe mount-only plugin assets used by ccc-agent run.
 
-    Runtime config should not mutate the launched CLI argv/env by default.
-    Setup persists agent configuration where supported:
+    Runtime config should not mutate the launched CLI argv by default. Setup and
+    image-build wiring provide native plugin availability where needed:
 
       codex  -- /etc/codex/config.toml or ~/.codex/config.toml enables/trusts
-                the plugin; ccc-agent run only supplies the read-only plugin
-                cache mount.
-      claude -- /etc/claude-code/managed-settings.d or ~/.claude/settings.json
-                loads standalone hooks, so no --plugin-dir is needed.
+                the plugin; ccc-agent run supplies the read-only plugin cache
+                bind at Codex's installed-plugin path.
+      claude -- the container image pre-seeds the plugin cache; ccc-agent run
+                supplies the read-only seed bind and CLAUDE_CODE_PLUGIN_SEED_DIR.
       hermes -- no default per-run plugin env injection; process-exit review
                 remains authoritative.
     """
     src = src_dir or plugins_dir()
+    claude_seed = os.path.abspath(
+        claude_seed_dir or default_claude_plugin_seed_dir())
     codex_cache_path = codex_plugin_cache_path(home)
     codex_cache_parent = os.path.dirname(codex_cache_path)
     return {
@@ -471,6 +582,12 @@ def build_agent_plugins(home, src_dir=None):
             "sandbox_path": codex_cache_path,
             "ensure_dirs": [codex_cache_parent],
             "plugin_id": CODEX_PLUGIN_ID,
+        },
+        "claude": {
+            "src": claude_seed,
+            "sandbox_path": claude_seed,
+            "setenv": {CLAUDE_PLUGIN_SEED_ENV: claude_seed},
+            "plugin_id": CLAUDE_PLUGIN_ID,
         },
     }
 
@@ -488,7 +605,7 @@ def build_agent_state_binds(home):
 
 def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
                  storage_root="/storage", branch_store="/opt/branchfs_branches",
-                 container_name=""):
+                 container_name="", claude_seed_dir=None):
     """Assemble the runtime config.json (bwrap confinement by default).
 
     System mode models CCC's storage layout: the whole of ``/storage`` is the
@@ -530,7 +647,9 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         }
         top_home_subdir = ""
         ignore = [os.path.join(home, ".cache*")]
-    agent_plugins = build_agent_plugins(home)
+    agent_plugins = build_agent_plugins(
+        home, claude_seed_dir=(
+            claude_seed_dir or default_claude_plugin_seed_dir(mode, home)))
     return {
         "_comment": "Generated by ccc-agent setup. Keep root-owned and not "
                     "writable by agents.",
@@ -579,14 +698,12 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "cred_mask": [],
         "cred_env": {},
         "_agent_plugins_comment": "Mount-only CCC plugin assets for tools that "
-                                  "load persistent config. By default this is "
-                                  "Codex only: setup enables/trusts the plugin "
-                                  "in Codex config, while ccc-agent run only "
-                                  "binds the read-only plugin cache. Claude "
-                                  "hooks are written to Claude settings and "
-                                  "Hermes gets no default per-run plugin env. "
-                                  "No default entry appends agent CLI argv or "
-                                  "sets launch env.",
+                                  "load persistent config. Setup enables/"
+                                  "trusts Codex and points Claude at a "
+                                  "pre-seeded plugin cache; ccc-agent run "
+                                  "supplies read-only plugin asset binds plus "
+                                  "Claude's documented plugin seed env. No "
+                                  "default entry appends agent CLI argv.",
         "agent_hook_mode": "plugins",
         "agent_plugins": agent_plugins,
         "roots": [root],
@@ -634,6 +751,7 @@ def main(argv=None, prog="ccc-agent setup"):
                              "--link-dir to PATH (for profile/rc integration)")
     parser.add_argument("--codex-config", help=argparse.SUPPRESS)
     parser.add_argument("--claude-settings", help=argparse.SUPPRESS)
+    parser.add_argument("--claude-plugin-seed-dir", help=argparse.SUPPRESS)
     parser.add_argument("--ssh-shell-router",
                         help="symlink the bundled SSH shell router to this "
                              "stable executable path")
@@ -685,35 +803,48 @@ def main(argv=None, prog="ccc-agent setup"):
     _warn_branchfs_runtime(branchfs_bin)
     bwrap_bin = _resolve("bwrap", args.bwrap_bin)
 
+    claude_seed_dir = (args.claude_plugin_seed_dir or
+                       default_claude_plugin_seed_dir(mode, home))
     config = build_config(mode, user, home, branchfs_bin, bwrap_bin,
                           state_dir, args.storage_root, args.branch_store,
-                          container_name)
+                          container_name, claude_seed_dir=claude_seed_dir)
     if args.protect_agent_state:
         config["protect_agent_state"] = True
     if args.no_plugins:
         config["agent_plugins"] = {}
         config["agent_hook_mode"] = "disabled"
     else:
-        if mode == "system":
-            codex_config_path = args.codex_config or "/etc/codex/config.toml"
-            claude_settings_path = args.claude_settings or CLAUDE_SYSTEM_SETTINGS
-        else:
-            codex_config_path = args.codex_config or None
-            claude_settings_path = args.claude_settings or None
+        codex_config_path = (args.codex_config or
+                             ("/etc/codex/config.toml" if mode == "system"
+                              else None))
+        claude_settings_path = (args.claude_settings or
+                                (CLAUDE_SYSTEM_SETTINGS if mode == "system"
+                                 else None))
         codex_config = ensure_codex_plugin_enabled(
             home, user=user, config_path=codex_config_path)
-        claude_settings = ensure_claude_hooks_enabled(
+        claude_settings = ensure_claude_seed_plugin_enabled(
             home, user=user, settings_path=claude_settings_path)
+        claude_registry = ensure_claude_seed_plugin_registry(
+            home, claude_seed_dir, user=user)
         sys.stderr.write(
             "ccc-agent setup: agent plugin assets under %s are mounted "
-            "read-only when needed; launch argv/env is not modified by "
-            "default\n" % plugins_dir())
+            "read-only when needed; Claude uses pre-seeded plugin dir %s\n"
+            % (plugins_dir(), claude_seed_dir))
         sys.stderr.write(
             "ccc-agent setup: ensured Codex plugin enablement in %s\n"
             % codex_config)
         sys.stderr.write(
-            "ccc-agent setup: ensured Claude standalone hooks in %s\n"
+            "ccc-agent setup: ensured Claude seed-plugin enablement in %s\n"
             % claude_settings)
+        if claude_registry:
+            sys.stderr.write(
+                "ccc-agent setup: initialized Claude plugin registry from %s\n"
+                % claude_seed_dir)
+        else:
+            sys.stderr.write(
+                "ccc-agent setup: WARNING Claude plugin seed is incomplete or "
+                "missing at %s; Claude will use process-exit review until the "
+                "image seed is installed\n" % claude_seed_dir)
 
     _write_json(config_file, config)
     sys.stderr.write("ccc-agent setup: wrote %s\n" % config_file)
