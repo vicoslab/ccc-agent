@@ -20,6 +20,7 @@ branchfs = [
 
 [project.scripts]
 ccc-agent = "ccc_agent.cli:main"
+ccc-agent-claude-plugin = "ccc_agent.claude_plugin:main"
 
 [tool.setuptools]
 packages = ["ccc_agent"]
@@ -37,6 +38,7 @@ version = { attr = "ccc_agent.__version__" }
     "assets/completions/zsh/_ccc-agent",
     "assets/completions/fish/ccc-agent.fish",
     "assets/plugins/**/*.json",
+    "assets/plugins/.claude-plugin/*.json",
     "assets/plugins/claude-ccc-containment/.claude-plugin/*.json",
     "assets/plugins/codex-ccc-containment/.codex-plugin/*.json",
     "assets/plugins/**/*.sh",

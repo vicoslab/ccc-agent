@@ -1,15 +1,5 @@
 {
-  "_comment": "Claude Code managed settings for CCC agent containment. Deploy to a path the agent cannot write (e.g. /etc/claude-code/managed-settings.json or launcher-injected --settings). User/home settings are NOT enforcement-grade: the agent can rewrite them.",
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/opt/ccc-agent/hooks/claude-stop-hook.sh"
-          }
-        ]
-      }
-    ]
+  "enabledPlugins": {
+    "ccc@ccc-agent": true
   }
 }

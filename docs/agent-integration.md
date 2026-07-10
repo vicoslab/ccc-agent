@@ -8,30 +8,37 @@ process-exit freeze/status/policy review.
 
 | Invocation | Boundary | Plugin behavior | Review behavior |
 |---|---|---|---|
-| `ccc-agent run -- codex exec "..."` | Process exit | Codex plugin may be injected, but one-shot exit is enough. | Session-end finalize. |
-| `ccc-agent run -- claude -p "..."` | Process exit | Claude plugin may be injected, but one-shot exit is enough. | Session-end finalize. |
-| `ccc-agent run -- hermes "..."` | Process exit / Hermes hooks | Hermes plugin can report turns/session end. | Turn and session finalize when hooks run; process exit remains authoritative. |
+| `ccc-agent run -- codex exec "..."` | Process exit | Codex plugin cache may be mounted; one-shot exit is enough. | Session-end finalize. |
+| `ccc-agent run -- claude -p "..."` | Process exit | Claude plugin seed may be mounted, but one-shot exit is enough. | Session-end finalize. |
+| `ccc-agent run -- hermes "..."` | Process exit | No default Hermes per-run plugin env. | Session-end finalize. |
 | `ccc-agent run -- codex` | Interactive turns + process exit | Codex plugin Stop hook, version-dependent. | Workspace changes may commit per turn; kept paths reviewed later. |
-| `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude plugin via `--plugin-dir`. | Workspace changes may commit per turn; kept paths reviewed later. |
+| `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude hooks from the enabled `ccc@ccc-agent` plugin, if active. | Workspace changes may commit per turn; kept paths reviewed later. |
 | `ccc-agent run --serve codex -- <ssh/app-server wrapper>` | Server process + inner sessions | Treats the contained command as a server/runtime wrapper for the named agent. | `ccc-agent` prints nothing on the SSH stream; at process exit it commits workspace changes and keeps other paths for later review. |
 | `ccc-agent run -- <other command>` | Process exit | No native plugin required. | Session-end finalize. |
 
-## Plugin injection model
+## Plugin/config model
 
-For a matching contained run, `ccc-agent run`:
+For default setup-generated configs, `ccc-agent run` does **not** append
+agent-specific argv. Instead:
 
-1. identifies the agent from `--agent` or the executable basename;
-2. validates the configured plugin asset directory on the trusted host;
-3. bind-mounts that asset read-only into the bwrap sandbox;
-4. inserts activation argv or environment variables for the contained command;
-5. starts a trusted control socket for turn operations when enabled.
+1. setup writes persistent tool config where the tool supports it;
+2. `ccc-agent run` may bind trusted package assets read-only when a matching
+   contained agent needs files inside its runtime state;
+3. it may set non-interactive plugin-discovery environment such as Claude's seed
+   path for an explicitly identified agent or server wrapper;
+4. the trusted control socket is available for best-effort turn operations when
+   hooks run.
+
+Manually configured `agent_plugins` may still specify `argv` or `setenv`.
+Argument activation remains restricted to direct agent CLI invocations; safe
+asset-discovery environment can reach an explicitly identified server wrapper.
 
 Use `--serve AGENT` for server-style entrypoints such as Codex app-server, Claude
 remote server wrappers, or a Hermes gateway launched through SSH. Server mode is
 intended for protocols that parse stdout/stderr themselves: `ccc-agent` emits no
 banner, finish line, review text, or prompt during the wrapped server lifecycle,
-and it does not inject agent-interactive argv/env activation into the server
-command. Before the final freeze it applies the same default as turn hooks:
+and it does not inject agent-interactive argv into the server command. Before the
+final freeze it applies the same default as turn hooks:
 commit in-workspace changes, remember non-workspace changes as kept in the
 branch, and leave the session reviewable if anything still needs later
 attention. The SSH shell router uses this mode automatically for detected
@@ -88,19 +95,16 @@ Configuration-level disabling uses `agent_hook_mode: "disabled"` and an empty
 ## Codex
 
 Contained Codex receives the bundled Codex plugin mounted at its in-sandbox plugin
-cache path. `ccc-agent setup` also maintains a narrow marked block in
-`~/.codex/config.toml` so Codex 0.136+ treats the plugin as enabled/trusted when
-that read-only plugin cache is present.
+cache path. `ccc-agent setup --system` writes the enable/trust block to
+`/etc/codex/config.toml`; `ccc-agent setup --user` writes the same marked block to
+`~/.codex/config.toml`. Codex 0.136+ then treats the read-only cache bind as an
+enabled/trusted installed plugin when the contained run provides it.
 
-For contained Codex commands, `ccc-agent` also inserts:
-
-```text
---dangerously-bypass-approvals-and-sandbox
-```
-
-Codex is already running inside the `ccc-agent` BranchFS/bwrap boundary. Disabling
-Codex's nested Linux sandbox avoids incompatible nested-bwrap behavior while
-preserving the outer filesystem containment and review boundary.
+`ccc-agent` no longer adds `--dangerously-bypass-approvals-and-sandbox` or any
+other Codex sandbox/Yolo flag by default. If you want Codex's danger-full-access
+mode inside the outer CCC boundary, pass the Codex flag yourself; otherwise Codex
+owns its own sandbox behavior and any nested-sandbox incompatibility is surfaced
+by Codex.
 
 Interactive Codex Stop hooks are version-dependent. If the hook runs, it calls
 `turn-finalize --default-keep`. If it does not run, changes are handled at
@@ -108,29 +112,40 @@ session end.
 
 ## Claude Code
 
-Contained Claude Code receives the bundled Claude plugin by adding a session-only
-plugin directory:
+Contained Claude Code uses the packaged `ccc@ccc-agent` Claude plugin, not
+settings-level hook duplication and not a session-only `--plugin-dir` flag.
+The production path is Anthropic's container/CI seed mechanism:
+`CLAUDE_CODE_PLUGIN_SEED_DIR` points to a read-only, pre-populated
+`~/.claude/plugins` tree baked into the image (normally `/opt/claude-seed`).
 
-```text
-claude --plugin-dir /ccc-agent/plugins/claude-ccc-containment ...
+The pip package owns the static plugin files. During the image build, materialize
+the local marketplace source and let Claude Code perform the one-time install:
+
+```bash
+mkdir -p /opt/claude-seed/marketplaces
+python -m ccc_agent.claude_plugin \
+  --write-to /opt/claude-seed/marketplaces/ccc-agent
+CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+  claude plugin marketplace add /opt/claude-seed/marketplaces/ccc-agent
+CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
+  claude plugin install ccc@ccc-agent
 ```
 
-The plugin directory is a read-only bwrap mount from package assets. The Stop
-hook reports turn boundaries to the trusted supervisor. `--bare` disables
-plugins/hooks, so a contained `--bare` run falls back to process-exit review.
+Setup-managed settings enable `ccc@ccc-agent` but do not duplicate hooks or
+declare another marketplace source. Setup initializes the user's Claude plugin
+metadata from the seed so hooks are active on the first invocation while
+preserving unrelated plugins. At runtime, `ccc-agent run` mounts the seed
+read-only and sets `CLAUDE_CODE_PLUGIN_SEED_DIR` inside bwrap. If the seed is
+absent or Claude does not load the plugin, contained Claude runs fall back to
+process-exit review.
 
 ## Hermes
 
-Contained Hermes receives a bundled plugin through environment variables:
-
-```text
-HERMES_BUNDLED_PLUGINS=/ccc-agent/plugins/hermes
-HERMES_ACCEPT_HOOKS=1
-```
-
-The plugin injects CCC review/commit reminders, reports turn/session boundaries,
-and surfaces kept-file choices in final responses when needed. It still does not
-own commit authority; it calls trusted `ccc-agent turn-*` operations.
+`ccc-agent` no longer injects `HERMES_BUNDLED_PLUGINS` or `HERMES_ACCEPT_HOOKS`
+by default. Hermes runs still get the BranchFS/bwrap boundary and process-exit
+freeze/status/policy review. Operators who want a Hermes native plugin can
+configure Hermes explicitly; commit authority remains in the trusted supervisor,
+not in the plugin.
 
 ## OpenCode and generic commands
 
@@ -201,9 +216,8 @@ Bundled lifecycle coverage:
 
 - Hermes: first-turn `pre_llm_call` adds the current workspace; `on_session_end`
   removes it.
-- Claude: `SessionStart` adds the current workspace; `SessionEnd`/`SessionStop`
-  are wired to remove it when those events are emitted. `Stop` remains a
-  turn-boundary finalize/review hook.
+- Claude: `SessionStart` adds the current workspace; `SessionEnd` removes it.
+  `Stop` remains a turn-boundary finalize/review hook.
 - Codex: documented `SessionStart` adds the root thread workspace;
   `SubagentStart`/`SubagentStop` add/remove subagent workspaces. Codex does not
   currently document a root `SessionEnd` event, so the root thread workspace is

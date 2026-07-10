@@ -1,11 +1,10 @@
 #!/bin/sh
 # CCC contained-session Stop-hook adapter (Claude Code / Codex plugin).
 #
-# Loaded for contained CCC sessions: ccc-agent run injects the enclosing
-# plugin read-only and points the agent at it (Claude --plugin-dir, Codex
-# installed-plugin cache bind). Codex also keeps a persistent enabled-plugin
-# config entry; direct Codex runs are safe because this hook exits immediately
-# unless CCC_AGENT_SESSION is set.
+# Loaded for contained CCC sessions through agent-native plugin config: Claude
+# uses a pre-seeded plugin cache (CLAUDE_CODE_PLUGIN_SEED_DIR), and Codex uses a
+# read-only installed-plugin cache bind. Direct/non-CCC runs are safe because hooks
+# exit immediately when CCC_AGENT_SESSION is absent.
 #
 # Hooks are best-effort turn-boundary SIGNALS. They never freeze, commit, or
 # abort -- commit authority lives in the trusted supervisor outside the

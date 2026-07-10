@@ -1,0 +1,15 @@
+{
+  "name": "ccc-agent",
+  "description": "CCC contained-session lifecycle integration for Claude Code.",
+  "owner": {
+    "name": "CCC agent"
+  },
+  "plugins": [
+    {
+      "name": "ccc",
+      "version": "0.2.0",
+      "description": "CCC contained-session lifecycle hooks and /ccc commands for Claude Code. Hooks exit unless CCC_AGENT_SESSION is set and signal the trusted ccc-agent supervisor over the control socket.",
+      "source": "./claude-ccc-containment"
+    }
+  ]
+}

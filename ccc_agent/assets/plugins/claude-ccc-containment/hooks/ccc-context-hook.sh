@@ -124,7 +124,7 @@ case "$EVENT" in
                 "$BODY" | emit_context SessionStart
         fi
         ;;
-    SessionEnd|SessionStop)
+    SessionEnd)
         workspace_scope remove
         ;;
     UserPromptSubmit)

@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import unittest
 
+import ccc_agent.claude_plugin as claude_plugin
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENT_DIR = os.path.dirname(HERE)
 ASSETS = os.path.join(AGENT_DIR, "ccc_agent", "assets")
@@ -50,6 +52,15 @@ class TestPluginAssets(unittest.TestCase):
     """The packaged native plugins ccc-agent run injects per contained run."""
 
     def test_claude_plugin_layout(self):
+        marketplace_path = os.path.join(PLUGINS, ".claude-plugin", "marketplace.json")
+        self.assertTrue(os.path.isfile(marketplace_path))
+        with open(marketplace_path) as fh:
+            marketplace = json.load(fh)
+        self.assertEqual(marketplace["name"], "ccc-agent")
+        self.assertEqual(marketplace["plugins"][0]["name"], "ccc")
+        self.assertEqual(marketplace["plugins"][0]["source"],
+                         "./claude-ccc-containment")
+
         root = os.path.join(PLUGINS, "claude-ccc-containment")
         manifest_path = os.path.join(root, ".claude-plugin", "plugin.json")
         self.assertTrue(os.path.isfile(manifest_path))
@@ -60,18 +71,15 @@ class TestPluginAssets(unittest.TestCase):
             hooks = json.load(fh)
         self.assertIn("SessionStart", hooks["hooks"])
         self.assertIn("SessionEnd", hooks["hooks"])
-        self.assertIn("SessionStop", hooks["hooks"])
         self.assertIn("UserPromptSubmit", hooks["hooks"])
         self.assertIn("Stop", hooks["hooks"])
         start_cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         end_cmd = hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
-        stop_session_cmd = hooks["hooks"]["SessionStop"][0]["hooks"][0]["command"]
         prompt_cmd = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
         stop_cmds = [hook["command"]
                      for hook in hooks["hooks"]["Stop"][0]["hooks"]]
         self.assertIn("ccc-context-hook.sh", start_cmd)
         self.assertIn("ccc-context-hook.sh", end_cmd)
-        self.assertIn("ccc-context-hook.sh", stop_session_cmd)
         self.assertIn("ccc-context-hook.sh", prompt_cmd)
         self.assertTrue(any("ccc-stop-hook.sh" in cmd for cmd in stop_cmds))
         self.assertTrue(any("ccc-context-hook.sh" in cmd for cmd in stop_cmds))
@@ -84,6 +92,34 @@ class TestPluginAssets(unittest.TestCase):
         self.assertIn("turn-add-workspace", context_body)
         self.assertIn("turn-remove-workspace", context_body)
         self.assertIn("--agent-session", context_body)
+
+    def test_claude_plugin_materializer_writes_local_marketplace_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "ccc-claude-plugin")
+            written = claude_plugin.materialize_marketplace(dest)
+            self.assertEqual(written, dest)
+            marketplace_path = os.path.join(dest, ".claude-plugin",
+                                            "marketplace.json")
+            self.assertTrue(os.path.isfile(marketplace_path))
+            with open(marketplace_path) as fh:
+                marketplace = json.load(fh)
+            self.assertEqual(marketplace["name"], "ccc-agent")
+            self.assertEqual(marketplace["plugins"][0]["source"],
+                             "./claude-ccc-containment")
+            self.assertTrue(os.path.isfile(os.path.join(
+                dest, "claude-ccc-containment", ".claude-plugin",
+                "plugin.json")))
+
+    def test_claude_plugin_materializer_does_not_delete_existing_dest_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "existing")
+            os.makedirs(dest)
+            sentinel = os.path.join(dest, "keep.txt")
+            with open(sentinel, "w") as fh:
+                fh.write("keep")
+            with self.assertRaises(FileExistsError):
+                claude_plugin.materialize_marketplace(dest)
+            self.assertTrue(os.path.isfile(sentinel))
 
     def test_codex_plugin_layout(self):
         root = os.path.join(PLUGINS, "codex-ccc-containment")
@@ -688,9 +724,10 @@ class TestShim(unittest.TestCase):
     def test_nested_session_runs_real_binary_directly(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"})
         self.assertIn("REAL:", proc.stdout)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox do thing",
-                      proc.stdout)
-        self.assertIn("disabling Codex inner sandbox", proc.stderr)
+        self.assertIn("do thing", proc.stdout)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
+                         proc.stdout)
+        self.assertNotIn("disabling Codex inner sandbox", proc.stderr)
         self.assertNotIn("LAUNCH:", proc.stdout)
 
     def test_nested_session_respects_explicit_codex_no_sandbox_arg(self):
@@ -701,12 +738,12 @@ class TestShim(unittest.TestCase):
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
                          proc.stdout)
 
-    def test_nested_session_rejects_explicit_codex_sandbox_arg(self):
+    def test_nested_session_preserves_explicit_codex_sandbox_arg(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"},
                              args=("--sandbox", "workspace-write", "do"))
-        self.assertEqual(proc.returncode, 2)
-        self.assertNotIn("REAL:", proc.stdout)
-        self.assertIn("refusing nested Codex sandbox", proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REAL:", proc.stdout)
+        self.assertIn("--sandbox workspace-write do", proc.stdout)
 
     def test_nested_session_respects_explicit_codex_yolo_arg(self):
         proc = self.run_shim(env_extra={"CCC_AGENT_SESSION": "agent-x"},

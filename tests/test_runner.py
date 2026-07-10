@@ -1238,22 +1238,26 @@ time.sleep(0.18)
         binds.append(paths["hermes"] + ":/home/domen/.hermes")
         return paths, binds
 
-    def test_bwrap_injects_claude_plugin_only_for_direct_claude(self):
+    def test_bwrap_mounts_claude_plugin_without_launch_args_for_direct_claude(self):
         src = self._make_plugin("claude-ccc-containment")
         sandbox = "/ccc-agent/plugins/claude-ccc-containment"
         plugins = {"claude": {"src": src, "sandbox_path": sandbox,
-                              "argv": ["--plugin-dir", sandbox]}}
+                              "setenv": {"CLAUDE_CODE_PLUGIN_SEED_DIR": sandbox}}}
 
-        argv = self._capture_argv(["claude", "-p", "x"], "claude", plugins)
+        argv, env = self._capture_argv(
+            ["claude", "-p", "x"], "claude", plugins, return_env=True)
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
-        # plugin source mounted read-only at the neutral sandbox path
         self.assertIn(("--ro-bind", src, sandbox), triples)
-        # --plugin-dir inserted right after the claude executable, user args kept
+        self.assertEqual(env.get("CLAUDE_CODE_PLUGIN_SEED_DIR"), sandbox)
+        self.assertNotIn(sandbox, [argv[k + 2] for k in range(len(argv) - 2)
+                                  if argv[k] == "--setenv" and
+                                  argv[k + 1] == "CLAUDE_CODE_PLUGIN_SEED_DIR"])
         self.assertEqual(self._wrapped_agent_command(argv),
-                         ["claude", "--plugin-dir", sandbox, "-p", "x"])
+                         ["claude", "-p", "x"])
+        self.assertNotIn("--plugin-dir", argv)
 
-        # a non-claude command never receives the claude plugin
+        # a non-claude command never receives the claude plugin by inference
         other = self._capture_argv(["bash", "-lc", "claude"], "command", plugins)
         self.assertNotIn(src, other)
         self.assertNotIn("--plugin-dir", other)
@@ -1275,22 +1279,25 @@ time.sleep(0.18)
             run_session(cfg)
 
         argv = seen["argv"]
-        self.assertIn(src, argv)  # mount-only part remains useful
+        self.assertIn(src, argv)
         self.assertNotIn("--plugin-dir", argv)
         self.assertEqual(self._wrapped_agent_command(argv), ["claude", "-p", "x"])
 
-    def test_bwrap_does_not_inject_claude_plugin_into_ssh_server_shell(self):
+    def test_bwrap_mounts_claude_plugin_without_launch_args_for_ssh_server_shell(self):
         src = self._make_plugin("claude-ccc-containment")
         sandbox = "/ccc-agent/plugins/claude-ccc-containment"
         plugins = {"claude": {"src": src, "sandbox_path": sandbox,
-                              "argv": ["--plugin-dir", sandbox]}}
+                              "setenv": {"CLAUDE_CODE_PLUGIN_SEED_DIR": sandbox}}}
 
-        argv = self._capture_argv(
+        argv, env = self._capture_argv(
             ["/bin/bash", "-c",
              "'/home/domen/.claude/remote/srv/hash/server' --version"],
-            "claude", plugins)
+            "claude", plugins, return_env=True, server_mode=True)
 
-        self.assertNotIn(src, argv)
+        triples = [(argv[k], argv[k + 1], argv[k + 2])
+                   for k in range(len(argv) - 2)]
+        self.assertIn(("--ro-bind", src, sandbox), triples)
+        self.assertEqual(env.get("CLAUDE_CODE_PLUGIN_SEED_DIR"), sandbox)
         self.assertNotIn("--plugin-dir", argv)
         self.assertEqual(
             self._wrapped_agent_command(argv),
@@ -1315,12 +1322,11 @@ time.sleep(0.18)
             self._wrapped_agent_command(argv),
             ["codex", "--dangerously-bypass-approvals-and-sandbox"])
 
-    def test_bwrap_does_not_inject_codex_plugin_into_ssh_payload_shell(self):
+    def test_bwrap_mounts_codex_plugin_without_launch_args_for_ssh_payload_shell(self):
         src = self._make_plugin("codex-ccc-containment")
         sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         plugins = {"codex": {"src": src, "sandbox_path": sandbox,
-                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
-                             "argv": ["--dangerously-bypass-approvals-and-sandbox"]}}
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"]}}
 
         command = [
             "/bin/bash", "-c",
@@ -1328,8 +1334,10 @@ time.sleep(0.18)
             "sh 'PATH=\"${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH\"; export PATH; codex --version'",
         ]
         argv = self._capture_argv(command, "codex", plugins)
+        triples = [(argv[k], argv[k + 1], argv[k + 2])
+                   for k in range(len(argv) - 2)]
 
-        self.assertNotIn(src, argv)
+        self.assertIn(("--ro-bind", src, sandbox), triples)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertEqual(self._wrapped_agent_command(argv), command)
 
@@ -1775,15 +1783,14 @@ time.sleep(0.18)
         self.assertEqual(self._wrapped_agent_command(argv),
                          [absolute_codex, "exec", "x"])
 
-    def test_explicit_agent_kind_does_not_decorate_different_executable(self):
+    def test_explicit_agent_kind_can_mount_only_without_decorating_different_executable(self):
         codex_src = self._make_plugin("codex-ccc-containment")
         claude_src = self._make_plugin("claude-ccc-containment")
         codex_sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
         claude_sandbox = "/ccc-agent/plugins/claude-ccc-containment"
         plugins = {
             "codex": {"src": codex_src, "sandbox_path": codex_sandbox,
-                      "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"],
-                      "argv": []},
+                      "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"]},
             "claude": {"src": claude_src, "sandbox_path": claude_sandbox,
                        "argv": ["--plugin-dir", claude_sandbox]},
         }
@@ -1794,7 +1801,7 @@ time.sleep(0.18)
 
         triples = [(argv[k], argv[k + 1], argv[k + 2])
                    for k in range(len(argv) - 2)]
-        self.assertNotIn(("--ro-bind", codex_src, codex_sandbox), triples)
+        self.assertIn(("--ro-bind", codex_src, codex_sandbox), triples)
         self.assertNotIn(("--ro-bind", claude_src, claude_sandbox), triples)
         self.assertNotIn("--plugin-dir", argv)
         self.assertEqual(self._wrapped_agent_command(argv),
