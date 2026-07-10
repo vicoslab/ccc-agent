@@ -15,14 +15,15 @@
   "bwrap_bin": "/usr/bin/bwrap",
   "bwrap_proc_mode": "bind",
   "_adaptive_lifecycle_comment": "The SSH router selects adaptive lifecycle for broadly detected Claude/Codex/Hermes traffic. A child alive beyond the bootstrap window is permanently foreground and leftover helpers are killed at exit. An early successful exit becomes a service only when descendants remain stable and release stdout+stderr. Ordinary ccc-agent run remains foreground unless --lifecycle adaptive is explicit.",
-  "adaptive_bootstrap_seconds": 2.0,
+  "adaptive_bootstrap_seconds": 10.0,
   "adaptive_stability_seconds": 0.2,
   "adaptive_detach_seconds": 2.0,
   "_run_access_comment": "Default true: bind the existing CCC/container /run runtime namespace, read-only /var, and device-capable /dev into bwrap so agents can use container-provided sockets/devices (Docker via /var/run/docker.sock or /run/docker.sock, ssh-agent, /dev/fuse, etc.). Rootless bwrap maps the uid plus one gid, not every supplementary group; when Docker socket access depends on a supplementary group, ccc-agent maps that socket gid automatically. Set bwrap_gid explicitly to override. Set container_run_access false, or run ccc-agent run --full-isolation, for no-ambient-runtime mode. This protects normal /home and /storage writes, not full escape prevention from a container that already exposes powerful sockets/devices.",
   "container_run_access": true,
 
-  "_runtime_comment": "The agent binary + deps live under the real $HOME / storage that the view hides; re-expose them read-only here. Prefer dests OUTSIDE the views (e.g. install agents at /opt) to avoid bwrap mkdir'ing mountpoints into the FUSE view. 'src' or 'src:dest'.",
+  "_runtime_comment": "The agent binary + deps live under the real $HOME / storage that the view hides; re-expose them read-only here. The sandbox inherits the complete invocation/container environment by default (including CCC FUSE, container identity, CUDA/NVIDIA, Conda, SSH agent, and external credential variables). bwrap_unsetenv explicitly removes operator-selected names; bwrap_setenv applies trusted overrides afterward. ccc-agent always replaces stale internal session/control values and does not expose its host state-dir path. Prefer bind dests OUTSIDE the views. 'src' or 'src:dest'.",
   "bwrap_ro_binds": ["/home/<user>/.local:/opt/agent/.local"],
+  "bwrap_unsetenv": [],
   "bwrap_setenv": {},
 
   "_agent_state_comment": "Default: ~/.codex, ~/.claude, and ~/.hermes are shared rw agent/system state, direct-bound over the BranchFS home view and therefore outside ccc-agent commit/review/rollback. Codex/Claude/Hermes own concurrent access to their state. Set protect_agent_state=true or pass ccc-agent run --protect-agent-state to keep these dirs inside BranchFS instead.",

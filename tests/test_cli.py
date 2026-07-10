@@ -298,6 +298,30 @@ class TestMainRun(unittest.TestCase):
         self.assertEqual(seen[1].lifecycle, "foreground")
         self.assertEqual(seen[1].adaptive_bootstrap_seconds, 10.0)
 
+    def test_run_loads_explicit_environment_removal_list(self):
+        with open(self.h.config_path) as fh:
+            data = json.load(fh)
+        data["confinement"] = "bwrap"
+        data["bwrap_unsetenv"] = ["AWS_SECRET_ACCESS_KEY", "DROP_ME"]
+        with open(self.h.config_path, "w") as fh:
+            json.dump(data, fh)
+        seen = []
+
+        def fake_run_session(config, env=None, before_finalize=None):
+            seen.append(config)
+            return SimpleNamespace(
+                session_id="agent-env", workspace=config.workspace,
+                protected_roots={}, state="auto-committed", events=[],
+                exit_status=0, agent_kind=config.agent_kind, policy={})
+
+        with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
+            self.assertEqual(main_run([
+                "--config", self.h.config_path, "--", "true",
+            ], env={}), 0)
+
+        self.assertEqual(seen[0].bwrap_unsetenv,
+                         ["AWS_SECRET_ACCESS_KEY", "DROP_ME"])
+
     def test_serve_run_suppresses_banner_finish_and_review_prompt(self):
         with open(self.h.config_path) as fh:
             data = json.load(fh)

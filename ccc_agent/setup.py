@@ -486,8 +486,14 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "bwrap_bin": bwrap_bin,
         "bwrap_proc_mode": "bind",
         "_runtime_comment": "Re-expose the agent binary/runtime read-only at a "
-                            "NON-view dest (e.g. '/path/to/agent:/opt/agent').",
+                            "NON-view dest (e.g. '/path/to/agent:/opt/agent'). "
+                            "The full invocation/container environment is "
+                            "inherited by default. Use bwrap_unsetenv for "
+                            "explicit removals and bwrap_setenv for trusted "
+                            "overrides.",
         "bwrap_ro_binds": [],
+        "bwrap_unsetenv": [],
+        "bwrap_setenv": {},
         "_agent_state_comment": "By default Codex/Hermes state plus Codex/"
                                 "Claude Code local launcher/runtime paths "
                                 "(~/.claude, ~/.claude.json, "

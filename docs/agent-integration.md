@@ -210,6 +210,43 @@ Bundled lifecycle coverage:
   cleared by the outer `ccc-agent run` lifecycle/resume reset rather than by an
   in-Codex end hook.
 
+## Environment propagation
+
+Contained commands inherit the complete environment of the `ccc-agent run`
+invocation by default. This is intentional for CCC images: integrations may rely
+on container identity and node variables, `CCC_FUSE_SIDECAR_SOCKET`, CUDA/NVIDIA
+settings, Conda activation, `SSH_AUTH_SOCK`, library paths, and future
+image-provided feature variables. External credential variables are inherited as
+well; ccc-agent does not guess which application tokens are valid.
+
+The launcher then applies a narrow trusted policy:
+
+1. discard stale ccc-agent session/control/hook/lifecycle values from an enclosing
+   or failed invocation;
+2. assign the new session identity and fresh control credentials;
+3. keep the host-side `CCC_AGENT_STATE_DIR` out of the bwrap process;
+4. override sandbox invariants such as `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`,
+   `TERM`, and `PWD` with the correct contained values;
+5. apply configured credential/plugin values and `bwrap_setenv` overrides.
+
+Fresh ccc-agent control tokens, extracted credential values, plugin values, and
+`bwrap_setenv` overrides are carried in bwrap's process environment, not in its
+command-line arguments, so values are not exposed through bwrap's
+`/proc/<pid>/cmdline`.
+
+Operators can explicitly remove deployment-specific variables:
+
+```json
+{
+  "bwrap_unsetenv": ["AWS_SECRET_ACCESS_KEY", "SOME_UNUSED_TOKEN"],
+  "bwrap_setenv": {"FEATURE_MODE": "contained"}
+}
+```
+
+`bwrap_unsetenv` is denylist-only. An empty list means inherit all non-internal
+variables. `bwrap_setenv` is applied after removal, so a trusted override can
+reintroduce a name deliberately.
+
 ## Security rules for integrations
 
 - Plugin assets must be package/root-owned and read-only in the sandbox.

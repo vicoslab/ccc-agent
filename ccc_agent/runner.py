@@ -45,6 +45,21 @@ ENV_CONTROL_TOKEN = "CCC_AGENT_CONTROL_TOKEN"
 ENV_HOOK_TOKEN = "CCC_AGENT_HOOK_TOKEN"
 ENV_HOOK_SESSION = "CCC_AGENT_HOOK_SESSION"
 ENV_SHIM_UNDERLYING_PATH = "CCC_AGENT_SHIM_UNDERLYING_PATH"
+ENV_LIFECYCLE_SOCKET = "CCC_AGENT_LIFECYCLE_SOCKET"
+ENV_BOOTSTRAP_SECONDS = "CCC_AGENT_BOOTSTRAP_SECONDS"
+ENV_STABILITY_SECONDS = "CCC_AGENT_STABILITY_SECONDS"
+ENV_DETACH_SECONDS = "CCC_AGENT_DETACH_SECONDS"
+
+# Values from an enclosing/stale ccc-agent session must never become authority in
+# a new session.  Remove them before assigning this launch's fresh identity and
+# control credentials.  This is intentionally narrow: container/runtime values
+# and external API credentials are inherited unless the operator explicitly
+# lists them in bwrap_unsetenv.
+TRANSIENT_INTERNAL_ENV = (
+    ENV_SESSION, ENV_STATE_DIR, ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN,
+    ENV_HOOK_TOKEN, ENV_HOOK_SESSION, ENV_LIFECYCLE_SOCKET,
+    ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
+)
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox.
@@ -165,7 +180,8 @@ class RunnerConfig(object):
                  agent_command, workspace, policy, roots,
                  completion="process-exit", confinement="none",
                  bwrap_bin="bwrap", bwrap_proc_mode="bind",
-                 bwrap_ro_binds=(), bwrap_setenv=None, per_turn=None,
+                 bwrap_ro_binds=(), bwrap_setenv=None, bwrap_unsetenv=(),
+                 per_turn=None,
                  container_run_access=True,
                  cred_mounts=(), cred_mask=(), cred_env=None,
                  bwrap_uid=None, bwrap_gid=None, agent_plugins=None,
@@ -199,10 +215,17 @@ class RunnerConfig(object):
         self.bwrap_proc_mode = bwrap_proc_mode
         # Extra read-only paths to re-expose inside the sandbox AFTER the view
         # binds (so the agent's own runtime + creds, which live under the real
-        # $HOME/storage the view hides, become reachable again).  setenv passes
-        # config/API-key env into the otherwise --clearenv'd sandbox.
+        # $HOME/storage the view hides, become reachable again). The bwrap child
+        # inherits the complete invocation environment by default. Operators can
+        # explicitly remove names, then apply trusted value overrides.
         self.bwrap_ro_binds = list(bwrap_ro_binds)
         self.bwrap_setenv = dict(bwrap_setenv or {})
+        self.bwrap_unsetenv = []
+        for name in bwrap_unsetenv or ():
+            name = str(name)
+            if not name or "=" in name or "\x00" in name:
+                raise ValueError("invalid bwrap_unsetenv name %r" % name)
+            self.bwrap_unsetenv.append(name)
         # By default the sandbox inherits selected runtime namespaces from the
         # existing CCC container: /run and a read-only /var for
         # deployment-provided sockets (including conventional /var/run paths),
@@ -813,8 +836,7 @@ def _bwrap_gid(config):
     return os.getgid()
 
 
-def _bwrap_command(session, config, control=None, env=None,
-                   lifecycle_socket=None):
+def _bwrap_command(session, config, control=None, lifecycle_socket=None):
     """Build a bubblewrap command that confines the agent rootlessly.
 
     This needs no container CAP_SYS_ADMIN and no privileged helper: bwrap
@@ -825,7 +847,6 @@ def _bwrap_command(session, config, control=None, env=None,
     /proc is bound from the container by default.
     """
     alias_map = config.alias_map
-    env = os.environ if env is None else env
     primary = _primary_root(session, alias_map)
     # Use the workspace path the user launched from as the in-sandbox cwd.
     # Policy/root selection still canonicalizes aliases, but the process should
@@ -846,7 +867,7 @@ def _bwrap_command(session, config, control=None, env=None,
             "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
             "--as-pid-1",
             "--uid", uid, "--gid", gid,
-            "--die-with-parent", "--clearenv"]
+            "--die-with-parent"]
 
     for d in BWRAP_RO_DIRS:
         if os.path.isdir(d):
@@ -951,45 +972,24 @@ def _bwrap_command(session, config, control=None, env=None,
         argv += ["--bind", lifecycle_socket, SANDBOX_LIFECYCLE_SOCK,
                  "--ro-bind", adaptive_runner, SANDBOX_ADAPTIVE_RUNNER]
 
-    sandbox_path = env.get(ENV_SHIM_UNDERLYING_PATH) or BWRAP_DEFAULT_PATH
-    sandbox_shell = env.get("SHELL") or os.environ.get("SHELL") or "/bin/sh"
-    argv += ["--setenv", ENV_SESSION, session.session_id,
-             "--setenv", "HOME", home,
-             "--setenv", "USER", config.owner,
-             "--setenv", "LOGNAME", config.owner,
-             "--setenv", "PATH", sandbox_path,
-             "--setenv", "SHELL", sandbox_shell,
-             "--setenv", "TERM", env.get("TERM", os.environ.get("TERM", "xterm"))]
     if control is not None:
-        argv += ["--setenv", ENV_CONTROL_SOCK, SANDBOX_CONTROL_SOCK,
-                 "--setenv", ENV_CONTROL_TOKEN, control[1],
-                 "--setenv", ENV_HOOK_TOKEN, control[2],
-                 "--setenv", ENV_HOOK_SESSION, session.session_id]
+        # The socket path must be remapped into private sandbox /tmp. Tokens and
+        # all other values are inherited through the bwrap process environment.
+        argv += ["--setenv", ENV_CONTROL_SOCK, SANDBOX_CONTROL_SOCK]
     if lifecycle_socket is not None:
         argv += [
-            "--setenv", "CCC_AGENT_LIFECYCLE_SOCKET", SANDBOX_LIFECYCLE_SOCK,
-            "--setenv", "CCC_AGENT_BOOTSTRAP_SECONDS",
+            "--setenv", ENV_LIFECYCLE_SOCKET, SANDBOX_LIFECYCLE_SOCK,
+            "--setenv", ENV_BOOTSTRAP_SECONDS,
             str(config.adaptive_bootstrap_seconds),
-            "--setenv", "CCC_AGENT_STABILITY_SECONDS",
+            "--setenv", ENV_STABILITY_SECONDS,
             str(config.adaptive_stability_seconds),
-            "--setenv", "CCC_AGENT_DETACH_SECONDS",
+            "--setenv", ENV_DETACH_SECONDS,
             str(config.adaptive_detach_seconds),
         ]
-    # Credentials via env (read from the host auth files; never bound in).
-    for var, spec in sorted(config.cred_env.items()):
-        value = _extract_cred(spec)
-        if value:
-            argv += ["--setenv", var, value]
-    # Plugin activation env (e.g. HERMES_BUNDLED_PLUGINS); operator bwrap_setenv
-    # below can still override. Server-mode launches may mount plugin assets, but
-    # never mutate the server protocol argv/env with agent-interactive flags.
-    plugin_launch_activation = False
-    if plugin_spec is not None and not config.server_mode:
-        plugin_launch_activation = True
-        for key, value in sorted(plugin_spec.get("setenv", {}).items()):
-            argv += ["--setenv", key, str(value)]
-    for key, value in sorted(config.bwrap_setenv.items()):
-        argv += ["--setenv", key, str(value)]
+    # Plugin argv activation is separate from the value-bearing environment,
+    # which _bwrap_process_env applies without exposing values in argv.
+    plugin_launch_activation = (plugin_spec is not None and
+                                not config.server_mode)
     argv += ["--chdir", workdir, "--"]
     command = _agent_command_with_plugin(
         config.agent_command, plugin_spec if plugin_launch_activation else None)
@@ -1001,7 +1001,55 @@ def _bwrap_command(session, config, control=None, env=None,
     return argv
 
 
-def _extract_cred(spec):
+def _fresh_run_env(env, session, state_dir):
+    """Copy the caller env while replacing stale ccc-agent authority values."""
+    run_env = dict(env)
+    for name in TRANSIENT_INTERNAL_ENV:
+        run_env.pop(name, None)
+    run_env[ENV_SESSION] = session.session_id
+    run_env[ENV_STATE_DIR] = state_dir
+    return run_env
+
+
+def _bwrap_process_env(run_env, config, session):
+    """Build bwrap's inherited env with explicit removals and overrides."""
+    sandbox_env = dict(run_env)
+    # The host-side state path is supervisor-only. Control paths are remapped by
+    # bwrap and fresh token values are assigned after stale values were removed.
+    sandbox_env.pop(ENV_STATE_DIR, None)
+    for name in config.bwrap_unsetenv:
+        sandbox_env.pop(name, None)
+
+    workdir = normalize(session.workspace)
+    home = "/home/%s" % config.owner
+    sandbox_env.update({
+        ENV_SESSION: session.session_id,
+        "HOME": home,
+        "USER": config.owner,
+        "LOGNAME": config.owner,
+        "PATH": (run_env.get(ENV_SHIM_UNDERLYING_PATH) or BWRAP_DEFAULT_PATH),
+        "SHELL": (run_env.get("SHELL") or os.environ.get("SHELL") or "/bin/sh"),
+        "TERM": run_env.get("TERM", os.environ.get("TERM", "xterm")),
+        "PWD": workdir,
+    })
+
+    # Apply value-bearing settings in the process environment, not bwrap argv:
+    # API keys and plugin/operator values can be sensitive and argv is readable
+    # through /proc/<pid>/cmdline. Explicit overrides follow removals.
+    for var, spec in sorted(config.cred_env.items()):
+        value = _extract_cred(spec, env=run_env)
+        if value:
+            sandbox_env[str(var)] = str(value)
+    plugin_spec = _matched_agent_plugin(config)
+    if plugin_spec is not None and not config.server_mode:
+        for key, value in sorted(plugin_spec.get("setenv", {}).items()):
+            sandbox_env[str(key)] = str(value)
+    for key, value in sorted(config.bwrap_setenv.items()):
+        sandbox_env[str(key)] = str(value)
+    return sandbox_env
+
+
+def _extract_cred(spec, env=None):
     """Resolve a credential for env passing.  ``spec`` is either a literal
     string, or {"env": NAME} (pass through from the supervisor env), or
     {"file": path, "json_key": "a.b.c"} (read a dotted key from a JSON auth
@@ -1011,7 +1059,8 @@ def _extract_cred(spec):
     if not isinstance(spec, dict):
         return None
     if spec.get("env"):
-        return os.environ.get(spec["env"])
+        source_env = os.environ if env is None else env
+        return source_env.get(spec["env"])
     path = spec.get("file")
     if not path or not os.path.isfile(path):
         return None
@@ -1505,9 +1554,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
 
         cwd = _agent_cwd(session, config.alias_map)
         os.makedirs(cwd, exist_ok=True)
-        run_env = dict(env)
-        run_env[ENV_SESSION] = session.session_id
-        run_env[ENV_STATE_DIR] = config.store.state_dir
+        run_env = _fresh_run_env(env, session, config.store.state_dir)
         control = None
         if config.per_turn:
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
@@ -1520,6 +1567,10 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
                                            hook_token=hook_token)
             control_server.start()
             session.add_event("control-server", host_sock)
+            run_env[ENV_CONTROL_SOCK] = host_sock
+            run_env[ENV_CONTROL_TOKEN] = token
+            run_env[ENV_HOOK_TOKEN] = hook_token
+            run_env[ENV_HOOK_SESSION] = session.session_id
             control = (host_sock, token, hook_token)
 
         session.transition("running")
@@ -1528,11 +1579,12 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         if config.on_session_start is not None:
             config.on_session_start(session)
 
-        argv = _bwrap_command(session, config, control=control, env=run_env,
+        bwrap_env = _bwrap_process_env(run_env, config, session)
+        argv = _bwrap_command(session, config, control=control,
                               lifecycle_socket=lifecycle_path)
         session.add_event("bwrap-launch", argv[0])
         config.store.save(session)
-        proc = subprocess.Popen(argv, env=run_env, stdin=subprocess.PIPE,
+        proc = subprocess.Popen(argv, env=bwrap_env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 bufsize=0)
         _handed_off, returncode = _adaptive_supervise_process(
@@ -1618,9 +1670,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
     try:
         cwd = _agent_cwd(session, config.alias_map)
         os.makedirs(cwd, exist_ok=True)
-        run_env = dict(env)
-        run_env[ENV_SESSION] = session.session_id
-        run_env[ENV_STATE_DIR] = config.store.state_dir
+        run_env = _fresh_run_env(env, session, config.store.state_dir)
 
         # Per-turn control channel: start the supervisor-side server (outside
         # the sandbox) BEFORE launching the agent, so the socket exists for the
@@ -1653,12 +1703,13 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
         if config.confinement == "bwrap":
             # bwrap assembles the namespace itself and --chdir's into the
             # workspace inside the sandbox, so no host-side cwd is set here.
-            argv = _bwrap_command(session, config, control=control, env=run_env)
+            bwrap_env = _bwrap_process_env(run_env, config, session)
+            argv = _bwrap_command(session, config, control=control)
             session.add_event("bwrap-launch", argv[0])
             session.add_event("container-run-access",
                               "enabled" if config.container_run_access
                               else "disabled")
-            proc = subprocess.run(argv, env=run_env)
+            proc = subprocess.run(argv, env=bwrap_env)
         else:
             proc = subprocess.run(config.agent_command, cwd=cwd, env=run_env)
         session.exit_status = proc.returncode

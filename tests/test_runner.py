@@ -20,8 +20,9 @@ from unittest import mock
 from ccc_agent.branchfs import FakeBranchFS, StatusReport, StatusWarning
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import (BWRAP_AGENT_RUNNER, BWRAP_AGENT_RUNNER_ARG0,
-                              ResumeError, RootSpec, RunnerConfig,
-                              resume_session, run_session)
+                              ENV_CONTROL_TOKEN, ENV_STATE_DIR, ResumeError,
+                              RootSpec, RunnerConfig, resume_session,
+                              run_session)
 from ccc_agent.session import SessionStore
 
 
@@ -689,6 +690,44 @@ os.execvpe(command[0], command, env)
         self.assertEqual(session.state, "auto-committed")
         self.assertIn(BWRAP_AGENT_RUNNER, seen["argv"])
 
+    def test_adaptive_path_inherits_environment_and_applies_explicit_removals(self):
+        output = os.path.join(self._tmp.name, "adaptive-env.json")
+        code = r'''
+import json, os, sys
+names = ["CONTAINER_NAME", "CCC_FUSE_SIDECAR_SOCKET", "EXTERNAL_API_TOKEN",
+         "DROP_ME", "CCC_AGENT_STATE_DIR", "CCC_AGENT_CONTROL_TOKEN"]
+with open(sys.argv[1], "w") as fh:
+    json.dump({name: os.environ.get(name) for name in names}, fh)
+'''
+        config = self.h.config(
+            [sys.executable, "-c", code, output], confinement="bwrap",
+            bwrap_bin=self._fake_bwrap(), lifecycle="adaptive",
+            adaptive_bootstrap_seconds=0.5,
+            adaptive_stability_seconds=0.03,
+            adaptive_detach_seconds=0.2,
+            bwrap_unsetenv=["DROP_ME"], per_turn=False)
+        session = run_session(config, env={
+            "PATH": os.environ["PATH"],
+            "SHELL": "/bin/bash",
+            "CONTAINER_NAME": "domen-cuda10",
+            "CCC_FUSE_SIDECAR_SOCKET": "/run/ccc-fuse-sidecar/fuse.sock",
+            "EXTERNAL_API_TOKEN": "keep-me",
+            "DROP_ME": "remove-me",
+            ENV_STATE_DIR: "/stale/state",
+            ENV_CONTROL_TOKEN: "stale-token",
+        })
+
+        self.assertEqual(session.state, "auto-committed")
+        with open(output) as fh:
+            observed = json.load(fh)
+        self.assertEqual(observed["CONTAINER_NAME"], "domen-cuda10")
+        self.assertEqual(observed["CCC_FUSE_SIDECAR_SOCKET"],
+                         "/run/ccc-fuse-sidecar/fuse.sock")
+        self.assertEqual(observed["EXTERNAL_API_TOKEN"], "keep-me")
+        self.assertIsNone(observed["DROP_ME"])
+        self.assertIsNone(observed[ENV_STATE_DIR])
+        self.assertIsNone(observed[ENV_CONTROL_TOKEN])
+
     def test_adaptive_clean_detach_returns_running_then_finalizes(self):
         code = r'''
 import subprocess, sys
@@ -812,7 +851,7 @@ time.sleep(0.18)
         seen = {}
 
         def fake_run(argv, **kwargs):
-            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
             return subprocess.CompletedProcess(argv, 0)
 
         path = "/tmp/conda-agent-bin:/usr/bin:/bin"
@@ -820,26 +859,20 @@ time.sleep(0.18)
             run_session(self._bwrap_config(["codex"], agent_kind="codex"),
                         env={"CCC_AGENT_SHIM_UNDERLYING_PATH": path})
 
-        argv = seen["argv"]
-        path_i = next(k for k in range(len(argv) - 2)
-                      if argv[k] == "--setenv" and argv[k + 1] == "PATH")
-        self.assertEqual(argv[path_i + 2], path)
+        self.assertEqual(seen["env"].get("PATH"), path)
 
     def test_bwrap_preserves_invoking_login_shell(self):
         seen = {}
 
         def fake_run(argv, **kwargs):
-            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
             return subprocess.CompletedProcess(argv, 0)
 
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
             run_session(self._bwrap_config(["true"]),
                         env={"SHELL": "/bin/bash"})
 
-        argv = seen["argv"]
-        shell_i = next(k for k in range(len(argv) - 2)
-                       if argv[k:k + 2] == ["--setenv", "SHELL"])
-        self.assertEqual(argv[shell_i + 2], "/bin/bash")
+        self.assertEqual(seen["env"].get("SHELL"), "/bin/bash")
 
     def test_bwrap_mode_builds_sandbox_and_wraps_command(self):
         seen = {}
@@ -1028,11 +1061,81 @@ time.sleep(0.18)
         gi = argv.index("--gid")
         self.assertEqual(argv[gi + 1], "2094")
 
+    def test_bwrap_rejects_invalid_environment_removal_names(self):
+        for name in ("", "BAD=NAME", "BAD\x00NAME"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError,
+                                            "invalid bwrap_unsetenv"):
+                    self._bwrap_config(["true"], bwrap_unsetenv=[name])
+
+    def test_bwrap_inherits_full_invocation_environment_with_explicit_removals(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        invoking_env = {
+            "PATH": "/opt/ccc-agent/shims:/usr/bin",
+            "SHELL": "/bin/bash",
+            "CONTAINER_NAME": "domen-cuda10",
+            "CONTAINER_NODE": "donbot",
+            "CCC_FUSE_SIDECAR_SOCKET": "/run/ccc-fuse-sidecar/fuse.sock",
+            "NVIDIA_VISIBLE_DEVICES": "void",
+            "EXTERNAL_API_TOKEN": "keep-me",
+            "SOURCE_CRED": "source-secret",
+            "DROP_ME": "remove-me",
+            "OVERRIDE_ME": "old-value",
+            ENV_STATE_DIR: "/stale/supervisor/state",
+            ENV_CONTROL_TOKEN: "stale-control-token",
+        }
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(
+                ["true"], per_turn=False,
+                bwrap_unsetenv=["DROP_ME", "OVERRIDE_ME"],
+                bwrap_setenv={"OVERRIDE_ME": "trusted-value",
+                              "TERM": "trusted-term"},
+                cred_env={"CRED_FROM_ENV": {"env": "SOURCE_CRED"}}),
+                env=invoking_env)
+
+        self.assertNotIn("--clearenv", seen["argv"])
+        self.assertEqual(seen["env"]["CONTAINER_NAME"], "domen-cuda10")
+        self.assertEqual(seen["env"]["CONTAINER_NODE"], "donbot")
+        self.assertEqual(seen["env"]["CCC_FUSE_SIDECAR_SOCKET"],
+                         "/run/ccc-fuse-sidecar/fuse.sock")
+        self.assertEqual(seen["env"]["NVIDIA_VISIBLE_DEVICES"], "void")
+        self.assertEqual(seen["env"]["EXTERNAL_API_TOKEN"], "keep-me")
+        self.assertNotIn("DROP_ME", seen["env"])
+        self.assertEqual(seen["env"].get("OVERRIDE_ME"), "trusted-value")
+        self.assertEqual(seen["env"].get("TERM"), "trusted-term")
+        self.assertEqual(seen["env"].get("CRED_FROM_ENV"), "source-secret")
+        self.assertNotIn("trusted-value", seen["argv"])
+        self.assertNotIn("source-secret", seen["argv"])
+        self.assertNotIn(ENV_STATE_DIR, seen["env"])
+        self.assertNotIn(ENV_CONTROL_TOKEN, seen["env"])
+
+    def test_bwrap_fresh_control_token_is_environment_only_not_argv(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["true"], per_turn=True), env={})
+
+        token = seen["env"][ENV_CONTROL_TOKEN]
+        self.assertTrue(token)
+        self.assertNotIn(token, seen["argv"])
+
     def test_bwrap_ro_binds_and_setenv_after_view(self):
         seen = {}
 
         def fake_run(argv, **kwargs):
             seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
             return subprocess.CompletedProcess(argv, 0)
 
         runtime = self.h.base
@@ -1054,10 +1157,9 @@ time.sleep(0.18)
         ro_i = max(k for k in range(len(argv) - 1)
                    if argv[k] == "--ro-bind" and argv[k + 1] == runtime)
         self.assertGreater(ro_i, view_i)
-        # setenv is passed through
-        si = [k for k in range(len(argv) - 1)
-              if argv[k] == "--setenv" and argv[k + 1] == "OPENAI_API_KEY"]
-        self.assertTrue(si and argv[si[0] + 2] == "sek-test")
+        # Value-bearing overrides use the process environment, not argv.
+        self.assertEqual(seen["env"].get("OPENAI_API_KEY"), "sek-test")
+        self.assertNotIn("sek-test", argv)
 
     def test_bwrap_ro_bind_resolves_symlink_to_existing_target(self):
         target = os.path.join(self._tmp.name, "real-storage", "domen", ".claude")
@@ -1108,18 +1210,21 @@ time.sleep(0.18)
         os.makedirs(os.path.join(path, "hooks"), exist_ok=True)
         return path
 
-    def _capture_argv(self, command, agent_kind, agent_plugins, **extra):
+    def _capture_argv(self, command, agent_kind, agent_plugins,
+                      return_env=False, **extra):
         seen = {}
 
         def fake_run(argv, **kwargs):
             seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
             return subprocess.CompletedProcess(argv, 0)
 
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
             run_session(self._bwrap_config(
                 command, agent_kind=agent_kind, agent_plugins=agent_plugins,
                 **extra))
-        return seen["argv"]
+        return ((seen["argv"], seen["env"])
+                if return_env else seen["argv"])
 
     def _agent_state_binds(self):
         paths = {}
@@ -1703,12 +1808,12 @@ time.sleep(0.18)
             "setenv": {"HERMES_BUNDLED_PLUGINS": "/ccc-agent/plugins/hermes",
                        "HERMES_ACCEPT_HOOKS": "1"}}}
 
-        argv = self._capture_argv(["hermes", "chat"], "hermes", plugins)
-        env = {argv[k + 1]: argv[k + 2] for k in range(len(argv) - 2)
-               if argv[k] == "--setenv"}
-        self.assertEqual(env.get("HERMES_BUNDLED_PLUGINS"),
+        argv, process_env = self._capture_argv(
+            ["hermes", "chat"], "hermes", plugins, return_env=True)
+        self.assertEqual(process_env.get("HERMES_BUNDLED_PLUGINS"),
                          "/ccc-agent/plugins/hermes")
-        self.assertEqual(env.get("HERMES_ACCEPT_HOOKS"), "1")
+        self.assertEqual(process_env.get("HERMES_ACCEPT_HOOKS"), "1")
+        self.assertNotIn("/ccc-agent/plugins/hermes", argv)
 
     def test_bwrap_skips_plugin_when_source_missing(self):
         # Graceful degradation: a missing trusted plugin dir must not be mounted
@@ -1741,6 +1846,7 @@ time.sleep(0.18)
 
         def fake_run(argv, **kwargs):
             seen["argv"] = list(argv)
+            seen["process_env"] = dict(kwargs["env"])
             return subprocess.CompletedProcess(argv, 0)
 
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
@@ -1754,11 +1860,14 @@ time.sleep(0.18)
                       if argv[k] == "--bind"]
         self.assertIn(sock, bind_dests)
         self.assertNotIn("/run/ccc-agent/control.sock", bind_dests)
-        # the in-sandbox env points the hook at that socket + a token
-        env = {argv[k + 1]: argv[k + 2] for k in range(len(argv) - 2)
-               if argv[k] == "--setenv"}
-        self.assertEqual(env.get("CCC_AGENT_CONTROL_SOCK"), sock)
-        self.assertTrue(env.get("CCC_AGENT_CONTROL_TOKEN"))
+        # The socket path is remapped on argv. Fresh tokens are inherited through
+        # bwrap's process environment so they are not exposed in /proc cmdline.
+        setenv = {argv[k + 1]: argv[k + 2] for k in range(len(argv) - 2)
+                  if argv[k] == "--setenv"}
+        self.assertEqual(setenv.get("CCC_AGENT_CONTROL_SOCK"), sock)
+        token = seen["process_env"].get("CCC_AGENT_CONTROL_TOKEN")
+        self.assertTrue(token)
+        self.assertNotIn(token, argv)
         expected_host_sock = os.path.join(self.h.state_dir, session.session_id,
                                           "control", "control.sock")
         control_events = [e for e in session.events
@@ -1781,6 +1890,7 @@ time.sleep(0.18)
 
         def fake_run(argv, **kwargs):
             seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
             return subprocess.CompletedProcess(argv, 0)
 
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
@@ -1796,8 +1906,10 @@ time.sleep(0.18)
         self.assertIn(("--ro-bind", cred_dir, cred_dir), triples)
         # secret file masked with /dev/null
         self.assertIn(("--ro-bind", "/dev/null", auth), triples)
-        # credential extracted from the host auth file and passed via env
-        self.assertIn(("--setenv", "OPENAI_API_KEY", "sek-xyz"), triples)
+        # Credential extracted from the host auth file is inherited via the
+        # process environment and never exposed in bwrap argv.
+        self.assertEqual(seen["env"].get("OPENAI_API_KEY"), "sek-xyz")
+        self.assertNotIn("sek-xyz", argv)
 
     def test_per_turn_off_starts_no_control_server(self):
         # none mode (per_turn defaults off): no control env injected.

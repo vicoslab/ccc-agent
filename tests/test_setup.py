@@ -224,6 +224,10 @@ class TestSetupConfig(unittest.TestCase):
         )
 
         self.assertEqual(cfg["cred_mounts"], [])
+        self.assertEqual(cfg["bwrap_unsetenv"], [])
+        self.assertEqual(cfg["bwrap_setenv"], {})
+        self.assertIn("full invocation/container environment",
+                      cfg["_runtime_comment"])
         # Native plugin injection: Codex needs its plugin to appear as an
         # installed/enabled plugin, not merely as a raw ~/.codex/plugins dir.
         self.assertEqual(cfg["agent_hook_mode"], "plugins")
@@ -276,6 +280,8 @@ class TestSetupConfig(unittest.TestCase):
         )
 
         self.assertEqual(cfg["cred_mounts"], [])
+        self.assertEqual(cfg["bwrap_unsetenv"], [])
+        self.assertEqual(cfg["bwrap_setenv"], {})
         plugins = cfg["agent_plugins"]
         self.assertEqual(plugins["codex"]["sandbox_path"],
                          "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0")
