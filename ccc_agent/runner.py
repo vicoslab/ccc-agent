@@ -179,7 +179,7 @@ LIFECYCLE_MODES = ("foreground", "adaptive")
 
 class RunnerConfig(object):
     def __init__(self, store, backend, alias_map, owner, agent_kind,
-                 agent_command, workspace, policy, roots,
+                 agent_command, workspace, policy, roots, launch_cwd=None,
                  completion="process-exit", confinement="none",
                  bwrap_bin="bwrap", bwrap_proc_mode="bind",
                  bwrap_ro_binds=(), bwrap_setenv=None, bwrap_unsetenv=(),
@@ -200,9 +200,15 @@ class RunnerConfig(object):
         self.agent_kind = agent_kind
         self.agent_command = list(agent_command)
         self.workspace = workspace
+        # A server may need to start in the SSH launch directory before an
+        # inner agent SessionStart hook identifies its real workspace. Keep
+        # that process cwd separate from commit-policy workspace metadata.
+        self.launch_cwd = launch_cwd if launch_cwd is not None else workspace
+        if not self.launch_cwd:
+            raise ValueError("launch_cwd is required when workspace is unset")
         self.policy = dict(policy)
         if "allowed_scopes" not in self.policy:
-            self.policy["allowed_scopes"] = [workspace]
+            self.policy["allowed_scopes"] = ([workspace] if workspace else [])
         PolicyConfig.from_dict(self.policy)  # validate early
         self.roots = list(roots)
         self.completion = completion
@@ -296,27 +302,29 @@ class RunnerConfig(object):
         return value
 
 
-def _agent_cwd(session, alias_map):
-    """Map the visible workspace path into the mounted branch view."""
-    workspace = alias_map.canonicalize(session.workspace)
+def _agent_cwd(session, alias_map, launch_cwd=None):
+    """Map the process launch cwd into the mounted branch view."""
+    launch_cwd = launch_cwd or session.workspace
+    workspace = alias_map.canonicalize(launch_cwd)
     for root in session.protected_roots.values():
         visible = alias_map.canonicalize(root.visible)
         if is_within(workspace, visible):
             rel = os.path.relpath(workspace, visible)
             return (root.mount if rel == "." else
                     os.path.join(root.mount, rel))
-    raise ValueError("workspace %s is not under any protected root"
-                     % session.workspace)
+    raise ValueError("launch cwd %s is not under any protected root"
+                     % launch_cwd)
 
 
-def _primary_root(session, alias_map):
-    """The protected root whose visible path contains the workspace."""
-    workspace = alias_map.canonicalize(session.workspace)
+def _primary_root(session, alias_map, launch_cwd=None):
+    """The protected root whose visible path contains the process launch cwd."""
+    launch_cwd = launch_cwd or session.workspace
+    workspace = alias_map.canonicalize(launch_cwd)
     for root in session.protected_roots.values():
         if is_within(workspace, alias_map.canonicalize(root.visible)):
             return root
-    raise ValueError("workspace %s is not under any protected root"
-                     % session.workspace)
+    raise ValueError("launch cwd %s is not under any protected root"
+                     % launch_cwd)
 
 
 # System paths exposed read-only inside the bwrap sandbox.  The agent sees the
@@ -863,12 +871,13 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
     /proc is bound from the container by default.
     """
     alias_map = config.alias_map
-    primary = _primary_root(session, alias_map)
-    # Use the workspace path the user launched from as the in-sandbox cwd.
+    primary = _primary_root(session, alias_map, config.launch_cwd)
+    # Use the process launch path as the in-sandbox cwd. For remote servers this
+    # is deliberately not an allowed workspace until a trusted hook adds one.
     # Policy/root selection still canonicalizes aliases, but the process should
     # start in `/home/domen/...` when invoked there rather than surprising the
     # user with the equivalent `/storage/user/<container>/...` spelling.
-    workdir = normalize(session.workspace)
+    workdir = normalize(config.launch_cwd)
     home = "/home/%s" % config.owner
 
     # Map to the REAL uid inside the namespace (not 0): the view files are owned
@@ -1646,7 +1655,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         listener.bind(lifecycle_path)
         listener.listen(1)
 
-        cwd = _agent_cwd(session, config.alias_map)
+        cwd = _agent_cwd(session, config.alias_map, config.launch_cwd)
         os.makedirs(cwd, exist_ok=True)
         run_env = _fresh_run_env(env, session, config.store.state_dir)
         control = None
@@ -1773,7 +1782,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
     control_server = None
     session_env_path = None
     try:
-        cwd = _agent_cwd(session, config.alias_map)
+        cwd = _agent_cwd(session, config.alias_map, config.launch_cwd)
         os.makedirs(cwd, exist_ok=True)
         run_env = _fresh_run_env(env, session, config.store.state_dir)
 

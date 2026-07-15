@@ -989,23 +989,30 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
 
     config = load_config(args.config, env=env)
     store, backend, alias_map, user, roots = build_runtime(config)
-    # The workspace is deliberately a *launch-time* value.  Generated system
-    # configs used to include a broad home default (e.g. /home/domen, which
+    # Ordinary runs use their launch directory as the initial workspace. Generated
+    # system configs used to include a broad home default (e.g. /home/domen, which
     # aliases to /storage/user/<container> on CCC), but a bare `ccc-agent run
-    # codex` must protect the directory where the user invoked it.  Keep config
-    # roots/policy as deployment defaults; use --workspace for explicit
-    # per-invocation overrides.
-    workspace = args.workspace or os.getcwd()
+    # codex` must protect the directory where the user invoked it. Server runs
+    # separate this process cwd from hook-owned workspace policy below. Keep
+    # config roots/policy as deployment defaults; use --workspace for an explicit
+    # per-invocation override.
+    launch_cwd = args.workspace or os.getcwd()
+    # An SSH/server wrapper is commonly launched from $HOME, which is only an
+    # incidental process cwd and must not become a broad auto-commit scope.
+    # An explicit --workspace remains an operator override; otherwise trusted
+    # inner-session hooks add and own all remote workspace scopes.
+    workspace = args.workspace if server_mode else launch_cwd
+    initial_workspaces = [workspace] if workspace else []
     config_policy = config.get("policy", {})
     static_scopes = (list(args.scope) +
                      list(config_policy.get("allowed_scopes", ())))
     policy = {
         "mode": config_policy.get("mode", args.policy),
-        "allowed_scopes": [workspace] + static_scopes,
+        "allowed_scopes": initial_workspaces + static_scopes,
         # Dynamic turn workspace commands mutate only this list and its matching
         # allowed_scopes entries. Extra --scope/config scopes and per-turn
         # approved paths remain preserved allowed scopes.
-        "workspace_scopes": [workspace],
+        "workspace_scopes": initial_workspaces,
         "hide_patterns": (list(args.hide) + list(config.get("hide_patterns", ()))
                           + list(config_policy.get("hide_patterns", ()))),
         "ignore_patterns": list(config_policy.get("ignore_patterns", ())),
@@ -1027,6 +1034,7 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     runner_config = RunnerConfig(
         store=store, backend=backend, alias_map=alias_map, owner=user,
         agent_kind=agent_kind, agent_command=command, workspace=workspace,
+        launch_cwd=launch_cwd,
         policy=policy, roots=roots,
         confinement=confinement,
         bwrap_bin=config.get("bwrap_bin", "bwrap"),

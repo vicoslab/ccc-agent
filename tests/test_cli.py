@@ -239,6 +239,32 @@ class TestMainRun(unittest.TestCase):
         self.assertIn("finished: auto-committed (1 update in workspace)",
                       output)
 
+    def test_serve_without_explicit_workspace_starts_with_hook_only_scopes(self):
+        seen = []
+
+        def fake_run_session(config, env=None, before_finalize=None):
+            seen.append(config)
+            return SimpleNamespace(
+                session_id="agent-remote", workspace=config.workspace,
+                protected_roots={}, state="running", events=[],
+                exit_status=0, agent_kind=config.agent_kind, policy=config.policy)
+
+        launch_cwd = "/storage/user/domen-cuda10"
+        with mock.patch("ccc_agent.cli.os.getcwd", return_value=launch_cwd):
+            with mock.patch("ccc_agent.cli.run_session",
+                            side_effect=fake_run_session):
+                code = main_run([
+                    "--config", self.h.config_path,
+                    "--serve", "claude", "--", "true",
+                ], env={})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNone(seen[0].workspace)
+        self.assertEqual(seen[0].launch_cwd, launch_cwd)
+        self.assertEqual(seen[0].policy["workspace_scopes"], [])
+        self.assertEqual(seen[0].policy["allowed_scopes"], [])
+
     def test_serve_run_is_quiet_and_default_keeps_out_of_scope(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

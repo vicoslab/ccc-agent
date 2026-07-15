@@ -39,7 +39,11 @@ server sessions use the `AGENT-remote` label (for example `codex-remote`) in
 `ccc-agent list`. Server mode is intended for protocols that parse stdout/stderr
 themselves: `ccc-agent` emits no banner, finish line, review text, or prompt during
 the wrapped server lifecycle, and it does not inject agent-interactive argv into
-the server command. Before the final freeze it applies the same default as turn
+the server command. Without an explicit `--workspace`, the SSH launch directory
+is used only as the server process cwd and is not an auto-commit scope. Trusted
+inner-session hooks establish and own the active workspace scopes; changes made
+before a workspace hook arrives are kept rather than auto-committed. Before the
+final freeze server mode applies the same default as turn
 hooks: commit in-workspace changes, remember non-workspace changes as kept in the
 branch, and leave the session reviewable if anything still needs later attention.
 The SSH shell router uses this mode automatically for detected Codex/Claude/Hermes

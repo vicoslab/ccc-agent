@@ -101,6 +101,34 @@ class TestRunSession(unittest.TestCase):
         self.h.store.save(session)
         return session
 
+    def test_server_without_workspace_uses_launch_cwd_but_holds_changes(self):
+        config = RunnerConfig(
+            store=self.h.store,
+            backend=self.h.backend,
+            alias_map=AliasMap.for_home("domen", home_subdir=""),
+            owner="domen",
+            agent_kind="claude-remote",
+            agent_command=["sh", "-c", "echo held > result.txt"],
+            workspace=None,
+            launch_cwd="/home/domen/Projects/proj-a",
+            policy={"mode": "workspace-auto", "allowed_scopes": [],
+                    "workspace_scopes": []},
+            roots=[RootSpec(name="storage_user", base=self.h.base,
+                            store=os.path.join(self.h.tmp, "stores",
+                                               "storage_user"),
+                            visible="/storage/user", home_subdir="")],
+            server_mode=True,
+        )
+
+        session = run_session(config)
+
+        self.assertIsNone(session.workspace)
+        self.assertEqual(session.policy["workspace_scopes"], [])
+        self.assertEqual(session.policy["allowed_scopes"], [])
+        self.assertEqual(session.state, "pending-review")
+        self.assertFalse(os.path.exists(os.path.join(
+            self.h.base, "Projects", "proj-a", "result.txt")))
+
     def test_workspace_write_auto_commits(self):
         session = run_session(self.h.config(
             ["sh", "-c", "echo done > result.txt"]))

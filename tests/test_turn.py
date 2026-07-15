@@ -181,6 +181,27 @@ class TestTurnController(unittest.TestCase):
             persisted.policy["turn_path_decisions"]["/storage/user/escape.txt"],
             "kept")
 
+    def test_first_hook_workspace_initializes_scope_for_server_session(self):
+        self.h.session.workspace = None
+        self.h.session.policy["workspace_scopes"] = []
+        self.h.session.policy["allowed_scopes"] = []
+        self.h.store.save(self.h.session)
+
+        resp = self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                       hook_session="hook-a")
+
+        self.assertEqual(resp["workspaces"], [
+            "/storage/user/Projects/proj-b",
+        ])
+        persisted = self.h.store.load(self.h.session.session_id)
+        self.assertEqual(persisted.workspace, "/storage/user/Projects/proj-b")
+        self.assertEqual(persisted.policy["allowed_scopes"], [
+            "/storage/user/Projects/proj-b",
+        ])
+        self.h.write("Projects/proj-b/b.txt", "two")
+        self.assertEqual(self.h.tc.finalize_turn()["verdict"], VERDICT_COMMITTED)
+        self.assertTrue(self.h.base_has("Projects/proj-b/b.txt"))
+
     def test_hook_session_add_workspace_allows_new_workspace_changes(self):
         resp = self.h.tc.add_workspace("/storage/user/Projects/proj-b",
                                        hook_session="hook-a")

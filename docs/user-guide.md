@@ -158,7 +158,11 @@ workspace for that inner session, and remove only that workspace when the inner
 session ends. These commands are intentionally not agent self-service commands;
 they require the hook token on the control socket. They do not `cd` the running
 agent or remount anything. Additional static `--scope` paths stay allowed;
-anything still outside the active scopes is kept for review.
+anything still outside the active scopes is kept for review. An implicit
+`--serve` launch starts with no workspace scope: its SSH current directory is
+only the server process cwd. The first successful inner-session workspace hook
+establishes the first auto-commit scope. Operators may still deliberately seed a
+server scope with explicit `--workspace` or `--scope`.
 
 ## Resuming and recovering
 
