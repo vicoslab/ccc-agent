@@ -386,6 +386,7 @@ class TestSetupConfig(unittest.TestCase):
             with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False):
                 rc = setup_mod.main([
                     "--system",
+                    "--home", home,
                     "--config", config_path,
                     "--state-dir", os.path.join(tmp, "state"),
                     "--storage-root", os.path.join(tmp, "storage"),
@@ -401,6 +402,8 @@ class TestSetupConfig(unittest.TestCase):
                 os.path.join(home, ".codex", "config.toml")))
             self.assertFalse(os.path.exists(
                 os.path.join(home, ".claude", "settings.json")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                home, ".claude", "plugins", "installed_plugins.json")))
             self.assertTrue(os.path.isfile(os.path.join(
                 claude_seed, "installed_plugins.json")))
             with open(codex_config) as fh:
