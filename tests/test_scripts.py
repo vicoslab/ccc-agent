@@ -448,6 +448,65 @@ class TestClaudeContextHook(unittest.TestCase):
         self.assertIn("turn-kept-status", out["additionalContext"])
         self.assertIn("contained filesystem", out["additionalContext"])
 
+    def test_session_start_restores_stripped_outer_session_for_bash_tools(self):
+        handoff = os.path.join(self._tmp.name, "session-env.json")
+        claude_env = os.path.join(self._tmp.name, "claude-env.sh")
+        with open(handoff, "w") as fh:
+            json.dump({"CCC_AGENT_SESSION": "agent-remote-claude"}, fh)
+
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "CLAUDE_PLUGIN_ROOT": self.plugin_root,
+            "CLAUDE_ENV_FILE": claude_env,
+            "CCC_AGENT_SESSION_ENV_FILE": handoff,
+        }
+        proc = subprocess.run(
+            ["sh", CLAUDE_CONTEXT_HOOK],
+            input=json.dumps({"hook_event_name": "SessionStart",
+                              "source": "startup"}),
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertIn("ccc-commit",
+                      data["hookSpecificOutput"]["additionalContext"])
+        with open(claude_env) as fh:
+            persisted = fh.read()
+        self.assertIn("CCC_AGENT_SESSION=agent-remote-claude", persisted)
+
+    def test_session_handoff_json_cannot_inject_shell_commands_or_names(self):
+        handoff = os.path.join(self._tmp.name, "session-env.json")
+        claude_env = os.path.join(self._tmp.name, "claude-env.sh")
+        marker = os.path.join(self._tmp.name, "must-not-exist")
+        session_value = "agent-x; touch %s" % marker
+        with open(handoff, "w") as fh:
+            json.dump({"CCC_AGENT_SESSION": session_value,
+                       "UNRELATED_INJECTED_NAME": "bad"}, fh)
+
+        proc = subprocess.run(
+            ["sh", CLAUDE_CONTEXT_HOOK],
+            input=json.dumps({"hook_event_name": "SessionStart",
+                              "source": "startup"}),
+            env={"PATH": "/usr/bin:/bin",
+                 "CLAUDE_PLUGIN_ROOT": self.plugin_root,
+                 "CLAUDE_ENV_FILE": claude_env,
+                 "CCC_AGENT_SESSION_ENV_FILE": handoff},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(os.path.exists(marker))
+        with open(claude_env) as fh:
+            persisted = fh.read()
+        self.assertNotIn("UNRELATED_INJECTED_NAME", persisted)
+        sourced = subprocess.run(
+            ["sh", "-c", '. "$1"; printf %s "$CCC_AGENT_SESSION"',
+             "sh", claude_env],
+            env={"PATH": "/usr/bin:/bin"}, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self.assertEqual(sourced.returncode, 0, sourced.stderr)
+        self.assertEqual(sourced.stdout, session_value)
+        self.assertFalse(os.path.exists(marker))
+
     def test_session_start_and_end_update_workspace_scope_with_hook_token(self):
         calls = os.path.join(self._tmp.name, "calls")
         with open(self.ctl, "w") as fh:

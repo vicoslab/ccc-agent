@@ -1169,6 +1169,38 @@ time.sleep(0.18)
         self.assertTrue(token)
         self.assertNotIn(token, seen["argv"])
 
+    def test_bwrap_mounts_session_env_handoff_for_remote_agent_children(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            triples = [(argv[k], argv[k + 1], argv[k + 2])
+                       for k in range(len(argv) - 2)]
+            handoffs = [item for item in triples
+                        if item[0] == "--ro-bind" and
+                        item[2] == "/tmp/ccc-agent/session-env.json"]
+            self.assertEqual(len(handoffs), 1)
+            seen["handoff_path"] = handoffs[0][1]
+            seen["handoff_mode"] = stat.S_IMODE(
+                os.stat(seen["handoff_path"]).st_mode)
+            with open(seen["handoff_path"]) as fh:
+                seen["handoff"] = json.load(fh)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(
+                self._bwrap_config(["true"], per_turn=True), env={})
+
+        self.assertEqual(seen["handoff"]["CCC_AGENT_SESSION"],
+                         session.session_id)
+        self.assertEqual(
+            seen["handoff"]["CCC_AGENT_CONTROL_SOCK"],
+            "/tmp/ccc-agent/control.sock")
+        self.assertTrue(seen["handoff"]["CCC_AGENT_CONTROL_TOKEN"])
+        self.assertTrue(seen["handoff"]["CCC_AGENT_HOOK_TOKEN"])
+        self.assertEqual(seen["handoff_mode"], 0o600)
+        self.assertFalse(os.path.exists(seen["handoff_path"]))
+
     def test_bwrap_ro_binds_and_setenv_after_view(self):
         seen = {}
 

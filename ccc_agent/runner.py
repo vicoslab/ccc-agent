@@ -71,6 +71,7 @@ BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
 SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 SANDBOX_LIFECYCLE_SOCK = "/tmp/ccc-agent/lifecycle.sock"
 SANDBOX_ADAPTIVE_RUNNER = "/tmp/ccc-agent/adaptive_pid1.py"
+SANDBOX_SESSION_ENV = "/tmp/ccc-agent/session-env.json"
 
 # Run the sandbox command under a tiny PID-1 lifecycle wrapper.  Without this,
 # bubblewrap's default PID-1 reaper keeps the namespace alive until every helper
@@ -850,7 +851,8 @@ def _bwrap_gid(config):
     return os.getgid()
 
 
-def _bwrap_command(session, config, control=None, lifecycle_socket=None):
+def _bwrap_command(session, config, control=None, lifecycle_socket=None,
+                   session_env_path=None):
     """Build a bubblewrap command that confines the agent rootlessly.
 
     This needs no container CAP_SYS_ADMIN and no privileged helper: bwrap
@@ -985,6 +987,8 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None):
                                        "adaptive_pid1.py")
         argv += ["--bind", lifecycle_socket, SANDBOX_LIFECYCLE_SOCK,
                  "--ro-bind", adaptive_runner, SANDBOX_ADAPTIVE_RUNNER]
+    if session_env_path is not None:
+        argv += ["--ro-bind", session_env_path, SANDBOX_SESSION_ENV]
 
     if control is not None:
         # The socket path must be remapped into private sandbox /tmp. Tokens and
@@ -1023,6 +1027,43 @@ def _fresh_run_env(env, session, state_dir):
     run_env[ENV_SESSION] = session.session_id
     run_env[ENV_STATE_DIR] = state_dir
     return run_env
+
+
+def _write_session_env_handoff(run_env, session, config):
+    """Write the narrow CCC env needed by agent-native child sessions.
+
+    Remote agent servers can deliberately rebuild the environment for an inner
+    Claude/Codex session. Mount this file read-only at a stable sandbox path so
+    trusted hooks can restore only ccc-agent's session/control values without
+    broadening the agent's own environment inheritance policy.
+    """
+    values = {ENV_SESSION: session.session_id}
+    if run_env.get(ENV_CONTROL_SOCK):
+        values[ENV_CONTROL_SOCK] = SANDBOX_CONTROL_SOCK
+    for name in (ENV_CONTROL_TOKEN, ENV_HOOK_TOKEN, ENV_HOOK_SESSION):
+        if run_env.get(name):
+            values[name] = str(run_env[name])
+    if run_env.get("CCC_AGENT_CLI"):
+        values["CCC_AGENT_CLI"] = str(run_env["CCC_AGENT_CLI"])
+
+    control_dir = config.store.control_dir(session.session_id)
+    os.makedirs(control_dir, exist_ok=True)
+    path = os.path.join(control_dir, "session-env.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(values, fh, sort_keys=True, separators=(",", ":"))
+        fh.write("\n")
+    os.chmod(path, 0o600)
+    return path
+
+
+def _remove_session_env_handoff(path):
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _bwrap_process_env(run_env, config, session):
@@ -1592,6 +1633,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
                              frontend_pid):
     control_server = None
     listener = None
+    session_env_path = None
     lifecycle_path = os.path.join(config.store.control_dir(session.session_id),
                                   "lifecycle.sock")
     try:
@@ -1625,6 +1667,8 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             run_env[ENV_HOOK_SESSION] = session.session_id
             control = (host_sock, token, hook_token)
 
+        session_env_path = _write_session_env_handoff(
+            run_env, session, config)
         session.transition("running")
         session.add_event("adaptive-supervisor", str(os.getpid()))
         config.store.save(session)
@@ -1632,8 +1676,10 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             config.on_session_start(session)
 
         bwrap_env = _bwrap_process_env(run_env, config, session)
-        argv = _bwrap_command(session, config, control=control,
-                              lifecycle_socket=lifecycle_path)
+        argv = _bwrap_command(
+            session, config, control=control,
+            lifecycle_socket=lifecycle_path,
+            session_env_path=session_env_path)
         session.add_event("bwrap-launch", argv[0])
         config.store.save(session)
         proc = subprocess.Popen(argv, env=bwrap_env, stdin=subprocess.PIPE,
@@ -1669,6 +1715,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         except OSError:
             pass
         _unmount_all(session, config.backend)
+        _remove_session_env_handoff(session_env_path)
 
     _adaptive_status(status_fd, "finished", session=session.to_dict())
     try:
@@ -1724,6 +1771,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
                             enter_running=False):
     """Launch config.agent_command against an already-mounted session."""
     control_server = None
+    session_env_path = None
     try:
         cwd = _agent_cwd(session, config.alias_map)
         os.makedirs(cwd, exist_ok=True)
@@ -1752,6 +1800,9 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             run_env[ENV_HOOK_SESSION] = session.session_id
             control = (host_sock, token, hook_token)
 
+        if config.confinement == "bwrap":
+            session_env_path = _write_session_env_handoff(
+                run_env, session, config)
         if enter_running:
             session.transition("running")
         config.store.save(session)
@@ -1761,7 +1812,9 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             # bwrap assembles the namespace itself and --chdir's into the
             # workspace inside the sandbox, so no host-side cwd is set here.
             bwrap_env = _bwrap_process_env(run_env, config, session)
-            argv = _bwrap_command(session, config, control=control)
+            argv = _bwrap_command(
+                session, config, control=control,
+                session_env_path=session_env_path)
             session.add_event("bwrap-launch", argv[0])
             session.add_event("container-run-access",
                               "enabled" if config.container_run_access
@@ -1775,6 +1828,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
         _fail(config.store, session, "agent launch failed: %s" % exc)
         if control_server is not None:
             control_server.stop()
+        _remove_session_env_handoff(session_env_path)
         _unmount_all(session, config.backend)
         return session
 
@@ -1790,6 +1844,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
     finally:
         if control_server is not None:
             control_server.stop()
+        _remove_session_env_handoff(session_env_path)
         _unmount_all(session, config.backend)
 
     return session

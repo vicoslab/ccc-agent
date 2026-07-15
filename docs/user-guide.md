@@ -56,7 +56,9 @@ create session
 
 The wrapped command receives `CCC_AGENT_SESSION` in its environment. If it starts
 another wrapped agent, the nested invocation reuses the same session so the task
-has one coherent review record.
+has one coherent review record. Claude remote sessions also restore this value
+for Bash tool calls through the bundled SessionStart hook, because Claude's
+remote server may rebuild the environment before launching the inner session.
 
 ## Session outcomes
 

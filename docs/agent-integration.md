@@ -136,9 +136,15 @@ Setup-managed settings enable `ccc@ccc-agent` but do not duplicate hooks or
 declare another marketplace source. Setup initializes the user's Claude plugin
 metadata from the seed so hooks are active on the first invocation while
 preserving unrelated plugins. At runtime, `ccc-agent run` mounts the seed
-read-only and sets `CLAUDE_CODE_PLUGIN_SEED_DIR` inside bwrap. If the seed is
-absent or Claude does not load the plugin, contained Claude runs fall back to
-process-exit review.
+read-only and sets `CLAUDE_CODE_PLUGIN_SEED_DIR` inside bwrap. Claude remote
+servers may rebuild the environment before starting an inner `ccd-cli` session.
+For that path, the launcher mounts a mode-0600, read-only CCC session/control
+handoff at `/tmp/ccc-agent/session-env.json`; the plugin's `SessionStart` hook
+restores those narrow values and appends them to Claude's documented
+`CLAUDE_ENV_FILE`, making `CCC_AGENT_SESSION` available to subsequent Bash tool
+calls. The host-side handoff is removed when the outer session exits. If the seed
+is absent, Claude does not load the plugin, or SessionStart does not run,
+contained Claude runs still fall back to process-exit review.
 
 ## Hermes
 

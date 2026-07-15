@@ -8,6 +8,39 @@
 # held in the branch.
 set -eu
 
+# Claude's remote server may rebuild the environment before launching ccd-cli.
+# Recover only allowlisted ccc-agent values from the launcher-owned JSON file.
+# The path override exists for isolated hook tests; JSON values are shell-quoted
+# by Python before eval and cannot add commands or arbitrary variable names.
+CCC_SESSION_ENV=${CCC_AGENT_SESSION_ENV_FILE:-/tmp/ccc-agent/session-env.json}
+CCC_SESSION_EXPORTS=""
+if command -v python3 >/dev/null 2>&1 && [ -r "$CCC_SESSION_ENV" ]; then
+    CCC_SESSION_EXPORTS=$(python3 - "$CCC_SESSION_ENV" <<'PY'
+import json
+import shlex
+import sys
+
+allowed = (
+    "CCC_AGENT_SESSION", "CCC_AGENT_CONTROL_SOCK",
+    "CCC_AGENT_CONTROL_TOKEN", "CCC_AGENT_HOOK_TOKEN",
+    "CCC_AGENT_HOOK_SESSION", "CCC_AGENT_CLI",
+)
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError, TypeError):
+    data = {}
+for name in allowed:
+    value = data.get(name)
+    if isinstance(value, str):
+        print("export %s=%s" % (name, shlex.quote(value)))
+PY
+)
+    if [ -n "$CCC_SESSION_EXPORTS" ]; then
+        eval "$CCC_SESSION_EXPORTS"
+    fi
+fi
+
 # Direct/uncontained Claude runs should not see CCC behavior.
 if [ -z "${CCC_AGENT_SESSION:-}" ]; then
     exit 0
@@ -116,6 +149,12 @@ workspace_scope() {
 
 case "$EVENT" in
     SessionStart)
+        # Claude documents CLAUDE_ENV_FILE as the supported way for a
+        # SessionStart hook to persist variables into later Bash tool calls.
+        if [ -n "${CLAUDE_ENV_FILE:-}" ] && \
+                [ -n "$CCC_SESSION_EXPORTS" ]; then
+            printf '%s\n' "$CCC_SESSION_EXPORTS" >> "$CLAUDE_ENV_FILE"
+        fi
         workspace_scope add
         BODY=$(skill_body)
         if [ -n "$BODY" ]; then

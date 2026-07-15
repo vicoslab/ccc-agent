@@ -13,6 +13,37 @@
 # contract can only cost per-turn convenience, never containment.
 set -eu
 
+# Claude remote ccd-cli may receive a rebuilt environment. Restore only
+# allowlisted ccc-agent values from the launcher-owned JSON handoff.
+CCC_SESSION_ENV=${CCC_AGENT_SESSION_ENV_FILE:-/tmp/ccc-agent/session-env.json}
+CCC_SESSION_EXPORTS=""
+if command -v python3 >/dev/null 2>&1 && [ -r "$CCC_SESSION_ENV" ]; then
+    CCC_SESSION_EXPORTS=$(python3 - "$CCC_SESSION_ENV" <<'PY'
+import json
+import shlex
+import sys
+
+allowed = (
+    "CCC_AGENT_SESSION", "CCC_AGENT_CONTROL_SOCK",
+    "CCC_AGENT_CONTROL_TOKEN", "CCC_AGENT_HOOK_TOKEN",
+    "CCC_AGENT_HOOK_SESSION", "CCC_AGENT_CLI",
+)
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError, TypeError):
+    data = {}
+for name in allowed:
+    value = data.get(name)
+    if isinstance(value, str):
+        print("export %s=%s" % (name, shlex.quote(value)))
+PY
+)
+    if [ -n "$CCC_SESSION_EXPORTS" ]; then
+        eval "$CCC_SESSION_EXPORTS"
+    fi
+fi
+
 CTL="${CCC_AGENT_CLI:-ccc-agent}"
 
 # Not a contained session (e.g. a human-run agent outside ccc-agent run): the
