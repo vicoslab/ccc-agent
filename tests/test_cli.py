@@ -253,9 +253,9 @@ class TestMainRun(unittest.TestCase):
         with mock.patch("ccc_agent.cli.os.getcwd", return_value=launch_cwd):
             with mock.patch("ccc_agent.cli.run_session",
                             side_effect=fake_run_session):
-                code = main_run([
-                    "--config", self.h.config_path,
-                    "--serve", "claude", "--", "true",
+                code = main(["serve"] + [
+                    "claude", "--config", self.h.config_path,
+                    "--lifecycle", "foreground", "--", "true",
                 ], env={})
 
         self.assertEqual(code, 0)
@@ -265,13 +265,13 @@ class TestMainRun(unittest.TestCase):
         self.assertEqual(seen[0].policy["workspace_scopes"], [])
         self.assertEqual(seen[0].policy["allowed_scopes"], [])
 
-    def test_serve_run_is_quiet_and_default_keeps_out_of_scope(self):
+    def test_serve_is_quiet_and_default_keeps_out_of_scope(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            code = main_run([
-                "--config", self.h.config_path,
+            code = main(["serve"] + [
+                "codex", "--config", self.h.config_path,
                 "--workspace", "/storage/user/Projects/proj-a",
-                "--serve", "codex",
+                "--lifecycle", "foreground",
                 "--", "sh", "-c",
                 "echo workspace > artifact.txt; echo outside > ../../escape.txt",
             ], env={})
@@ -292,7 +292,7 @@ class TestMainRun(unittest.TestCase):
                          "committed")
         self.assertEqual(decisions.get("/storage/user/escape.txt"), "kept")
 
-    def test_serve_and_adaptive_lifecycle_are_orthogonal(self):
+    def test_serve_defaults_to_adaptive_and_allows_foreground_override(self):
         with open(self.h.config_path) as fh:
             data = json.load(fh)
         data["confinement"] = "bwrap"
@@ -308,20 +308,19 @@ class TestMainRun(unittest.TestCase):
                 exit_status=0, agent_kind=config.agent_kind, policy={})
 
         with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
-            self.assertEqual(main_run([
-                "--config", self.h.config_path,
-                "--serve", "claude", "--lifecycle", "adaptive",
+            self.assertEqual(main(["serve"] + [
+                "claude", "--config", self.h.config_path,
+                "--lifecycle", "foreground",
                 "--", "tool", "--lifecycle", "child-value",
             ], env={}), 0)
-            self.assertEqual(main_run([
-                "--config", self.h.config_path,
-                "--serve", "claude", "--", "true",
+            self.assertEqual(main(["serve"] + [
+                "claude", "--config", self.h.config_path, "--", "true",
             ], env={}), 0)
 
-        self.assertEqual(seen[0].lifecycle, "adaptive")
+        self.assertEqual(seen[0].lifecycle, "foreground")
         self.assertEqual(seen[0].agent_command,
                          ["tool", "--lifecycle", "child-value"])
-        self.assertEqual(seen[1].lifecycle, "foreground")
+        self.assertEqual(seen[1].lifecycle, "adaptive")
         self.assertEqual(seen[1].adaptive_bootstrap_seconds, 10.0)
 
     def test_serve_labels_supported_agents_as_remote_sessions(self):
@@ -337,9 +336,9 @@ class TestMainRun(unittest.TestCase):
         with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
             for agent in ("claude", "codex", "hermes"):
                 with self.subTest(agent=agent):
-                    self.assertEqual(main_run([
-                        "--config", self.h.config_path,
-                        "--serve", agent, "--", "true",
+                    self.assertEqual(main(["serve"] + [
+                        agent, "--config", self.h.config_path,
+                        "--lifecycle", "foreground", "--", "true",
                     ], env={}), 0)
 
         self.assertEqual(seen, ["claude-remote", "codex-remote",
@@ -401,11 +400,10 @@ class TestMainRun(unittest.TestCase):
                             side_effect=AssertionError(
                                 "server-mode run must not review/prompt")):
                 with contextlib.redirect_stderr(stderr):
-                    code = main_run([
-                        "--config", self.h.config_path,
+                    code = main(["serve"] + [
+                        "claude", "--config", self.h.config_path,
                         "--workspace", "/storage/user/Projects/proj-a",
-                        "--serve", "claude",
-                        "--", "true",
+                        "--lifecycle", "foreground", "--", "true",
                     ], env={})
 
         self.assertEqual(code, 0)
@@ -2005,15 +2003,19 @@ class TestShellCompletion(unittest.TestCase):
         self.assertEqual(self.complete(["ccc-agent", "resume", "agent-alpha",
                                         "--cmd", ""]), [])
 
-    def test_run_completion_lists_full_isolation_option(self):
+    def test_run_and_serve_completion_have_distinct_options(self):
         matches = self.complete(["ccc-agent", "run", "--"])
         self.assertIn("--full-isolation", matches)
         self.assertIn("--protect-agent-state", matches)
-        self.assertIn("--serve", matches)
+        self.assertNotIn("--serve", matches)
         self.assertIn("--lifecycle", matches)
         self.assertIn("--adaptive-bootstrap-seconds", matches)
         self.assertIn("--adaptive-stability-seconds", matches)
         self.assertIn("--adaptive-detach-seconds", matches)
+        serve_matches = self.complete(["ccc-agent", "serve", "--"])
+        self.assertIn("--full-isolation", serve_matches)
+        self.assertIn("--lifecycle", serve_matches)
+        self.assertNotIn("--agent", serve_matches)
 
     def test_review_completion_lists_ignored_policy_options(self):
         matches = self.complete(["ccc-agent", "review", "--"])
@@ -2064,6 +2066,7 @@ class TestShellCompletion(unittest.TestCase):
     def test_top_level_completion_lists_matching_ops(self):
         matches = self.complete(["ccc-agent", "st"])
         self.assertIn("status", matches)
+        self.assertIn("serve", self.complete(["ccc-agent", "se"]))
         self.assertIn("cleanup", self.complete(["ccc-agent", "cl"]))
         list_matches = self.complete(["ccc-agent", "l"])
         self.assertIn("list", list_matches)
@@ -2108,6 +2111,78 @@ class TestUnifiedMain(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(os.path.isfile(os.path.join(
             self.h.base, self.h.workspace_rel, "u.txt")))
+
+    def test_serve_op_dispatches_to_remote_runtime(self):
+        seen = []
+
+        def fake_run_session(config, env=None, before_finalize=None):
+            seen.append(config)
+            return SimpleNamespace(
+                session_id="agent-remote", workspace=config.workspace,
+                protected_roots={}, state="running", events=[],
+                exit_status=0, agent_kind=config.agent_kind, policy=config.policy)
+
+        with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
+            code = main([
+                "serve", "claude", "--config", self.h.config_path,
+                "--lifecycle", "foreground", "--", "true",
+            ], env={})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen[0].agent_kind, "claude-remote")
+        self.assertTrue(seen[0].server_mode)
+        self.assertEqual(seen[0].policy["workspace_scopes"], [])
+
+    def test_run_rejects_removed_serve_option(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                main([
+                    "run", "--config", self.h.config_path,
+                    "--serve", "claude", "--", "true",
+                ], env={})
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("use 'ccc-agent serve AGENT -- COMMAND...'",
+                      stderr.getvalue())
+
+    def test_run_preserves_child_serve_argument_without_separator(self):
+        seen = []
+
+        def fake_run_session(config, env=None, before_finalize=None):
+            seen.append(config.agent_command)
+            return SimpleNamespace(
+                session_id="agent-run", workspace=config.workspace,
+                protected_roots={}, state="auto-committed", events=[],
+                exit_status=0, agent_kind=config.agent_kind, policy=config.policy)
+
+        with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
+            code = main([
+                "run", "--config", self.h.config_path, "tool", "--serve",
+            ], env={})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [["tool", "--serve"]])
+
+    def test_serve_requires_agent_positional(self):
+        with self.assertRaises(SystemExit) as raised:
+            main(["serve"] + ["--config", self.h.config_path, "--", "true"], env={})
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_serve_requires_server_command(self):
+        with self.assertRaises(SystemExit) as raised:
+            main(["serve", "claude", "--config", self.h.config_path], env={})
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_serve_help_describes_required_command_and_protocol_clean_options(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as raised:
+                main(["serve", "--help"], env={})
+        self.assertEqual(raised.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertIn("server command to run (required)", text)
+        self.assertNotIn("default: current shell", text)
+        self.assertNotIn("--verbose", text)
 
     def test_control_ops_are_direct(self):
         main([
@@ -2159,6 +2234,7 @@ class TestUnifiedMain(unittest.TestCase):
         self.assertLess(plugin, auxiliary)
         primary_text = text[primary:session]
         self.assertIn("  run", primary_text)
+        self.assertIn("  serve", primary_text)
         self.assertIn("  resume", primary_text)
         self.assertNotIn("setup", primary_text)
         session_text = text[session:plugin]

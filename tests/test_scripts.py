@@ -966,15 +966,12 @@ class TestSshShellRouter(unittest.TestCase):
         proc = self.run_router(command)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stderr, "")
-        self.assertIn("ARG1:run", proc.stdout)
-        self.assertIn("ARG2:--serve", proc.stdout)
-        self.assertIn("ARG3:%s" % agent, proc.stdout)
-        self.assertIn("ARG4:--lifecycle", proc.stdout)
-        self.assertIn("ARG5:adaptive", proc.stdout)
-        self.assertIn("ARG6:--", proc.stdout)
-        self.assertIn("ARG7:%s" % self.real_shell, proc.stdout)
-        self.assertIn("ARG8:-c", proc.stdout)
-        self.assertIn("ARG9:%s" % command, proc.stdout)
+        self.assertIn("ARG1:serve", proc.stdout)
+        self.assertIn("ARG2:%s" % agent, proc.stdout)
+        self.assertIn("ARG3:--", proc.stdout)
+        self.assertIn("ARG4:%s" % self.real_shell, proc.stdout)
+        self.assertIn("ARG5:-c", proc.stdout)
+        self.assertIn("ARG6:%s" % command, proc.stdout)
         self.assertIn("ORIG:%s" % command, proc.stdout)
 
     def test_routes_direct_claude_codex_and_hermes_commands(self):
@@ -997,7 +994,7 @@ class TestSshShellRouter(unittest.TestCase):
         )
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("ARG1:run", proc.stdout)
+        self.assertIn("ARG1:serve", proc.stdout)
         self.assertIn("UNDERLYING:%s:%s:/usr/bin:/bin" %
                       (self.realdir, self.bin), proc.stdout)
         self.assertNotIn("UNDERLYING:%s:" % self.shimdir, proc.stdout)
@@ -1048,20 +1045,20 @@ class TestSshShellRouter(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("SHELLARG1:-c", proc.stdout)
             self.assertIn("SHELLARG2:%s" % command, proc.stdout)
-            self.assertNotIn("ARG1:run", proc.stdout)
+            self.assertNotIn("ARG1:serve", proc.stdout)
 
     def test_disabled_or_nested_sessions_pass_through(self):
         proc = self.run_router("claude --app", enabled=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SHELLARG1:-c", proc.stdout)
         self.assertIn("SHELLARG2:claude --app", proc.stdout)
-        self.assertNotIn("ARG1:run", proc.stdout)
+        self.assertNotIn("ARG1:serve", proc.stdout)
 
         proc = self.run_router("claude --app", extra_env={"CCC_AGENT_SESSION": "agent-x"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SHELLARG1:-c", proc.stdout)
         self.assertIn("SHELLARG2:claude --app", proc.stdout)
-        self.assertNotIn("ARG1:run", proc.stdout)
+        self.assertNotIn("ARG1:serve", proc.stdout)
 
 
 class TestStopHookSelfRepair(unittest.TestCase):

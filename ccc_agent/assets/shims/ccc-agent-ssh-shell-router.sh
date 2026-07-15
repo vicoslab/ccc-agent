@@ -274,4 +274,4 @@ if [ -z "${CCC_AGENT_SHIM_UNDERLYING_PATH:-}" ]; then
     CCC_AGENT_SHIM_UNDERLYING_PATH="$(_path_without_shims "${PATH:-}" "${agent}")"
     export CCC_AGENT_SHIM_UNDERLYING_PATH
 fi
-exec "${launcher}" run --serve "${agent}" --lifecycle adaptive -- "${shell}" -c "${original_command}"
+exec "${launcher}" serve "${agent}" -- "${shell}" -c "${original_command}"
