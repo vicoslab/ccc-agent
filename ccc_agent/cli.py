@@ -1936,7 +1936,7 @@ _SESSION_ID_COMPLETION_OPS = (
 )
 _MULTI_SESSION_ID_COMPLETION_OPS = set(_BATCH_SESSION_ID_CTL_OPS)
 _MAIN_OPS = tuple(sorted(_CTL_OPS | {
-    "run", "resume", "setup", "softsandbox", "completion",
+    "run", "resume", "setup", "mcp-server", "softsandbox", "completion",
 }))
 _TOP_LEVEL_OPTIONS = ("--config", "--version", "--help")
 _GLOBAL_VALUE_OPTIONS = frozenset(("--config",))
@@ -2198,13 +2198,14 @@ def _print_main_help(stream=None):
         "  thaw             reopen a pending-review branch for more work\n"
         "  cleanup          remove old terminal session bundles after an age "
         "check; use --all-type to include failed/non-terminal sessions\n\n"
-        "Plugin/hook ops (normally invoked by agent plugins/hooks):\n"
-        "  turn-finalize   inside session: finalize the current turn via the "
+        "Plugin/hook ops (including client-launched MCP):\n"
+        "  mcp-server      dependency-free stdio MCP server launched by the "
+        "official Claude/Codex client\n"
+        "  turn-finalize   lifecycle hook: finalize the current turn via the "
         "control socket\n"
-        "  turn-approve    inside session: answer a pending per-turn approval "
-        "token\n"
-        "  turn-resolve    inside session: commit/keep/discard a previously "
-        "remembered path\n"
+        "  turn-approve / turn-resolve\n"
+        "                   legacy protocol verbs; mutating authority requires "
+        "the pinned MCP connection\n"
         "  turn-add-workspace / turn-remove-workspace\n"
         "                   hook-only: add/remove session-owned dynamic "
         "workspace scopes\n"
@@ -2251,6 +2252,9 @@ def main(argv=None, env=None):
     if op == "setup":
         from . import setup as setup_mod
         return setup_mod.main(rest, prog="ccc-agent setup")
+    if op == "mcp-server":
+        from . import mcp as mcp_mod
+        return mcp_mod.main(rest, env=env)
     if op == "softsandbox":
         return main_softsandbox(rest, env=env)
 

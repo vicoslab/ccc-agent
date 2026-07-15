@@ -1,16 +1,20 @@
 ---
 name: ccc-containment
-description: Always use in every session when ${CCC_AGENT_SESSION} env is non empty; check kept non-workspace files when finished/idling.
+description: Use in every contained CCC session; operate live containment state only through the official CCC MCP tools.
 ---
 
-# CCC containment rules
+# CCC containment
 
-Always use this skill when `${CCC_AGENT_SESSION}` is not empty. The CCC plugin also injects these rules at session/turn boundaries.
+Always use this skill when `${CCC_AGENT_SESSION}` is set. You are working in a contained filesystem. Trusted lifecycle hooks maintain workspace scopes and finalize each turn; do not invoke hook lifecycle commands yourself. Process-exit finalization remains authoritative.
 
-You are running in a contained filesystem. At each stop, the hook writes workspace/in-policy files through. Files outside workspace/policy stay separate until the user approves.
+For direct Claude/Codex clients, use only the `ccc` MCP server for agent-facing decisions:
 
-Workspace-scope changes are managed by trusted hooks; do not run workspace-scope commands yourself.
+- `ccc_status`: compact kept/committed counts.
+- `ccc_list_kept`: exact currently kept non-workspace paths.
+- `ccc_commit_kept`: commit currently kept paths after nested human form elicitation.
+- `ccc_discard_kept`: discard currently kept changes after nested human form elicitation.
+- `ccc_keep_kept`: leave currently kept paths for later review.
 
-When you have finished your work and would otherwise idle, check kept files. The Stop hook runs `ccc-agent turn-review-kept`; if it reports kept files, ask briefly whether to commit, discard, or keep them, then run `ccc-agent turn-resolve <commit|discard|keep> --all-kept` unless a selective path decision is needed. You must run `ccc-agent turn-kept-status` if checking manually; use `--details` only when exact paths are needed.
+Codex policy must prompt per-tool for every CCC MCP call; never add a blanket allow rule. Commit/discard fail closed without affirmative confirmation and accept only currently remembered kept paths. Never use ordinary `ccc-agent turn-resolve` or `turn-approve`; they are not an agent authority path. In unsupported wrapper/Hermes modes, leave resolution to external session review.
 
-Do not stop active loops/goals just to ask about commits unless approval is required to continue.
+Do not stop active loops/goals merely to ask about kept paths. When finished or otherwise idling, call `ccc_status`; use `ccc_list_kept` and a resolution tool only when needed.

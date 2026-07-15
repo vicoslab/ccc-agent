@@ -358,6 +358,9 @@ class TestTurnController(unittest.TestCase):
         persisted = self.h.store.load(self.h.session.session_id)
         tc2 = TurnController(persisted, self.h.store, self.h.backend,
                              self.h.alias)
+        with self.assertRaises(ValueError):
+            tc2.resolve_turn("commit", ["/storage/user/not-kept.txt"])
+
         resp = tc2.resolve_turn("discard", ["/storage/user/escape.txt"])
 
         self.assertEqual(resp["verdict"], "discarded")
@@ -406,7 +409,7 @@ class TestTurnController(unittest.TestCase):
 
         self.assertEqual(review["verdict"], "needs-kept-review")
         self.assertEqual(review["kept"], ["/storage/user/escape.txt"])
-        self.assertIn("turn-resolve", review["message"])
+        self.assertIn("ccc_list_kept", review["message"])
 
     def test_granular_approval_can_commit_discard_and_keep_paths(self):
         self.h.write("commit-me.txt", "a")

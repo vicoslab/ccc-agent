@@ -30,7 +30,8 @@ inspect, selectively apply, or discard them.
 | `ccc-agent review/diff/commit/abort/...` | Operator control over persisted sessions. | Bypass policy accidentally. |
 | BranchFS | Lazy branch views, deltas, tombstones, freeze/thaw/status primitives. | Decide human policy or agent lifecycle. |
 | FUSE sidecar | Local privileged mount plumbing when needed. | Classify paths or commit data. |
-| Agent plugins/hooks | Signal turn boundaries and expose convenient review commands. | Directly commit real data. |
+| Agent plugins/hooks | Signal lifecycle turn/workspace boundaries and configure the client-launched MCP server. | Directly commit real data. |
+| CCC stdio MCP server | Expose compact kept state; relay nested human elicitation over the official client connection. | Admit itself by token claims or bypass supervisor process admission. |
 
 ## Session lifecycle
 
@@ -56,6 +57,18 @@ Main flow:
 
 Commit failures never abort automatically. If applying changes fails, the branch
 is preserved and the session becomes `failed` or `pending-review` for recovery.
+
+### Agent-facing MCP admission
+
+For direct Claude/Codex bwrap launches, the client starts the bundled stdio MCP
+server before model work. The supervisor uses Unix `SO_PEERCRED`, then pins the
+first eligible persistent connection to MCP PID/start-time, direct parent client
+PID/start-time, and ancestry under the launched bwrap PID. A shell-parented MCP
+process and unsupported server-wrapper topology fail closed. Ordinary
+`turn-resolve`/`turn-approve` connections are rejected; lifecycle hook calls are
+unchanged. This is Linux process-bound admission for ordinary untrusted tool
+subprocesses under procfs/ptrace isolation, not cryptographic process
+attestation. See [Agent integration](agent-integration.md#mcp-process-admission).
 
 ## Sandbox layout in `bwrap` mode
 

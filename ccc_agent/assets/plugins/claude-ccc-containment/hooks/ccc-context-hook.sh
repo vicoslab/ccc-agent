@@ -168,7 +168,7 @@ case "$EVENT" in
         ;;
     UserPromptSubmit)
         printf '%s\n' \
-            "CCC contained-session reminder: workspace/in-policy files are written through by the supervisor, while non-workspace or out-of-policy files stay separate until the user decides. When work is finished and Claude would otherwise idle, check compact kept-file counts with ccc-agent turn-kept-status or follow Stop-hook feedback from ccc-agent turn-review-kept; if kept files exist, ask the user briefly whether to commit, discard, or keep them, then run ccc-agent turn-resolve <commit|discard|keep> --all-kept unless a selective path decision is needed. Use ccc-agent turn-kept-status --details only when exact paths are needed." \
+            "CCC contained-session reminder: workspace/in-policy files are written through by the supervisor, while non-workspace or out-of-policy files stay separate. Do not run turn-resolve or turn-approve. When work is finished and Claude would otherwise idle, use ccc_status and the ccc MCP kept-path tools. Commit/discard perform their own required human elicitation." \
             | emit_context UserPromptSubmit
         ;;
     Stop)
@@ -186,7 +186,7 @@ case "$EVENT" in
         REVIEW=$("$CTL" turn-review-kept 2>&1) || rc=$?
         if [ "$rc" -eq 2 ] && [ -n "$REVIEW" ]; then
             printf '%s\n\n%s\n' \
-                "CCC contained-session review is pending. The supervisor kept non-workspace or out-of-policy files separate and they are not committed. Ask the user briefly whether to commit, discard, or keep them, then run ccc-agent turn-resolve <commit|discard|keep> --all-kept unless a selective path decision is needed. Do not paste long path lists; use ccc-agent turn-kept-status --details only when exact paths are needed." \
+                "CCC contained-session review is pending. The supervisor kept non-workspace or out-of-policy files separate and they are not committed. Use ccc_status, ccc_list_kept, and the appropriate ccc MCP resolution tool. Commit/discard perform required nested human elicitation; do not run turn-resolve or turn-approve directly." \
                 "$REVIEW" | emit_context Stop
         fi
         ;;

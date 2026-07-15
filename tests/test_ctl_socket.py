@@ -24,7 +24,8 @@ class TestCtlSocket(unittest.TestCase):
 
     def _serve(self, handler, hook_token=None):
         srv = ControlServer(self.sock, handler, self.token,
-                            hook_token=hook_token)
+                            hook_token=hook_token,
+                            enforce_mcp_admission=False)
         srv.start()
         self.addCleanup(srv.stop)
 

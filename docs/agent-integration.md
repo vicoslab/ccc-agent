@@ -186,28 +186,59 @@ When `CCC_AGENT_SESSION` is already set, a nested invocation reuses the current
 session rather than creating another branch. This is important when one agent
 starts another agent or helper script: the task remains one review unit.
 
-## Live review commands exposed to agents
+## Live review through MCP
 
-Bundled plugins include user-facing command skills where the agent supports them:
+The Claude and Codex plugins each use the client's supported plugin `.mcp.json`
+to launch `ccc-agent mcp-server` over stdio. The dependency-free server exposes:
 
 ```text
-/ccc-status [filter]
-/ccc-commit [paths|prompt]
-/ccc-discard [all|prompt]
-/ccc <natural-language request>
+ccc_status
+ccc_list_kept
+ccc_commit_kept
+ccc_discard_kept
+ccc_keep_kept
 ```
 
-These operation skills set `disable-model-invocation: true`, so they remain
-explicit user commands rather than operations the model may invoke by itself.
+The four protected user-operation skills (`ccc`, `ccc-status`, `ccc-commit`, and
+`ccc-discard`) have been replaced by one `ccc-containment` instruction skill.
+Lifecycle hooks are retained. Codex deployments must keep per-tool prompting for
+`mcp__ccc__*` enabled and must not add a blanket allow rule. Claude's destructive
+tools carry `anthropic/requiresUserInteraction` metadata.
 
-The concrete trusted CLI operations are:
+`ccc_commit_kept` and `ccc_discard_kept` send a nested MCP form-mode
+`elicitation/create` request on the same connection. No advertised elicitation
+capability, an MCP error, malformed content, decline, cancel, EOF, or anything
+other than `action=accept` plus `confirm=true` fails closed. Every resolution is
+restricted to the supervisor's current remembered-kept path set. The old
+`turn-resolve` and `turn-approve` CLI protocol verbs remain for compatibility,
+but the production supervisor admits their mutating operations only on the
+pinned MCP connection; ordinary agent tool subprocesses cannot exercise them.
 
-```bash
-ccc-agent turn-kept-status [--details]
-ccc-agent turn-review-kept [--details]
-ccc-agent turn-resolve commit|keep|discard --paths a,b
-ccc-agent turn-resolve commit|keep|discard --all-kept
-```
+## MCP process admission
+
+The supervisor authenticates the Unix control peer with Linux `SO_PEERCRED`; it
+does not trust environment claims or a token by itself. Before tools are
+advertised/model work starts, the first eligible stdio MCP process opens one
+persistent control connection. The supervisor pins that connection to:
+
+- the kernel-reported MCP peer PID and `/proc/<pid>/stat` start time;
+- its direct parent official Claude/Codex client PID and start time; and
+- ancestry beneath the exact bwrap PID launched for this CCC session.
+
+The expected client is derived from the configured direct executable and
+cmdline. bwrap/runner ancestry is traversed rather than assuming that bwrap is
+the MCP process's direct parent. A Bash-launched `ccc-agent mcp-server` is
+rejected because its direct parent is the shell, not the expected client. Other
+connections/processes, PID reuse, missing/unreadable proc state, non-bwrap debug
+launches, and server/SSH wrapper modes where the official client cannot be
+identified all fail closed. Server-wrapper sessions retain hook and process-exit
+finalization but do not receive MCP mutation admission.
+
+This is process-bound admission in the normal Linux process model, intended to
+protect against ordinary untrusted tool subprocesses when the deployment also
+provides the expected procfs/ptrace isolation. It is **not cryptographic process
+attestation** and does not claim protection if an attacker can ptrace, replace,
+or arbitrarily manipulate the admitted client/MCP process.
 
 Hook-only workspace operations are reserved for trusted lifecycle hooks:
 

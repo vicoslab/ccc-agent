@@ -1,7 +1,7 @@
 {
   "name": "ccc",
   "version": "0.2.0",
-  "description": "CCC contained-session lifecycle hooks and /ccc commands. Distributed through a read-only Claude plugin seed; hooks stay inert outside CCC sessions because they require CCC_AGENT_SESSION. Signals turn boundaries to the trusted supervisor over the control socket; it never holds commit authority.",
+  "description": "CCC contained-session lifecycle hooks, one containment instruction skill, and an authenticated stdio MCP server for agent-facing review. Distributed through a read-only Claude plugin seed; hooks stay inert outside CCC sessions because they require CCC_AGENT_SESSION.",
   "author": {
     "name": "CCC agent"
   }

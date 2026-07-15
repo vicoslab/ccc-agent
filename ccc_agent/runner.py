@@ -643,6 +643,24 @@ def _is_codex_agent(config):
     return _is_agent_kind(config, "codex")
 
 
+def _mcp_admission_config(config):
+    """Return expected process names and whether this direct launch is eligible.
+
+    Agent labels routed through bash/SSH/server wrappers are insufficient: the
+    official client must be the direct configured command under bwrap. An
+    unsupported launch gets an unmatchable name so ordinary mutating control
+    calls are still rejected while hooks retain lifecycle access.
+    """
+    direct = (_agent_token(config.agent_command[0])
+              if config.agent_command else "")
+    kind = _agent_token(config.agent_kind).split("-", 1)[0]
+    recognized = direct if direct in ("claude", "codex") else (
+        kind if kind in ("claude", "codex") else "")
+    supported = bool(recognized and direct == recognized and
+                     config.confinement == "bwrap")
+    return ((recognized or "__unsupported_ccc_mcp_client__",), supported)
+
+
 def _add_runtime_state_ignores(session, config, ignore, relpaths):
     home = "/home/%s" % config.owner
     for relpath in relpaths:
@@ -1659,6 +1677,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         os.makedirs(cwd, exist_ok=True)
         run_env = _fresh_run_env(env, session, config.store.state_dir)
         control = None
+        _mcp_supported = False
         if config.per_turn:
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
             hook_token = binascii.hexlify(os.urandom(16)).decode("ascii")
@@ -1666,8 +1685,10 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             turn_ctl = TurnController(session, config.store, config.backend,
                                       config.alias_map)
             turn_ctl.reset_agent_workspaces()
-            control_server = ControlServer(host_sock, turn_ctl.handle, token,
-                                           hook_token=hook_token)
+            expected_clients, _mcp_supported = _mcp_admission_config(config)
+            control_server = ControlServer(
+                host_sock, turn_ctl.handle, token, hook_token=hook_token,
+                expected_clients=expected_clients)
             control_server.start()
             session.add_event("control-server", host_sock)
             run_env[ENV_CONTROL_SOCK] = host_sock
@@ -1694,6 +1715,9 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         proc = subprocess.Popen(argv, env=bwrap_env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 bufsize=0)
+        if control_server is not None:
+            control_server.set_launch_process(proc.pid,
+                                              supported=_mcp_supported)
         _handed_off, returncode = _adaptive_supervise_process(
             proc, listener, session, config, status_fd, frontend_pid)
         listener = None
@@ -1776,6 +1800,23 @@ def _run_adaptive_session(session, config, env, before_finalize=None):
         return session
 
 
+def _run_wait_with_launch_identity(command, control_server=None,
+                                   mcp_supported=False, **kwargs):
+    """Run a foreground child and publish its PID before waiting.
+
+    Older runner tests intercept ``subprocess.run`` to inspect bwrap argv. Keep
+    that test-double seam without using it in production; real executions always
+    use Popen so MCP admission can bind to the live launch PID before model work.
+    """
+    if hasattr(subprocess.run, "mock_calls"):
+        return subprocess.run(command, **kwargs)
+    proc = subprocess.Popen(command, **kwargs)
+    if control_server is not None:
+        control_server.set_launch_process(proc.pid, supported=mcp_supported)
+    proc.wait()
+    return proc
+
+
 def _run_agent_and_finalize(session, config, env, before_finalize=None,
                             enter_running=False):
     """Launch config.agent_command against an already-mounted session."""
@@ -1792,6 +1833,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
         # token go into the agent env (bwrap remaps the path to the in-sandbox
         # mount); finalize at process exit still runs as the session-end pass.
         control = None
+        _mcp_supported = False
         if config.per_turn:
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
             hook_token = binascii.hexlify(os.urandom(16)).decode("ascii")
@@ -1799,8 +1841,10 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             turn_ctl = TurnController(session, config.store, config.backend,
                                       config.alias_map)
             turn_ctl.reset_agent_workspaces()
-            control_server = ControlServer(host_sock, turn_ctl.handle, token,
-                                           hook_token=hook_token)
+            expected_clients, _mcp_supported = _mcp_admission_config(config)
+            control_server = ControlServer(
+                host_sock, turn_ctl.handle, token, hook_token=hook_token,
+                expected_clients=expected_clients)
             control_server.start()
             session.add_event("control-server", host_sock)
             run_env[ENV_CONTROL_SOCK] = host_sock
@@ -1828,9 +1872,13 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             session.add_event("container-run-access",
                               "enabled" if config.container_run_access
                               else "disabled")
-            proc = subprocess.run(argv, env=bwrap_env)
+            proc = _run_wait_with_launch_identity(
+                argv, env=bwrap_env, control_server=control_server,
+                mcp_supported=_mcp_supported)
         else:
-            proc = subprocess.run(config.agent_command, cwd=cwd, env=run_env)
+            proc = _run_wait_with_launch_identity(
+                config.agent_command, cwd=cwd, env=run_env,
+                control_server=control_server, mcp_supported=False)
         session.exit_status = proc.returncode
         session.add_event("agent-exit", str(proc.returncode))
     except Exception as exc:

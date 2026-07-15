@@ -26,10 +26,10 @@ is idempotent, and the supervisor records per-path commit/keep decisions in the
 session so out-of-scope paths that were already committed or kept are not
 re-prompted after controller restarts.
 
-Threat model is naive/accidental (see docs/architecture.md): the supervisor
-holds commit authority and only copies out-of-scope work to base on a relayed
-user "yes"; an agent can spoof its OWN approval but never escapes the in-scope
-policy.
+Mutating agent decisions are admitted only through the process-pinned MCP
+connection. Lifecycle hooks retain finalize/workspace signaling, while ordinary
+agent subprocesses cannot call turn-approve or turn-resolve on the production
+supervisor.
 """
 
 import binascii
@@ -556,11 +556,10 @@ class TurnController(object):
                 return {"verdict": VERDICT_NOOP, "kept": [], "stale": stale,
                         "message": "no kept non-workspace paths"}
             msg = (
-                "%d kept non-workspace path(s) remain pending; ask the user "
-                "whether to commit, discard, or keep them, then run "
-                "ccc-agent turn-resolve <commit|discard|keep> --all-kept. "
-                "Use ccc-agent turn-kept-status --details only when exact "
-                "paths are needed." % len(kept))
+                "%d kept non-workspace path(s) remain pending. Use the ccc "
+                "MCP server: call ccc_list_kept if exact paths are needed, "
+                "then ccc_commit_kept, ccc_discard_kept, or ccc_keep_kept. "
+                "Commit/discard require nested human confirmation." % len(kept))
             self.session.add_event("turn-kept-review-requested",
                                    "%d path(s)" % len(kept))
             self.store.save(self.session)
@@ -687,6 +686,12 @@ class TurnController(object):
             paths = set(paths or ())
             if not paths:
                 raise ValueError("turn-resolve requires at least one path")
+            current_kept, _stale = self._kept_path_view()
+            not_kept = sorted(paths - set(current_kept))
+            if not_kept:
+                raise ValueError(
+                    "turn-resolve accepts only currently remembered kept paths: %s"
+                    % ", ".join(not_kept))
             decision = str(decision or "").strip().lower()
             if decision in self._YES:
                 committed = self._commit_paths(paths)

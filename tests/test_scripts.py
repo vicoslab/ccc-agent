@@ -216,45 +216,23 @@ class TestPluginAssets(unittest.TestCase):
                 bodies.append(fh.read())
         self.assertEqual(len(set(bodies)), 1)
         self.assertIn("name: ccc-containment", bodies[0])
-        self.assertLess(len(bodies[0].split()), 190)
-        self.assertNotIn("BranchFS", bodies[0])
-        self.assertNotIn("branchfs", bodies[0].lower())
         self.assertIn("Always use this skill", bodies[0])
         self.assertIn("contained filesystem", bodies[0])
-        self.assertIn("You must run", bodies[0])
-        self.assertIn("ccc-agent turn-kept-status", bodies[0])
-        self.assertIn("finished your work", bodies[0])
-        self.assertIn("would otherwise idle", bodies[0])
+        self.assertIn("ccc_status", bodies[0])
+        self.assertIn("ccc_list_kept", bodies[0])
+        self.assertIn("ccc_commit_kept", bodies[0])
+        self.assertIn("per-tool", bodies[0])
         self.assertIn("Do not stop active loops/goals", bodies[0])
-        self.assertIn("turn-review-kept", bodies[0])
-        self.assertIn("turn-resolve", bodies[0])
+        self.assertIn("Process-exit finalization", bodies[0])
 
-    def test_ccc_user_command_skills_are_bundled_with_prefixed_names(self):
-        expected = {
-            "ccc-status": "ccc-agent turn-kept-status",
-            "ccc-commit": "ccc-agent turn-resolve commit",
-            "ccc-discard": "ccc-agent turn-resolve discard",
-            "ccc": "ccc-agent turn-",
-        }
-        bodies = []
+    def test_protected_user_command_skills_are_replaced_by_mcp_instructions(self):
+        removed = ("ccc-status", "ccc-commit", "ccc-discard", "ccc")
         for plugin in ("claude-ccc-containment", "codex-ccc-containment",
                        "hermes-ccc-containment"):
-            for old_name in ("status", "commit", "discard", "op"):
-                old_path = os.path.join(PLUGINS, plugin, "skills", old_name)
-                self.assertFalse(os.path.exists(old_path), old_path)
-            for name, command in expected.items():
+            for name in removed:
                 path = os.path.join(PLUGINS, plugin, "skills", name,
                                     "SKILL.md")
-                self.assertTrue(os.path.isfile(path), path)
-                with open(path) as fh:
-                    body = fh.read()
-                bodies.append(body)
-                self.assertIn("name: %s" % name, body)
-                self.assertIn("disable-model-invocation: true", body)
-                self.assertIn("$ARGUMENTS", body)
-                self.assertIn(command, body)
-                self.assertNotIn("BranchFS", body)
-                self.assertLess(len(body.split()), 180)
+                self.assertFalse(os.path.isfile(path), path)
 
     def test_hermes_plugin_layout(self):
         root = os.path.join(PLUGINS, "hermes-ccc-containment")
@@ -449,7 +427,7 @@ class TestClaudeContextHook(unittest.TestCase):
         out = data["hookSpecificOutput"]
         self.assertEqual(out["hookEventName"], "SessionStart")
         self.assertIn("ccc-containment", out["additionalContext"])
-        self.assertIn("turn-kept-status", out["additionalContext"])
+        self.assertIn("ccc_status", out["additionalContext"])
         self.assertIn("contained filesystem", out["additionalContext"])
 
     def test_session_start_restores_stripped_outer_session_for_bash_tools(self):
@@ -551,7 +529,8 @@ class TestClaudeContextHook(unittest.TestCase):
         out = data["hookSpecificOutput"]
         self.assertEqual(out["hookEventName"], "UserPromptSubmit")
         self.assertIn("CCC contained-session reminder", out["additionalContext"])
-        self.assertIn("turn-review-kept", out["additionalContext"])
+        self.assertIn("ccc_status", out["additionalContext"])
+        self.assertIn("human elicitation", out["additionalContext"])
 
     def test_stop_review_kept_continues_with_user_decision_context(self):
         calls = os.path.join(self._tmp.name, "calls")
@@ -649,9 +628,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
         self.assertIsInstance(result, dict)
         context = result["context"]
         self.assertIn("ccc-containment", context)
-        self.assertIn("turn-kept-status", context)
+        self.assertIn("ccc_status", context)
         self.assertIn("contained filesystem", context)
         self.assertIn("Hermes would otherwise idle", context)
+        self.assertIn("external session review", context)
 
     def test_pre_llm_and_session_end_update_workspace_scope_with_hook_token(self):
         mod = self.load_plugin()
