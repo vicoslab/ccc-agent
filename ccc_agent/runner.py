@@ -35,7 +35,8 @@ from .paths import is_within, normalize
 from .policy import (ABORT, AUTO_COMMIT, NO_CHANGES, PENDING_REVIEW,
                      PolicyConfig, PolicyDecision, evaluate, split_ignored)
 from .previous_commits import split_previously_committed_changes
-from .session import ProtectedRoot
+from .session import (ProtectedRoot, Session, is_remote_bridge,
+                      remote_bridge_agent_kind)
 from .turn import TurnController
 
 ENV_SESSION = "CCC_AGENT_SESSION"
@@ -1304,6 +1305,38 @@ def finalize_session(session, store, backend, alias_map):
     return decision
 
 
+def _discard_remote_bridge_session(session, store, backend):
+    """Abort and forget a completed adaptive remote bridge.
+
+    Bridges are transport helpers, not reviewable agent work sessions. They must
+    never commit branch deltas. Keep a failed abort/removal record for recovery,
+    but remove the complete bundle immediately after a successful discard.
+    """
+    _unmount_all(session, backend)
+    session.add_event("unmounted-bundle")
+    try:
+        for root in session.protected_roots.values():
+            backend.abort(root)
+    except Exception as exc:
+        _fail(store, session,
+              "remote bridge discard failed; branch preserved: %s" % exc)
+        return False
+
+    session.add_event("closed", "remote bridge finished; branch discarded")
+    session.transition("aborted")
+    store.save(session)
+    try:
+        store.remove(session.session_id)
+    except (OSError, ValueError) as exc:
+        # The branch is already discarded, so retain the closed metadata bundle
+        # with an explicit cleanup error instead of attempting an illegal
+        # aborted -> failed transition.
+        session.add_event("error", "remote bridge bundle cleanup failed: %s" % exc)
+        store.save(session)
+        return False
+    return True
+
+
 def _unmount_all(session, backend):
     for root in session.protected_roots.values():
         try:
@@ -1508,6 +1541,12 @@ def _adaptive_supervise_process(proc, listener, session, config, status_fd,
                     event = message.get("event")
                     durable = _adaptive_event_name(event)
                     if durable:
+                        if (config.server_mode and
+                                event in ("foreground-locked",
+                                          "handoff-rejected")):
+                            session.agent_kind = remote_bridge_agent_kind(
+                                session.agent_kind)
+                            session.add_event("adaptive-remote-bridge", event)
                         detail = message.get("reason")
                         session.add_event(durable, detail)
                         config.store.save(session)
@@ -1606,12 +1645,15 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         session.exit_status = returncode
         session.add_event("agent-exit", str(returncode))
 
-        session.transition("finalizing")
-        config.store.save(session)
-        if before_finalize is not None:
-            before_finalize(session)
-        finalize_session(session, config.store, config.backend,
-                         config.alias_map)
+        if is_remote_bridge(session):
+            _discard_remote_bridge_session(session, config.store, config.backend)
+        else:
+            session.transition("finalizing")
+            config.store.save(session)
+            if before_finalize is not None:
+                before_finalize(session)
+            finalize_session(session, config.store, config.backend,
+                             config.alias_map)
     except Exception as exc:
         _fail(config.store, session, "adaptive launch failed: %s" % exc)
     finally:
@@ -1628,7 +1670,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             pass
         _unmount_all(session, config.backend)
 
-    _adaptive_status(status_fd, "finished")
+    _adaptive_status(status_fd, "finished", session=session.to_dict())
     try:
         os.close(status_fd)
     except OSError:
@@ -1670,6 +1712,8 @@ def _run_adaptive_session(session, config, env, before_finalize=None):
             os.waitpid(supervisor_pid, 0)
         except OSError:
             pass
+        if isinstance(message.get("session"), dict):
+            return Session.from_dict(message["session"])
     try:
         return config.store.load(session.session_id)
     except KeyError:

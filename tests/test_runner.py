@@ -810,6 +810,45 @@ time.sleep(0.18)
         self.assertTrue(any(e["event"] == "adaptive-foreground-locked"
                             for e in session.events))
 
+    def test_adaptive_remote_bridges_are_hidden_aborted_and_removed(self):
+        for agent in ("claude", "codex", "hermes"):
+            with self.subTest(agent=agent):
+                def seed_delta(running_session):
+                    root = running_session.protected_roots["storage_user"]
+                    path = os.path.join(
+                        root.store, "branches", root.branch, "files",
+                        "Projects", "proj-a", "bridge-only.txt")
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as fh:
+                        fh.write("discard me\n")
+
+                self.h.backend = FakeBranchFS()
+                config = self.h.config(
+                    [sys.executable, "-c", "import time; time.sleep(0.08)"],
+                    agent_kind=agent + "-remote", server_mode=True,
+                    confinement="bwrap", bwrap_bin=self._fake_bwrap(),
+                    lifecycle="adaptive", adaptive_bootstrap_seconds=0.02,
+                    adaptive_stability_seconds=0.01,
+                    adaptive_detach_seconds=0.05, per_turn=False,
+                    on_session_start=seed_delta)
+
+                session = run_session(
+                    config,
+                    before_finalize=lambda _session: self.fail(
+                        "remote bridge must be discarded, not finalized"))
+
+                self.assertEqual(session.agent_kind, agent + "-remote-bridge")
+                self.assertEqual(session.state, "aborted")
+                self.assertEqual(self.h.store.list(), [])
+                with self.assertRaises(KeyError):
+                    self.h.store.load(session.session_id)
+                self.assertFalse(os.path.exists(
+                    self.h.store.bundle_dir(session.session_id)))
+                self.assertFalse(os.path.exists(os.path.join(
+                    self.h.base, "Projects", "proj-a", "bridge-only.txt")))
+                root = session.protected_roots["storage_user"]
+                self.assertEqual(self.h.backend.status(root), [])
+
     def test_bwrap_needs_no_script_or_uid(self):
         # Unlike chroot, bwrap is rootless: it must not require uid/gid/script.
         cfg = self.h.config(["true"], confinement="bwrap")

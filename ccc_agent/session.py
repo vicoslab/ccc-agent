@@ -27,6 +27,31 @@ STATES = (
 
 TERMINAL_STATES = ("auto-committed", "committed", "aborted", "failed")
 
+REMOTE_AGENT_SUFFIX = "-remote"
+REMOTE_BRIDGE_SUFFIX = "-remote-bridge"
+
+
+def remote_agent_kind(agent_kind):
+    """Return the durable ``--serve`` label for an agent kind."""
+    agent_kind = str(agent_kind)
+    if agent_kind.endswith(REMOTE_BRIDGE_SUFFIX):
+        return agent_kind[:-len("-bridge")]
+    if agent_kind.endswith(REMOTE_AGENT_SUFFIX):
+        return agent_kind
+    return agent_kind + REMOTE_AGENT_SUFFIX
+
+
+def remote_bridge_agent_kind(agent_kind):
+    """Return the adaptive foreground bridge label for a remote agent run."""
+    if str(agent_kind).endswith(REMOTE_BRIDGE_SUFFIX):
+        return str(agent_kind)
+    return remote_agent_kind(agent_kind) + "-bridge"
+
+
+def is_remote_bridge(session):
+    return str(session.agent_kind).endswith(REMOTE_BRIDGE_SUFFIX)
+
+
 _TRANSITIONS = {
     "created": ("mounting", "aborted", "failed"),
     "mounting": ("running", "aborted", "failed"),

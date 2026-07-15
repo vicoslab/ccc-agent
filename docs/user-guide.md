@@ -82,6 +82,11 @@ ccc-agent ls
 ccc-agent list <session-prefix>
 ```
 
+Runs started with `--serve AGENT` use the `AGENT-remote` label. If adaptive
+classification identifies a foreground bridge/proxy helper, its label changes to
+`AGENT-remote-bridge`; it is then omitted from this listing and discarded with
+its branch when it finishes.
+
 Inspect one session:
 
 ```bash

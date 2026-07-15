@@ -34,15 +34,16 @@ Argument activation remains restricted to direct agent CLI invocations; safe
 asset-discovery environment can reach an explicitly identified server wrapper.
 
 Use `--serve AGENT` for server-style entrypoints such as Codex app-server, Claude
-remote server wrappers, or a Hermes gateway launched through SSH. Server mode is
-intended for protocols that parse stdout/stderr themselves: `ccc-agent` emits no
-banner, finish line, review text, or prompt during the wrapped server lifecycle,
-and it does not inject agent-interactive argv into the server command. Before the
-final freeze it applies the same default as turn hooks:
-commit in-workspace changes, remember non-workspace changes as kept in the
-branch, and leave the session reviewable if anything still needs later
-attention. The SSH shell router uses this mode automatically for detected
-Codex/Claude/Hermes remote commands.
+remote server wrappers, or a Hermes gateway launched through SSH. Persisted
+server sessions use the `AGENT-remote` label (for example `codex-remote`) in
+`ccc-agent list`. Server mode is intended for protocols that parse stdout/stderr
+themselves: `ccc-agent` emits no banner, finish line, review text, or prompt during
+the wrapped server lifecycle, and it does not inject agent-interactive argv into
+the server command. Before the final freeze it applies the same default as turn
+hooks: commit in-workspace changes, remember non-workspace changes as kept in the
+branch, and leave the session reviewable if anything still needs later attention.
+The SSH shell router uses this mode automatically for detected Codex/Claude/Hermes
+remote commands.
 
 ## Adaptive SSH process lifecycle
 
@@ -68,10 +69,14 @@ process behavior:
   the detach timeout.
 
 A small trusted supervisor owns bwrap and BranchFS after a clean handoff, while
-the bootstrap SSH command returns. Later bridge/proxy commands continue to use
-ordinary separate ccc-agent sessions and shared agent runtime sockets; there is no
-active-lane or namespace-attachment router. Multiple services therefore keep
-independent session IDs and branch views.
+the bootstrap SSH command returns. That true service remains visible as an
+`AGENT-remote` session. A foreground-locked or rejected adaptive server-mode run
+is classified as `AGENT-remote-bridge`: it is omitted from `ccc-agent list`, its
+branch is aborted rather than committed when the bridge exits, and its session
+bundle is removed immediately after a successful discard. Bridge/proxy commands
+still use independent containment while running; there is no active-lane or
+namespace-attachment router. Multiple true services therefore keep independent
+session IDs and branch views.
 
 Interactive SSH commands with a TTY stay on the existing foreground lifecycle so
 terminal ownership/job control is preserved. Ordinary local `ccc-agent run`

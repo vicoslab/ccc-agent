@@ -30,7 +30,7 @@ from .policy import (Change, IgnoredChange, PolicyConfig, classify,
 from .previous_commits import split_previously_committed_changes
 from .runner import finalize_session, _rewrite_review_for_permission_failures
 from .paths import is_within
-from .session import STATES, TERMINAL_STATES
+from .session import STATES, TERMINAL_STATES, is_remote_bridge
 
 # turn-check outcomes (stable strings for hook adapters and logs)
 CHECK_ALLOW = "allow"          # change set clean: finish normally
@@ -439,7 +439,8 @@ class Controller(object):
             out = session_prefix
             session_prefix = None
         out = out or sys.stdout
-        sessions = self.store.list()
+        sessions = [session for session in self.store.list()
+                    if not is_remote_bridge(session)]
         if session_prefix:
             sessions = [session for session in sessions
                         if session.session_id.startswith(session_prefix)]

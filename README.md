@@ -143,13 +143,17 @@ Interactive Codex/Claude/Hermes sessions use best-effort turn hooks. Ordinary
 workspace changes can be committed at turn boundaries; out-of-scope changes are
 kept in the branch and surfaced for review. Server-style SSH/app-server launches
 should use `ccc-agent run --serve <agent> -- ...` (the SSH router does this
-automatically): `ccc-agent` stays silent on the protocol stream, does not inject
-interactive-agent argv/env activation into the server command, commits workspace
-changes at process exit, and keeps non-workspace changes for later review. For
-server-style runtimes, distinguish the outer `ccc-agent run` containment session
-from inner agent sessions (for example a Codex app-server client session,
-Hermes gateway conversation, or Claude agent command). Hooks may register one
-current workspace per active inner agent session; when that inner session ends,
+automatically): `ccc-agent` stays silent on the protocol stream, labels true
+service records as `<agent>-remote`, does not inject interactive-agent argv/env
+activation into the server command, commits workspace changes at process exit,
+and keeps non-workspace changes for later review. With adaptive lifecycle,
+foreground bridge/proxy runs are classified as `<agent>-remote-bridge`, hidden
+from `ccc-agent list`, aborted without commit at exit, and immediately removed
+after successful cleanup. For server-style runtimes, distinguish the outer
+`ccc-agent run` containment session from inner agent sessions (for example a
+Codex app-server client session, Hermes gateway conversation, or Claude agent
+command). Hooks may register one current workspace per active inner agent
+session; when that inner session ends,
 session ends, only the workspace that hook session added is removed. If a hook
 does not run, process-exit finalization still provides the authoritative
 freeze/status/policy path.

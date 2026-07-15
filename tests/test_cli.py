@@ -259,7 +259,7 @@ class TestMainRun(unittest.TestCase):
         sid = self.h.sessions()[0]
         store = SessionStore(os.path.join(self.h.tmp, "state"))
         session = store.load(sid)
-        self.assertEqual(session.agent_kind, "codex")
+        self.assertEqual(session.agent_kind, "codex-remote")
         self.assertEqual(session.state, "pending-review")
         decisions = session.policy.get("turn_path_decisions", {})
         self.assertEqual(decisions.get("/storage/user/Projects/proj-a/artifact.txt"),
@@ -297,6 +297,27 @@ class TestMainRun(unittest.TestCase):
                          ["tool", "--lifecycle", "child-value"])
         self.assertEqual(seen[1].lifecycle, "foreground")
         self.assertEqual(seen[1].adaptive_bootstrap_seconds, 10.0)
+
+    def test_serve_labels_supported_agents_as_remote_sessions(self):
+        seen = []
+
+        def fake_run_session(config, env=None, before_finalize=None):
+            seen.append(config.agent_kind)
+            return SimpleNamespace(
+                session_id="agent-remote", workspace=config.workspace,
+                protected_roots={}, state="auto-committed", events=[],
+                exit_status=0, agent_kind=config.agent_kind, policy={})
+
+        with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
+            for agent in ("claude", "codex", "hermes"):
+                with self.subTest(agent=agent):
+                    self.assertEqual(main_run([
+                        "--config", self.h.config_path,
+                        "--serve", agent, "--", "true",
+                    ], env={}), 0)
+
+        self.assertEqual(seen, ["claude-remote", "codex-remote",
+                                "hermes-remote"])
 
     def test_run_loads_explicit_environment_removal_list(self):
         with open(self.h.config_path) as fh:
@@ -1151,6 +1172,27 @@ class TestMainCtl(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(self.h.sessions()[0], out.getvalue())
 
+    def test_list_hides_remote_bridge_sessions(self):
+        visible = self.make_session_in_state("agent-remote", "running")
+        bridge = self.make_session_in_state("agent-remote-bridge", "running")
+        store = self.store()
+        visible_session = store.load(visible)
+        visible_session.agent_kind = "claude-remote"
+        store.save(visible_session)
+        bridge_session = store.load(bridge)
+        bridge_session.agent_kind = "claude-remote-bridge"
+        store.save(bridge_session)
+
+        out = io.StringIO()
+        runtime = build_runtime(load_config(self.h.config_path, env={}))
+        controller = Controller(store=runtime[0], backend=runtime[1],
+                                alias_map=runtime[2])
+        sessions = controller.list(out=out)
+
+        self.assertEqual([session.session_id for session in sessions], [visible])
+        self.assertIn("claude-remote", out.getvalue())
+        self.assertNotIn(bridge, out.getvalue())
+
     def test_control_help_describes_subcommands(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -1915,6 +1957,14 @@ class TestShellCompletion(unittest.TestCase):
                 self.assertEqual(
                     self.complete(["ccc-agent", op, "agent-a"]),
                     ["agent-alpha"])
+
+    def test_session_completion_hides_remote_bridges(self):
+        bridge = self._make_session("agent-bridge")
+        bridge.agent_kind = "claude-remote-bridge"
+        SessionStore(os.path.join(self.h.tmp, "state")).save(bridge)
+
+        self.assertEqual(
+            self.complete(["ccc-agent", "show", "agent-bridge"]), [])
 
     def test_resume_completes_session_ids_and_options(self):
         self.assertEqual(

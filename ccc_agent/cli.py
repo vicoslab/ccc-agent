@@ -52,7 +52,7 @@ from .paths import AliasMap
 from .runner import (ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN, ENV_HOOK_SESSION,
                      ENV_HOOK_TOKEN, ENV_SESSION, ResumeError, RootSpec,
                      RunnerConfig, resume_session, run_session)
-from .session import SessionStore
+from .session import SessionStore, is_remote_bridge, remote_agent_kind
 from .turn import TurnController
 
 CONFIG_ENV = "CCC_AGENT_CONFIG"
@@ -941,10 +941,12 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     agent_group.add_argument("--agent", default=None,
                              help="agent kind label, e.g. codex, claude, hermes")
     agent_group.add_argument("--serve", metavar="AGENT",
-                             help="server-style agent label; suppress "
-                                  "ccc-agent terminal output and default to "
-                                  "committing workspace changes while keeping "
-                                  "other paths for later review")
+                             help="server-style AGENT-remote session label; "
+                                  "suppress ccc-agent terminal output and "
+                                  "default to committing workspace changes "
+                                  "while keeping other paths for later review; "
+                                  "adaptive foreground bridges are hidden and "
+                                  "discarded at exit")
     parser.add_argument("--protect-agent-state", action="store_true",
                         help="keep Codex/Hermes state and Claude Code runtime "
                              "paths inside BranchFS review instead of the "
@@ -981,7 +983,9 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
 
     env_map = os.environ if env is None else env
     server_mode = bool(args.serve) or _server_mode_from_env(env_map)
-    agent_kind = args.serve or args.agent or "command"
+    base_agent_kind = args.serve or args.agent or "command"
+    agent_kind = (remote_agent_kind(base_agent_kind)
+                  if args.serve else base_agent_kind)
 
     config = load_config(args.config, env=env)
     store, backend, alias_map, user, roots = build_runtime(config)
@@ -2094,7 +2098,8 @@ def _session_id_completions(prefix, config_path=None, env=None):
     except (OSError, ValueError):
         return []
     return sorted(session.session_id for session in sessions
-                  if session.session_id.startswith(prefix))
+                  if (not is_remote_bridge(session) and
+                      session.session_id.startswith(prefix)))
 
 
 def _complete_words(words, cword, env=None):
