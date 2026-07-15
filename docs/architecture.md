@@ -60,15 +60,28 @@ is preserved and the session becomes `failed` or `pending-review` for recovery.
 
 ### Agent-facing MCP admission
 
-For direct Claude/Codex bwrap launches, the client starts the bundled stdio MCP
-server before model work. The supervisor uses Unix `SO_PEERCRED`, then pins the
-first eligible persistent connection to MCP PID/start-time, direct parent client
-PID/start-time, and ancestry under the launched bwrap PID. A shell-parented MCP
-process and unsupported server-wrapper topology fail closed. Ordinary
-`turn-resolve`/`turn-approve` connections are rejected; lifecycle hook calls are
-unchanged. This is Linux process-bound admission for ordinary untrusted tool
-subprocesses under procfs/ptrace isolation, not cryptographic process
-attestation. See [Agent integration](agent-integration.md#mcp-process-admission).
+For direct Claude/Codex bwrap launches, the trusted namespace PID-1 runner
+registers the exact initial client PID/start-time immediately after spawning it
+and before waiting for agent work. Registration is accepted only from that
+launch's PID 1 and resolves its direct child through host `/proc` plus `NSpid`.
+The client then starts the bundled stdio MCP server. The supervisor uses Unix
+`SO_PEERCRED` and admits only an MCP process whose direct parent is that exact
+registered client; a later descendant merely naming itself `claude`/`codex`
+cannot become eligible. The first eligible persistent connection is pinned to
+MCP PID/start-time and client PID/start-time. Unsupported server-wrapper
+topologies fail closed. Process identity alone is not commit authority: setup
+also installs a root-owned client preload
+that makes the trusted client/MCP processes non-dumpable and their transports
+close-on-exec. The supervisor probes that `/proc/<pid>/fd` is inaccessible for
+both processes before enabling destructive MCP operations. Without this verified
+transport boundary, status remains available but commit/discard returns pending
+external approval. Ordinary `turn-resolve`/`turn-approve` connections are
+rejected; lifecycle hook calls are unchanged. This is Linux process-bound
+authorization, not cryptographic process attestation. See the complete
+[trusted MCP commit protocol](trusted-mcp-commit-protocol.md) for the trust
+chain, exact checks, spoofing analysis, failure behavior, assumptions, and
+implementation map; [Agent integration](agent-integration.md#mcp-process-and-transport-admission)
+covers the user-facing integration.
 
 ## Sandbox layout in `bwrap` mode
 

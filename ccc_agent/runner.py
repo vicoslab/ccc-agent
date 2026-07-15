@@ -14,6 +14,8 @@ commit decision, and the agent process never does.
 """
 
 import binascii
+import hashlib
+import hmac
 import json
 import os
 import selectors
@@ -50,6 +52,9 @@ ENV_LIFECYCLE_SOCKET = "CCC_AGENT_LIFECYCLE_SOCKET"
 ENV_BOOTSTRAP_SECONDS = "CCC_AGENT_BOOTSTRAP_SECONDS"
 ENV_STABILITY_SECONDS = "CCC_AGENT_STABILITY_SECONDS"
 ENV_DETACH_SECONDS = "CCC_AGENT_DETACH_SECONDS"
+ENV_HARDEN_CLIENT = "CCC_AGENT_HARDEN_CLIENT"
+ENV_MCP_REGISTER_CLIENT = "CCC_AGENT_MCP_REGISTER_CLIENT"
+ENV_CLIENT_PRELOAD = "CCC_AGENT_CLIENT_PRELOAD"
 
 # Values from an enclosing/stale ccc-agent session must never become authority in
 # a new session.  Remove them before assigning this launch's fresh identity and
@@ -60,6 +65,7 @@ TRANSIENT_INTERNAL_ENV = (
     ENV_SESSION, ENV_STATE_DIR, ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN,
     ENV_HOOK_TOKEN, ENV_HOOK_SESSION, ENV_LIFECYCLE_SOCKET,
     ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
+    ENV_HARDEN_CLIENT, ENV_MCP_REGISTER_CLIENT, ENV_CLIENT_PRELOAD,
 )
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -72,6 +78,7 @@ SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 SANDBOX_LIFECYCLE_SOCK = "/tmp/ccc-agent/lifecycle.sock"
 SANDBOX_ADAPTIVE_RUNNER = "/tmp/ccc-agent/adaptive_pid1.py"
 SANDBOX_SESSION_ENV = "/tmp/ccc-agent/session-env.json"
+SANDBOX_HARDENING_LIBRARY = "/opt/ccc-agent/libccc-client-hardening.so"
 
 # Run the sandbox command under a tiny PID-1 lifecycle wrapper.  Without this,
 # bubblewrap's default PID-1 reaper keeps the namespace alive until every helper
@@ -84,7 +91,10 @@ SANDBOX_SESSION_ENV = "/tmp/ccc-agent/session-env.json"
 BWRAP_AGENT_RUNNER_ARG0 = "ccc-agent-runner"
 BWRAP_AGENT_RUNNER = r"""
 import errno
+import json
+import os
 import signal
+import socket
 import subprocess
 import sys
 
@@ -113,12 +123,54 @@ def restore_child_signals():
     set_signal(signal.SIGHUP, signal.SIG_DFL)
 
 
+def register_initial_client(pid):
+    if os.environ.get("CCC_AGENT_MCP_REGISTER_CLIENT") != "1":
+        return
+    path = os.environ.get("CCC_AGENT_CONTROL_SOCK")
+    token = os.environ.get("CCC_AGENT_CONTROL_TOKEN")
+    if not path or not token:
+        raise RuntimeError("missing CCC control registration environment")
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(5.0)
+        conn.connect(path)
+        request = {"op": "mcp-register-client", "token": token,
+                   "pid": int(pid)}
+        conn.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+        data = b""
+        while b"\n" not in data and len(data) <= 65536:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        response = json.loads(data.split(b"\n", 1)[0].decode())
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error") or "registration rejected")
+    finally:
+        conn.close()
+
+
+client_env = None
+client_preload = os.environ.pop("CCC_AGENT_CLIENT_PRELOAD", None)
+if client_preload:
+    client_env = os.environ.copy()
+    client_env["LD_PRELOAD"] = client_preload
+    client_env["CCC_AGENT_HARDEN_CLIENT"] = "1"
+
+
 try:
-    child = subprocess.Popen(command, preexec_fn=restore_child_signals)
+    child = subprocess.Popen(command, preexec_fn=restore_child_signals,
+                             env=client_env)
 except OSError as exc:
     print("ccc-agent-runner: failed to exec %s: %s" % (command[0], exc),
           file=sys.stderr)
     sys.exit(127 if exc.errno == errno.ENOENT else 126)
+
+try:
+    register_initial_client(child.pid)
+except Exception as exc:
+    print("ccc-agent-runner: initial MCP client registration unavailable: %s" % exc,
+          file=sys.stderr)
 
 
 def forward_signal(sig, _frame):
@@ -192,7 +244,8 @@ class RunnerConfig(object):
                  server_mode=False, lifecycle="foreground",
                  adaptive_bootstrap_seconds=10.0,
                  adaptive_stability_seconds=0.2,
-                 adaptive_detach_seconds=2.0):
+                 adaptive_detach_seconds=2.0,
+                 mcp_client_hardening_library=None):
         self.store = store              # SessionStore
         self.backend = backend          # BranchfsCli or FakeBranchFS
         self.alias_map = alias_map
@@ -278,6 +331,9 @@ class RunnerConfig(object):
         self.ensure_agent_state_dirs = bool(ensure_agent_state_dirs)
         self.on_session_start = on_session_start
         self.server_mode = bool(server_mode)
+        self.mcp_client_hardening_library = (
+            os.path.abspath(str(mcp_client_hardening_library))
+            if mcp_client_hardening_library else None)
         if lifecycle not in LIFECYCLE_MODES:
             raise ValueError("unknown lifecycle %r (expected one of %s)"
                              % (lifecycle, ", ".join(LIFECYCLE_MODES)))
@@ -661,6 +717,56 @@ def _mcp_admission_config(config):
     return ((recognized or "__unsupported_ccc_mcp_client__",), supported)
 
 
+def _secure_root_owned_path(path, agent_uid):
+    if not path or not os.path.isabs(path):
+        return False
+    current = os.path.abspath(path)
+    try:
+        while True:
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode):
+                return False
+            if info.st_uid == agent_uid or info.st_mode & 0o022:
+                return False
+            if current == "/":
+                break
+            current = os.path.dirname(current)
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _secure_hardening_library(path, agent_uid=None):
+    """Verify immutable ownership and the system-setup digest manifest."""
+    if not path or not os.path.isabs(path):
+        return False
+    agent_uid = os.getuid() if agent_uid is None else int(agent_uid)
+    manifest = path + ".sha256"
+    if not (_secure_root_owned_path(path, agent_uid) and
+            _secure_root_owned_path(manifest, agent_uid)):
+        return False
+    try:
+        with open(manifest) as fh:
+            expected = fh.read().strip().split()[0]
+        if len(expected) != 64:
+            return False
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return hmac.compare_digest(expected.lower(), digest.hexdigest())
+    except (OSError, IndexError, ValueError):
+        return False
+
+
+def _mcp_client_hardening(config):
+    path = config.mcp_client_hardening_library
+    agent_uid = (config.bwrap_uid if config.bwrap_uid is not None
+                 else os.getuid())
+    _expected, supported = _mcp_admission_config(config)
+    return path if supported and _secure_hardening_library(path, agent_uid) else None
+
+
 def _add_runtime_state_ignores(session, config, ignore, relpaths):
     home = "/home/%s" % config.owner
     for relpath in relpaths:
@@ -1003,6 +1109,16 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
     plugin_spec = _matched_agent_plugin(config)
     _append_agent_plugin_binds(argv, plugin_spec)
 
+    _expected_mcp, direct_mcp_client = _mcp_admission_config(config)
+    if direct_mcp_client:
+        argv += ["--setenv", ENV_MCP_REGISTER_CLIENT, "1"]
+
+    hardening_library = _mcp_client_hardening(config)
+    if hardening_library is not None:
+        argv += ["--ro-bind", hardening_library, SANDBOX_HARDENING_LIBRARY,
+                 "--setenv", ENV_CLIENT_PRELOAD,
+                 SANDBOX_HARDENING_LIBRARY]
+
     # Per-turn control socket: bind the host socket to a fixed in-sandbox path
     # so hooks can signal the supervisor.  `control` is (host_sock, token,
     # hook_token) or None.
@@ -1128,6 +1244,13 @@ def _bwrap_process_env(run_env, config, session):
             sandbox_env[str(key)] = str(value)
     for key, value in sorted(config.bwrap_setenv.items()):
         sandbox_env[str(key)] = str(value)
+    _expected_mcp, direct_mcp_client = _mcp_admission_config(config)
+    if direct_mcp_client:
+        # Never let invocation-controlled preload state enter the trusted client.
+        # The verified library is assigned by bwrap only after its read-only bind
+        # exists inside the completed sandbox.
+        sandbox_env.pop("LD_PRELOAD", None)
+        sandbox_env.pop(ENV_HARDEN_CLIENT, None)
     return sandbox_env
 
 

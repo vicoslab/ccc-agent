@@ -16,7 +16,7 @@ from ccc_agent.control import (VERDICT_COMMITTED, VERDICT_DISCARDED,
                                VERDICT_HELD, VERDICT_NEEDS_APPROVAL,
                                VERDICT_NOOP)
 from ccc_agent.paths import AliasMap
-from ccc_agent.runner import RootSpec
+from ccc_agent.runner import RootSpec, finalize_session
 from ccc_agent.session import SessionStore
 from ccc_agent.turn import TurnController
 
@@ -410,6 +410,34 @@ class TestTurnController(unittest.TestCase):
         self.assertEqual(review["verdict"], "needs-kept-review")
         self.assertEqual(review["kept"], ["/storage/user/escape.txt"])
         self.assertIn("ccc_list_kept", review["message"])
+
+    def test_approved_abort_request_switches_session_to_throwaway_at_exit(self):
+        self.h.write("Projects/proj-a/must-not-commit.txt", "x")
+        response = self.h.tc.request_abort()
+        stop = self.h.tc.finalize_turn(default_keep=True)
+        review = self.h.tc.review_kept()
+
+        self.assertEqual(response["verdict"], "abort-requested")
+        self.assertEqual(response["apply"], "process-exit")
+        self.assertTrue(stop["abort_requested"])
+        self.assertEqual(stop["committed"], [])
+        self.assertTrue(review["abort_requested"])
+        self.assertEqual(review["verdict"], VERDICT_NOOP)
+        self.assertFalse(self.h.base_has("Projects/proj-a/must-not-commit.txt"))
+        persisted = self.h.store.load(self.h.session.session_id)
+        self.assertEqual(persisted.policy["mode"], "throwaway")
+        self.assertTrue(persisted.policy["mcp_abort_requested"])
+
+        self.h.session.transition("mounting")
+        self.h.session.transition("running")
+        self.h.session.transition("finalizing")
+        self.h.store.save(self.h.session)
+        finalize_session(self.h.session, self.h.store, self.h.backend,
+                         self.h.alias)
+        closed = self.h.store.load(self.h.session.session_id)
+        self.assertEqual(closed.state, "aborted")
+        self.assertEqual(self.h.backend.status(self.h.root), [])
+        self.assertFalse(self.h.base_has("Projects/proj-a/must-not-commit.txt"))
 
     def test_granular_approval_can_commit_discard_and_keep_paths(self):
         self.h.write("commit-me.txt", "a")

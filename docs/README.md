@@ -26,6 +26,10 @@ development/validation procedures.
 
 - [Architecture](architecture.md) — trust split, lifecycle, sandbox layout,
   BranchFS/FUSE plumbing, review artifacts, and limits.
+- [Trusted MCP commit protocol](trusted-mcp-commit-protocol.md) — exact-client
+  registration, process/connection pinning, transport hardening, human
+  elicitation, supervisor commit signaling, spoofing defenses, and fail-closed
+  behavior.
 - [Design decisions](design-decisions.md) — why BranchFS, why rootless bwrap, why
   process-exit finalization remains authoritative, why hooks are best-effort, and
   other selected tradeoffs.

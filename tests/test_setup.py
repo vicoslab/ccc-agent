@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -148,6 +149,39 @@ class TestCondaShimActivation(unittest.TestCase):
 
 
 class TestSetupConfig(unittest.TestCase):
+    def test_client_hardening_source_builds_and_blocks_parent_fd_theft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = os.path.join(tmp, "libccc-client-hardening.so")
+            built = setup_mod.build_mcp_client_hardening(library)
+            self.assertEqual(built, library)
+            self.assertTrue(os.path.isfile(library))
+            self.assertTrue(os.path.isfile(library + ".sha256"))
+
+            probe = """import os, subprocess, sys
+r, w = os.pipe()
+child = '''import os, sys
+try:
+    os.open('/proc/%d/fd/%d' % (os.getppid(), int(sys.argv[1])), os.O_WRONLY)
+except OSError as exc:
+    print(exc.errno)
+    raise SystemExit(0)
+raise SystemExit(2)
+'''
+proc = subprocess.run([sys.executable, '-c', child, str(w)],
+                      stdout=subprocess.PIPE, text=True)
+print('inheritable=%s child_rc=%d errno=%s' %
+      (os.get_inheritable(w), proc.returncode, proc.stdout.strip()))
+raise SystemExit(proc.returncode)
+"""
+            env = dict(os.environ, CCC_AGENT_HARDEN_CLIENT="1",
+                       LD_PRELOAD=library)
+            proc = subprocess.run([sys.executable, "-c", probe], env=env,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("inheritable=False", proc.stdout)
+            self.assertIn("errno=13", proc.stdout)
+
     def test_setup_prefers_packaged_vicoslab_branchfs_when_available(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
@@ -338,6 +372,15 @@ class TestSetupConfig(unittest.TestCase):
             self.assertIn("safe to leave enabled", codex_toml)
             self.assertIn('plugins."ccc@ccc-agent".enabled = true',
                           codex_toml)
+            for tool in ("ccc_commit_kept", "ccc_discard_kept",
+                         "ccc_abort_session"):
+                self.assertIn(
+                    'plugins."ccc@ccc-agent".mcp_servers.ccc.tools.%s.approval_mode = "prompt"'
+                    % tool, codex_toml)
+            for tool in ("ccc_status", "ccc_list_kept", "ccc_keep_kept"):
+                self.assertIn(
+                    'plugins."ccc@ccc-agent".mcp_servers.ccc.tools.%s.approval_mode = "approve"'
+                    % tool, codex_toml)
             self.assertIn("Trust only the bundled CCC hooks", codex_toml)
             for key, trusted_hash in setup_mod.CODEX_HOOK_TRUSTED_HASHES:
                 self.assertIn('hooks.state."%s".trusted_hash = "%s"'
@@ -361,6 +404,7 @@ class TestSetupConfig(unittest.TestCase):
 
             with open(config_path) as fh:
                 cfg = json.load(fh)
+            self.assertNotIn("mcp_client_hardening_library", cfg)
             self.assertEqual(cfg["agent_hook_mode"], "plugins")
             self.assertEqual(sorted(cfg["agent_plugins"]), ["claude", "codex"])
             src = cfg["agent_plugins"]["codex"]["src"]
@@ -415,6 +459,8 @@ class TestSetupConfig(unittest.TestCase):
                     {"enabledPlugins": {"ccc@ccc-agent": True}})
             with open(config_path) as fh:
                 cfg = json.load(fh)
+            self.assertTrue(os.path.isfile(
+                cfg["mcp_client_hardening_library"]))
             self.assertEqual(cfg["agent_plugins"]["claude"]["src"], claude_seed)
             self.assertEqual(
                 cfg["agent_plugins"]["claude"]["setenv"],

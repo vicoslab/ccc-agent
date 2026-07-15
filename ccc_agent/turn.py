@@ -391,6 +391,15 @@ class TurnController(object):
     # -- control ops -------------------------------------------------------
     def finalize_turn(self, default_keep=False):
         with self._lock:
+            if self.session.policy.get("mcp_abort_requested"):
+                paths = sorted({change.path for change in self._live_changes()})
+                kept = self._keep_paths(paths)
+                self.session.add_event(
+                    "turn-held-for-abort",
+                    "%d path(s) awaiting process-exit abort" % len(kept))
+                self.store.save(self.session)
+                return {"verdict": VERDICT_HELD, "abort_requested": True,
+                        "committed": [], "kept": kept, "held": kept}
             # No freeze/thaw: the hook calls this synchronously at a Stop while
             # the agent is idle, so there are no concurrent writes — and
             # freezing a branch under its live FUSE mount invalidates the
@@ -551,6 +560,11 @@ class TurnController(object):
     def review_kept(self):
         """Final/idle check: ask the user only if kept paths still exist."""
         with self._lock:
+            if self.session.policy.get("mcp_abort_requested"):
+                return {"verdict": VERDICT_NOOP, "abort_requested": True,
+                        "kept": [], "stale": [],
+                        "message": "Session abort is approved; exit the agent "
+                                   "so process-exit finalization can discard it."}
             kept, stale = self._kept_path_view()
             if not kept:
                 return {"verdict": VERDICT_NOOP, "kept": [], "stale": stale,
@@ -717,6 +731,22 @@ class TurnController(object):
                         "held": kept}
             raise ValueError("unknown turn decision %r" % decision)
 
+    def request_abort(self):
+        """Record an approved whole-session abort for authoritative finalization.
+
+        The live mount remains intact until the client exits; process-exit
+        finalization evaluates throwaway mode, unmounts, and aborts every branch.
+        """
+        with self._lock:
+            self.session.policy["mode"] = "throwaway"
+            self.session.policy["mcp_abort_requested"] = True
+            self.session.add_event(
+                "mcp-abort-requested",
+                "approved abort will discard the branch at process exit")
+            self.store.save(self.session)
+            return {"verdict": "abort-requested", "apply": "process-exit",
+                    "message": "Exit the agent to discard all session changes."}
+
     # -- ControlServer entrypoint -----------------------------------------
     def handle(self, request):
         op = request.get("op")
@@ -733,6 +763,8 @@ class TurnController(object):
         if op == "turn-resolve":
             return self.resolve_turn(request.get("decision", "keep"),
                                      request.get("paths"))
+        if op == "turn-request-abort":
+            return self.request_abort()
         if op == "turn-kept-status":
             return self.kept_status()
         if op == "turn-review-kept":

@@ -5,12 +5,14 @@ import json
 import os
 import sys
 
-from .control import ControlError, MCPControlClient, peer_credentials
+from .control import (ControlError, MCPControlClient,
+                      peer_credentials as peer_credentials)
 from .runner import ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "ccc-agent", "version": "1"}
-DESTRUCTIVE = frozenset(("ccc_commit_kept", "ccc_discard_kept"))
+DESTRUCTIVE = frozenset(("ccc_commit_kept", "ccc_discard_kept",
+                         "ccc_abort_session"))
 
 
 def _tool(name, description, properties=None, required=(), destructive=False):
@@ -56,6 +58,10 @@ TOOLS = (
     _tool("ccc_keep_kept",
           "Keep selected currently kept paths in BranchFS for later review.",
           PATHS_PROPERTY),
+    _tool("ccc_abort_session",
+          "After human confirmation, discard every still-live branch change at "
+          "process exit; already committed earlier turns are unaffected.",
+          destructive=True),
 )
 
 
@@ -68,6 +74,8 @@ class MCPServer(object):
         self.capabilities = {}
         self.initialized = False
         self._elicitation_id = 0
+        self.destructive_authorized = False
+        self.authorization_reason = "MCP admission has not completed"
 
     def _write(self, message):
         self.writer.write(json.dumps(message, separators=(",", ":")) + "\n")
@@ -163,6 +171,23 @@ class MCPServer(object):
             status = self.control.kept_status()
             kept = list(status.get("kept") or [])
             return self._tool_result({"kept": kept, "count": len(kept)})
+        if name == "ccc_abort_session":
+            if not self.destructive_authorized:
+                return self._tool_result({
+                    "verdict": "pending-external-approval",
+                    "action": "abort-session",
+                    "paths": [],
+                    "reason": self.authorization_reason,
+                })
+            accepted, reason = self._elicit(
+                "abort remaining session branch",
+                ["all still-live BranchFS changes "
+                 "(earlier committed turns are unaffected)"])
+            if not accepted:
+                return self._tool_result({"error": reason,
+                                          "verdict": "not-authorized"},
+                                         error=True)
+            return self._tool_result(self.control.request_abort())
         decisions = {"ccc_commit_kept": "commit",
                      "ccc_discard_kept": "discard",
                      "ccc_keep_kept": "keep"}
@@ -173,6 +198,13 @@ class MCPServer(object):
             return self._tool_result({"verdict": "noop", "paths": []})
         decision = decisions[name]
         if name in DESTRUCTIVE:
+            if not self.destructive_authorized:
+                return self._tool_result({
+                    "verdict": "pending-external-approval",
+                    "action": decision,
+                    "paths": paths,
+                    "reason": self.authorization_reason,
+                })
             accepted, reason = self._elicit(decision, paths)
             if not accepted:
                 return self._tool_result({"error": reason,
@@ -187,7 +219,11 @@ class MCPServer(object):
             params = request.get("params") or {}
             self.capabilities = params.get("capabilities") or {}
             # Admission happens before tools are advertised/model work begins.
-            self.control.admit(self.client)
+            admission = self.control.admit(self.client)
+            self.destructive_authorized = bool(
+                admission.get("destructive_authorized"))
+            self.authorization_reason = (admission.get("authorization_reason") or
+                                         "trusted client transport is not hardened")
             self.initialized = True
             self._response(req_id, {
                 "protocolVersion": PROTOCOL_VERSION,
@@ -195,9 +231,11 @@ class MCPServer(object):
                 "serverInfo": SERVER_INFO,
                 "instructions": (
                     "Use ccc_status/list_kept for contained-path state. "
-                    "Commit/discard always requires nested human elicitation; "
-                    "keep is non-destructive. At end of turn do not interrupt "
-                    "active work; inspect kept paths only when finished/idling."
+                    "Commit/discard/abort require hardened transport and nested "
+                    "human elicitation; otherwise they remain pending external "
+                    "review. Keep is non-destructive. At end of turn do not "
+                    "interrupt active work; inspect kept paths only when "
+                    "finished/idling."
                 ),
             })
             return

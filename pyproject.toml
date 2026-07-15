@@ -34,6 +34,7 @@ version = { attr = "ccc_agent.__version__" }
     "assets/hooks/*.sh",
     "assets/shims/*.sh",
     "assets/scripts/*.sh",
+    "assets/security/*.c",
     "assets/completions/bash/ccc-agent",
     "assets/completions/zsh/_ccc-agent",
     "assets/completions/fish/ccc-agent.fish",

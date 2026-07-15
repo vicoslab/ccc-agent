@@ -23,7 +23,8 @@ VERDICT_NEEDS_KEPT_REVIEW = "needs-kept-review"
 VERDICT_WORKSPACE_UPDATED = "workspace-updated"
 
 WORKSPACE_HOOK_OPS = frozenset(("turn-add-workspace", "turn-remove-workspace"))
-MCP_ONLY_OPS = frozenset(("turn-approve", "turn-resolve"))
+MCP_ONLY_OPS = frozenset(("turn-approve", "turn-resolve",
+                          "turn-request-abort"))
 
 
 class ControlError(Exception):
@@ -67,11 +68,57 @@ def _proc_identity(pid):
         with open("/proc/%d/cmdline" % pid, "rb") as fh:
             argv = [part.decode("utf-8", "surrogateescape")
                     for part in fh.read().split(b"\0") if part]
-        exe = os.readlink("/proc/%d/exe" % pid)
     except (OSError, ValueError, IndexError):
         return None
+    try:
+        exe = os.readlink("/proc/%d/exe" % pid)
+    except OSError:
+        # PR_SET_DUMPABLE=0 intentionally hides this symlink from same-uid
+        # outsiders. cmdline/stat remain readable and the launch ancestry is
+        # independently pinned by the trusted supervisor.
+        exe = ""
     return {"pid": pid, "ppid": ppid, "start_time": start_time,
             "argv": argv, "exe": exe}
+
+
+def _proc_fds_hidden(pid):
+    """Whether same-uid outsiders are denied this process's descriptor table."""
+    try:
+        os.listdir("/proc/%d/fd" % int(pid))
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _proc_namespace_pids(pid):
+    try:
+        with open("/proc/%d/status" % int(pid)) as fh:
+            for line in fh:
+                if line.startswith("NSpid:"):
+                    return tuple(int(value) for value in line.split()[1:])
+    except (OSError, ValueError):
+        return ()
+    return (int(pid),)
+
+
+def _registered_child_host_pid(parent_pid, child_namespace_pid):
+    """Resolve a runner-reported namespace PID to its direct host child."""
+    try:
+        path = "/proc/%d/task/%d/children" % (int(parent_pid), int(parent_pid))
+        with open(path) as fh:
+            children = [int(value) for value in fh.read().split()]
+    except (OSError, ValueError):
+        return None
+    matches = []
+    for child_pid in children:
+        identity = _proc_identity(child_pid)
+        namespace_pids = _proc_namespace_pids(child_pid)
+        if (identity and identity["ppid"] == int(parent_pid) and
+                int(child_namespace_pid) in namespace_pids):
+            matches.append(child_pid)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _process_matches(identity, expected):
@@ -103,10 +150,10 @@ class ControlServer(object):
     """Supervisor-side Unix control socket.
 
     ``expected_clients`` is a set of official agent executable/cmdline basenames.
-    Production runners also call :meth:`set_launch_process`; an MCP server is
-    eligible only when its direct parent matches one of those clients and that
-    client is beneath the launched bwrap process.  The first eligible connection
-    is pinned to MCP PID/start-time plus client PID/start-time.
+    Production runners call :meth:`set_launch_process`, then namespace PID 1
+    registers its exact initial direct child. An MCP server is eligible only
+    when that registered client is its direct parent. The first eligible
+    connection is pinned to MCP PID/start-time plus client PID/start-time.
     """
 
     def __init__(self, socket_path, handler, token, hook_token=None,
@@ -127,8 +174,10 @@ class ControlServer(object):
         self._launch_start_time = None
         self._launch_supported = False
         self._launch_ready = threading.Condition()
+        self._registered_client_fingerprint = None
         self._mcp_fingerprint = None
         self._mcp_conn = None
+        self._mcp_destructive_authorized = False
         self._admission_lock = threading.Lock()
 
     def start(self):
@@ -180,29 +229,71 @@ class ControlServer(object):
             threading.Thread(target=self._handle_conn, args=(conn,),
                              daemon=True).start()
 
+    def _register_initial_client(self, conn, child_namespace_pid):
+        try:
+            runner_pid, uid, _gid = peer_credentials(conn)
+            child_namespace_pid = int(child_namespace_pid)
+        except (ControlError, TypeError, ValueError) as exc:
+            return {"ok": False, "error": "invalid client registration: %s" % exc}
+        if uid != os.geteuid():
+            return {"ok": False, "error": "runner uid is not the supervisor uid"}
+        if not self._wait_for_launch() or not self._launch_supported:
+            return {"ok": False, "error": "launch boundary is unavailable"}
+        launch = _proc_identity(self._launch_pid)
+        runner = _proc_identity(runner_pid)
+        runner_nspids = _proc_namespace_pids(runner_pid)
+        if (launch is None or launch["start_time"] != self._launch_start_time or
+                runner is None or not runner_nspids or runner_nspids[-1] != 1 or
+                not _is_descendant(runner_pid, self._launch_pid)):
+            return {"ok": False, "error": "registration peer is not trusted PID 1"}
+        child_pid = _registered_child_host_pid(runner_pid, child_namespace_pid)
+        child = _proc_identity(child_pid) if child_pid is not None else None
+        if child is None or not _process_matches(child, self.expected_clients):
+            return {"ok": False, "error": "registered child is not the expected client"}
+        fingerprint = (child["pid"], child["start_time"])
+        with self._launch_ready:
+            if (self._registered_client_fingerprint is not None and
+                    self._registered_client_fingerprint != fingerprint):
+                return {"ok": False, "error": "initial client is already registered"}
+            self._registered_client_fingerprint = fingerprint
+            self._launch_ready.notify_all()
+        return {"ok": True, "registered": True}
+
     def _eligible_mcp_peer(self, peer_pid):
         peer = _proc_identity(peer_pid)
         if peer is None or not self.expected_clients:
             return None
-        parent = _proc_identity(peer["ppid"])
-        # This direct-parent check is what rejects `bash -c ccc-agent mcp-server`.
-        if _process_matches(parent, self.expected_clients):
-            client = parent
-        elif (not self.require_launch_boundary and
-              _process_matches(peer, self.expected_clients)):
-            # Explicit unit-test mode permits an in-process MCP client.
-            client = peer
-        else:
-            return None
         if self.require_launch_boundary:
             if not self._wait_for_launch() or not self._launch_supported:
                 return None
-            launch = _proc_identity(self._launch_pid)
-            if (launch is None or launch["start_time"] != self._launch_start_time or
-                    not _is_descendant(client["pid"], self._launch_pid)):
+            with self._launch_ready:
+                if self._registered_client_fingerprint is None:
+                    self._launch_ready.wait(timeout=2.0)
+                registered = self._registered_client_fingerprint
+            if registered is None:
                 return None
-        return (peer["pid"], peer["start_time"],
-                client["pid"], client["start_time"])
+            client = _proc_identity(registered[0])
+            if (client is None or client["start_time"] != registered[1] or
+                    peer["ppid"] != client["pid"]):
+                return None
+        else:
+            parent = _proc_identity(peer["ppid"])
+            if _process_matches(parent, self.expected_clients):
+                client = parent
+            elif _process_matches(peer, self.expected_clients):
+                # Explicit unit-test mode permits an in-process MCP client.
+                client = peer
+            else:
+                return None
+        hardened = (_proc_fds_hidden(peer["pid"]) and
+                    _proc_fds_hidden(client["pid"]))
+        return {
+            "fingerprint": (peer["pid"], peer["start_time"],
+                            client["pid"], client["start_time"]),
+            "destructive_authorized": hardened,
+            "authorization_reason": (None if hardened else
+                                     "trusted client/MCP descriptor access is not hidden"),
+        }
 
     def _admit_mcp(self, conn):
         try:
@@ -211,17 +302,21 @@ class ControlServer(object):
             return {"ok": False, "error": str(exc)}
         if uid != os.geteuid():
             return {"ok": False, "error": "MCP peer uid is not the supervisor uid"}
-        fingerprint = self._eligible_mcp_peer(pid)
-        if fingerprint is None:
+        eligibility = self._eligible_mcp_peer(pid)
+        if eligibility is None:
             return {"ok": False,
                     "error": "MCP peer is not the eligible official client child"}
         with self._admission_lock:
             if self._mcp_fingerprint is not None:
                 return {"ok": False,
                         "error": "an MCP process/connection is already pinned"}
-            self._mcp_fingerprint = fingerprint
+            self._mcp_fingerprint = eligibility["fingerprint"]
             self._mcp_conn = conn
-        return {"ok": True, "admitted": True}
+            self._mcp_destructive_authorized = bool(
+                eligibility["destructive_authorized"])
+        return {"ok": True, "admitted": True,
+                "destructive_authorized": self._mcp_destructive_authorized,
+                "authorization_reason": eligibility["authorization_reason"]}
 
     def _mcp_connection_valid(self, conn):
         with self._admission_lock:
@@ -232,9 +327,16 @@ class ControlServer(object):
         peer_pid, peer_start, client_pid, client_start = fingerprint
         peer = _proc_identity(peer_pid)
         client = _proc_identity(client_pid)
-        return bool(peer and client and peer["start_time"] == peer_start and
-                    client["start_time"] == client_start and
-                    (peer_pid == client_pid or peer["ppid"] == client_pid))
+        identity_valid = bool(
+            peer and client and peer["start_time"] == peer_start and
+            client["start_time"] == client_start and
+            (peer_pid == client_pid or peer["ppid"] == client_pid))
+        if not identity_valid:
+            return False
+        if self._mcp_destructive_authorized:
+            return (_proc_fds_hidden(peer_pid) and
+                    _proc_fds_hidden(client_pid))
+        return True
 
     def _handle_conn(self, conn):
         try:
@@ -249,6 +351,10 @@ class ControlServer(object):
                 if req.get("token") != self.token:
                     _send_line(conn, {"ok": False, "error": "unauthorized"})
                     return
+                if req.get("op") == "mcp-register-client":
+                    resp = self._register_initial_client(conn, req.get("pid"))
+                    _send_line(conn, resp)
+                    return
                 if req.get("op") == "mcp-admit":
                     resp = self._admit_mcp(conn)
                     _send_line(conn, resp)
@@ -261,6 +367,15 @@ class ControlServer(object):
                     _send_line(conn, {"ok": False,
                                       "error": "operation requires the pinned MCP connection"})
                     return
+                if (req.get("op") in MCP_ONLY_OPS and
+                        self.enforce_mcp_admission and
+                        (req.get("op") == "turn-request-abort" or
+                         req.get("decision") in ("commit", "discard", "revert",
+                                                 "yes", "select")) and
+                        not self._mcp_destructive_authorized):
+                    _send_line(conn, {"ok": False,
+                                      "error": "destructive MCP operation requires hardened client transport"})
+                    continue
                 if self._mcp_conn is conn and not self._mcp_connection_valid(conn):
                     _send_line(conn, {"ok": False,
                                       "error": "pinned MCP process identity changed"})
@@ -405,6 +520,9 @@ class MCPControlClient(ControlClient):
 
     def admit(self, client):
         return self._request({"op": "mcp-admit", "client": str(client)})
+
+    def request_abort(self):
+        return self._request({"op": "turn-request-abort"})
 
     def close(self):
         try:

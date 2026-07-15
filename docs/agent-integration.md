@@ -197,6 +197,7 @@ ccc_list_kept
 ccc_commit_kept
 ccc_discard_kept
 ccc_keep_kept
+ccc_abort_session
 ```
 
 The four protected user-operation skills (`ccc`, `ccc-status`, `ccc-commit`, and
@@ -205,40 +206,70 @@ Lifecycle hooks are retained. Codex deployments must keep per-tool prompting for
 `mcp__ccc__*` enabled and must not add a blanket allow rule. Claude's destructive
 tools carry `anthropic/requiresUserInteraction` metadata.
 
-`ccc_commit_kept` and `ccc_discard_kept` send a nested MCP form-mode
-`elicitation/create` request on the same connection. No advertised elicitation
-capability, an MCP error, malformed content, decline, cancel, EOF, or anything
-other than `action=accept` plus `confirm=true` fails closed. Every resolution is
-restricted to the supervisor's current remembered-kept path set. The old
-`turn-resolve` and `turn-approve` CLI protocol verbs remain for compatibility,
-but the production supervisor admits their mutating operations only on the
-pinned MCP connection; ordinary agent tool subprocesses cannot exercise them.
+`ccc_commit_kept`, `ccc_discard_kept`, and `ccc_abort_session` send a
+nested MCP form-mode `elicitation/create` request on the same connection **only
+after** transport hardening is verified. Abort records throwaway policy and is
+applied by authoritative process-exit finalization rather than tearing down the
+live mount; the client should exit after an accepted abort. No advertised
+elicitation capability, an MCP error,
+malformed content, decline, cancel, EOF, or anything other than
+`action=accept` plus `confirm=true` fails closed. Every resolution is restricted
+to the supervisor's current remembered-kept path set. If hardening is absent,
+the tool returns `pending-external-approval` and does not open an elicitation or
+apply data; resolution remains available through trusted external session
+review. The old `turn-resolve` and `turn-approve` CLI protocol verbs remain for
+compatibility, but the production supervisor admits their mutating operations
+only on the pinned, destructively-authorized MCP connection.
 
-## MCP process admission
+## MCP process and transport admission
+
+This section is the operational summary. The complete security protocol,
+including trust boundaries, exact registration/admission checks, human
+elicitation, supervisor signaling, spoofing defenses, failure behavior,
+assumptions, implementation map, and review checklist, is documented in
+[Trusted MCP commit protocol](trusted-mcp-commit-protocol.md).
 
 The supervisor authenticates the Unix control peer with Linux `SO_PEERCRED`; it
-does not trust environment claims or a token by itself. Before tools are
-advertised/model work starts, the first eligible stdio MCP process opens one
-persistent control connection. The supervisor pins that connection to:
+does not trust environment claims or a token by itself. The trusted namespace
+PID-1 runner registers the exact initial Claude/Codex child immediately after
+spawning it. The supervisor accepts registration only from that launch's PID 1,
+resolves its direct child with host `/proc`/`NSpid`, and pins the client PID and
+start time. Before tools are advertised/model work starts, the bundled stdio MCP
+process opens one persistent control connection. The supervisor admits it only
+when `SO_PEERCRED` shows that the registered initial client is its direct parent,
+then pins the MCP PID/start time and connection object.
 
-- the kernel-reported MCP peer PID and `/proc/<pid>/stat` start time;
-- its direct parent official Claude/Codex client PID and start time; and
-- ancestry beneath the exact bwrap PID launched for this CCC session.
+A later shell or malicious descendant cannot become eligible by naming itself
+`claude` or `codex`; the first registration is one-time and process-bound. PID
+reuse, missing process state, non-bwrap debug launches, and server/SSH wrapper
+modes where the exact initial client cannot be registered all fail closed.
 
-The expected client is derived from the configured direct executable and
-cmdline. bwrap/runner ancestry is traversed rather than assuming that bwrap is
-the MCP process's direct parent. A Bash-launched `ccc-agent mcp-server` is
-rejected because its direct parent is the shell, not the expected client. Other
-connections/processes, PID reuse, missing/unreadable proc state, non-bwrap debug
-launches, and server/SSH wrapper modes where the official client cannot be
-identified all fail closed. Server-wrapper sessions retain hook and process-exit
-finalization but do not receive MCP mutation admission.
+Process lineage alone is insufficient: on ordinary same-UID procfs mounts, a
+malicious child can reopen its parent's MCP pipe through `/proc/<pid>/fd` and
+forge traffic. `ccc-agent setup --system` therefore compiles a tiny
+architecture-local preload library from packaged source into the root-owned
+configuration directory. User-mode setup deliberately does not authorize
+destructive MCP operations. For direct Claude/Codex launches the
+runner uses it only when the library, its setup-generated SHA-256 manifest, and
+every parent directory are not owned or writable by the agent UID and the
+digest matches, then binds it read-only into bwrap. The library:
 
-This is process-bound admission in the normal Linux process model, intended to
-protect against ordinary untrusted tool subprocesses when the deployment also
-provides the expected procfs/ptrace isolation. It is **not cryptographic process
-attestation** and does not claim protection if an attacker can ptrace, replace,
-or arbitrarily manipulate the admitted client/MCP process.
+- sets `PR_SET_DUMPABLE=0` in the client and MCP subprocess;
+- forces close-on-exec on newly created pipes and socketpairs; and
+- exits immediately if the dumpability restriction cannot be installed.
+
+At MCP admission the supervisor independently verifies that both the client and
+MCP process descriptor directories reject access. Only then does it mark the
+pinned connection as destructive-authorized and treat same-connection Form Mode
+elicitation as authoritative. A missing compiler/library, user-writable setup,
+unsupported/static loader behavior, or failed descriptor probe leaves status
+available but commit/discard external-review-only.
+
+This is process-bound authorization in the normal Linux process model, not
+cryptographic process attestation. It assumes the trusted Claude/Codex client
+itself is not compromised and that the attacker cannot escape containment,
+replace root-owned runtime assets, or obtain privilege that bypasses the
+non-dumpable process restriction.
 
 Hook-only workspace operations are reserved for trusted lifecycle hooks:
 

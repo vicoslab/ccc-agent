@@ -5,28 +5,31 @@ import json
 import os
 import pathlib
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 import zipfile
 from unittest import mock
 
 from ccc_agent import control as control_mod
 from ccc_agent import mcp
+from ccc_agent import setup as setup_mod
 from ccc_agent.control import ControlServer, MCPControlClient
 
 
 class FakeControl(object):
-    def __init__(self):
+    def __init__(self, destructive_authorized=True):
         self.calls = []
         self.kept = ["/storage/user/outside.txt"]
+        self.destructive_authorized = destructive_authorized
 
     def admit(self, client):
         self.calls.append(("admit", client))
-        return {"admitted": True}
+        return {"admitted": True,
+                "destructive_authorized": self.destructive_authorized,
+                "authorization_reason": (None if self.destructive_authorized else
+                                         "trusted client transport is not hardened")}
 
     def kept_status(self):
         self.calls.append(("status",))
@@ -36,6 +39,10 @@ class FakeControl(object):
     def resolve_turn(self, decision, paths):
         self.calls.append(("resolve", decision, list(paths)))
         return {"verdict": decision, decision + "ted": list(paths)}
+
+    def request_abort(self):
+        self.calls.append(("abort",))
+        return {"verdict": "abort-requested", "apply": "process-exit"}
 
     def close(self):
         pass
@@ -49,10 +56,10 @@ def rpc(req_id, method, params=None):
 
 
 class TestMCPProtocol(unittest.TestCase):
-    def run_server(self, lines, client="claude"):
+    def run_server(self, lines, client="claude", destructive_authorized=True):
         reader = io.StringIO("".join(lines))
         writer = io.StringIO()
-        control = FakeControl()
+        control = FakeControl(destructive_authorized=destructive_authorized)
         server = mcp.MCPServer(reader, writer, control, client=client)
         server.run()
         return [json.loads(line) for line in writer.getvalue().splitlines()], control
@@ -75,8 +82,9 @@ class TestMCPProtocol(unittest.TestCase):
         tools = {tool["name"]: tool for tool in output[1]["result"]["tools"]}
         self.assertEqual(set(tools), {"ccc_status", "ccc_list_kept",
                                       "ccc_commit_kept", "ccc_discard_kept",
-                                      "ccc_keep_kept"})
-        for name in ("ccc_commit_kept", "ccc_discard_kept"):
+                                      "ccc_keep_kept", "ccc_abort_session"})
+        for name in ("ccc_commit_kept", "ccc_discard_kept",
+                     "ccc_abort_session"):
             self.assertTrue(tools[name]["_meta"][
                 "anthropic/requiresUserInteraction"])
 
@@ -157,6 +165,41 @@ class TestMCPProtocol(unittest.TestCase):
         self.assertTrue(output[-1]["result"]["isError"])
         self.assertFalse(any(call[0] == "resolve" for call in control.calls))
 
+    def test_unhardened_client_returns_external_review_without_elicitation(self):
+        output, control = self.run_server([
+            self.initialize({"elicitation": {"form": {}}}),
+            rpc(2, "tools/call", {"name": "ccc_commit_kept",
+                                   "arguments": {}}),
+        ], destructive_authorized=False)
+
+        self.assertEqual(len(output), 2)
+        result = output[-1]["result"]["structuredContent"]
+        self.assertEqual(result["verdict"], "pending-external-approval")
+        self.assertEqual(result["paths"], ["/storage/user/outside.txt"])
+        self.assertIn("not hardened", result["reason"])
+        self.assertFalse(any(call[0] == "resolve" for call in control.calls))
+
+    def test_abort_requires_elicitation_and_records_abort_on_process_exit(self):
+        probe, _ = self.run_server([
+            self.initialize({"elicitation": {"form": {}}}),
+            rpc(2, "tools/call", {"name": "ccc_abort_session",
+                                   "arguments": {}}),
+        ])
+        accept = json.dumps({"jsonrpc": "2.0", "id": probe[1]["id"],
+                             "result": {"action": "accept",
+                                        "content": {"confirm": True}}}) + "\n"
+        output, control = self.run_server([
+            self.initialize({"elicitation": {"form": {}}}),
+            rpc(2, "tools/call", {"name": "ccc_abort_session",
+                                   "arguments": {}}),
+            accept,
+        ])
+
+        self.assertEqual(control.calls[-1], ("abort",))
+        result = output[-1]["result"]["structuredContent"]
+        self.assertEqual(result["verdict"], "abort-requested")
+        self.assertEqual(result["apply"], "process-exit")
+
 
 class TestMCPControlAdmission(unittest.TestCase):
     def test_so_peercred_is_used_and_ordinary_mutation_is_rejected(self):
@@ -173,6 +216,9 @@ class TestMCPControlAdmission(unittest.TestCase):
             try:
                 admitted = client.admit("codex")
                 self.assertTrue(admitted["admitted"])
+                self.assertFalse(admitted["destructive_authorized"])
+                with self.assertRaisesRegex(Exception, "hardened client transport"):
+                    client.resolve_turn("commit", ["/x"])
                 response = client.kept_status()
                 self.assertEqual(response["verdict"], "ok")
             finally:
@@ -189,7 +235,46 @@ class TestMCPControlAdmission(unittest.TestCase):
             self.assertIn("MCP", reply["error"])
             self.assertEqual([req["op"] for req in calls], ["turn-kept-status"])
 
-    def test_shell_parent_is_not_an_eligible_official_client(self):
+    def test_hardened_parent_and_mcp_child_receive_destructive_capability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "control.sock")
+            library = setup_mod.build_mcp_client_hardening(
+                os.path.join(tmp, "hardening.so"))
+            server = ControlServer(path, lambda req: {"verdict": "ok"},
+                                   "token", expected_clients=("python",),
+                                   require_launch_boundary=False)
+            server.start()
+            self.addCleanup(server.stop)
+            child = """import json, sys
+from ccc_agent.control import MCPControlClient
+client = MCPControlClient(sys.argv[1], 'token')
+try:
+    admission = client.admit('codex')
+    resolved = client.resolve_turn('commit', ['/x'])
+    print(json.dumps({'admission': admission, 'resolved': resolved}))
+finally:
+    client.close()
+"""
+            parent = """import subprocess, sys
+proc = subprocess.run([sys.executable, '-c', sys.argv[1], sys.argv[2]],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+sys.stdout.write(proc.stdout)
+sys.stderr.write(proc.stderr)
+raise SystemExit(proc.returncode)
+"""
+            env = dict(os.environ, CCC_AGENT_HARDEN_CLIENT="1",
+                       LD_PRELOAD=library)
+            proc = subprocess.run([sys.executable, "-c", parent, child, path],
+                                  cwd=pathlib.Path(__file__).resolve().parents[1],
+                                  env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertTrue(result["admission"]["destructive_authorized"])
+            self.assertEqual(result["resolved"]["verdict"], "ok")
+
+    def test_only_registered_initial_client_can_parent_production_mcp(self):
         server = ControlServer("/unused", lambda req: {}, "token",
                                expected_clients=("codex",))
         server._launch_pid = 100
@@ -198,20 +283,78 @@ class TestMCPControlAdmission(unittest.TestCase):
         identities = {
             10: {"pid": 10, "ppid": 20, "start_time": 3,
                  "argv": ["ccc-agent", "mcp-server"], "exe": "/bin/python"},
-            20: {"pid": 20, "ppid": 100, "start_time": 2,
-                 "argv": ["bash"], "exe": "/bin/bash"},
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["codex"], "exe": "/usr/bin/codex"},
+            30: {"pid": 30, "ppid": 40, "start_time": 5,
+                 "argv": ["ccc-agent", "mcp-server"], "exe": "/bin/python"},
+            40: {"pid": 40, "ppid": 50, "start_time": 4,
+                 "argv": ["codex"], "exe": "/tmp/codex"},
+            50: {"pid": 50, "ppid": 100, "start_time": 6,
+                 "argv": ["ccc-agent-runner"], "exe": "/usr/bin/python"},
             100: {"pid": 100, "ppid": 1, "start_time": 1,
                   "argv": ["bwrap"], "exe": "/usr/bin/bwrap"},
         }
         with mock.patch.object(control_mod, "_proc_identity",
-                               side_effect=lambda pid: identities.get(pid)):
-            self.assertIsNone(server._eligible_mcp_peer(10))
-            identities[20]["argv"] = ["codex"]
-            identities[20]["exe"] = "/usr/bin/codex"
-            with mock.patch.object(control_mod, "_is_descendant",
-                                   return_value=True):
-                self.assertEqual(server._eligible_mcp_peer(10),
-                                 (10, 3, 20, 2))
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  return_value=True):
+            # A later malicious descendant named `codex` is not accepted merely
+            # because its process name and ancestry look plausible.
+            self.assertIsNone(server._eligible_mcp_peer(30))
+            server._registered_client_fingerprint = (20, 2)
+            eligible = server._eligible_mcp_peer(10)
+            self.assertEqual(eligible["fingerprint"], (10, 3, 20, 2))
+            self.assertTrue(eligible["destructive_authorized"])
+            self.assertIsNone(server._eligible_mcp_peer(30))
+
+    def test_pid1_runner_registers_exact_initial_client_once(self):
+        server = ControlServer("/unused", lambda req: {}, "token",
+                               expected_clients=("codex",))
+        server._launch_pid = 100
+        server._launch_start_time = 1
+        server._launch_supported = True
+        identities = {
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["codex"], "exe": "/usr/bin/codex"},
+            50: {"pid": 50, "ppid": 100, "start_time": 6,
+                 "argv": ["ccc-agent-runner"], "exe": "/usr/bin/python"},
+            100: {"pid": 100, "ppid": 1, "start_time": 1,
+                  "argv": ["bwrap"], "exe": "/usr/bin/bwrap"},
+        }
+        with mock.patch.object(control_mod, "peer_credentials",
+                               return_value=(50, os.geteuid(), os.getegid())), \
+                mock.patch.object(control_mod, "_proc_identity",
+                                  side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_namespace_pids",
+                                  return_value=(50, 1)), \
+                mock.patch.object(control_mod, "_registered_child_host_pid",
+                                  return_value=20), \
+                mock.patch.object(control_mod, "_is_descendant",
+                                  return_value=True):
+            response = server._register_initial_client(object(), 2)
+
+        self.assertTrue(response["registered"])
+        self.assertEqual(server._registered_client_fingerprint, (20, 2))
+
+    def test_process_lineage_without_hidden_proc_fds_is_read_only(self):
+        server = ControlServer("/unused", lambda req: {}, "token",
+                               expected_clients=("codex",),
+                               require_launch_boundary=False)
+        identities = {
+            10: {"pid": 10, "ppid": 20, "start_time": 3,
+                 "argv": ["ccc-agent", "mcp-server"], "exe": "/bin/python"},
+            20: {"pid": 20, "ppid": 1, "start_time": 2,
+                 "argv": ["codex"], "exe": "/usr/bin/codex"},
+        }
+        with mock.patch.object(control_mod, "_proc_identity",
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  return_value=False):
+            eligible = server._eligible_mcp_peer(10)
+
+        self.assertEqual(eligible["fingerprint"], (10, 3, 20, 2))
+        self.assertFalse(eligible["destructive_authorized"])
+        self.assertIn("descriptor", eligible["authorization_reason"])
 
     def test_peer_credentials_report_this_process(self):
         left, right = socket.socketpair(socket.AF_UNIX)
@@ -263,6 +406,7 @@ class TestMCPPluginAssets(unittest.TestCase):
             with zipfile.ZipFile(wheels[0]) as wheel:
                 names = set(wheel.namelist())
         self.assertIn("ccc_agent/mcp.py", names)
+        self.assertIn("ccc_agent/assets/security/ccc_client_hardening.c", names)
         for agent in ("claude", "codex"):
             prefix = "ccc_agent/assets/plugins/%s-ccc-containment/" % agent
             self.assertIn(prefix + ".mcp.json", names)

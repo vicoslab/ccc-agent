@@ -16,10 +16,12 @@ argv is not modified by setup-generated defaults.
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import pwd
 import stat
+import subprocess
 import sys
 from importlib import resources
 from shutil import which
@@ -43,6 +45,60 @@ def plugins_dir():
     operator use but are not injected by default.
     """
     return os.path.join(assets_dir(), "plugins")
+
+
+def build_mcp_client_hardening(output_path, compiler=None):
+    """Build the Linux preload that protects the trusted MCP transport.
+
+    The source remains package data so the wheel stays architecture independent.
+    System setup compiles it for the container's libc and architecture. If this
+    cannot be built, destructive MCP remains in external-review-only mode.
+    """
+    compiler = (compiler or
+                ("/usr/bin/cc" if os.path.isfile("/usr/bin/cc") else None) or
+                ("/usr/bin/gcc" if os.path.isfile("/usr/bin/gcc") else None) or
+                which("cc") or which("gcc"))
+    if not compiler:
+        raise RuntimeError("no C compiler found (tried cc and gcc)")
+    source = os.path.join(assets_dir(), "security", "ccc_client_hardening.c")
+    if not os.path.isfile(source):
+        raise RuntimeError("missing packaged client-hardening source %s" % source)
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    temporary = output_path + ".tmp.%d" % os.getpid()
+    command = [compiler, "-shared", "-fPIC", "-O2", "-Wall", "-Wextra",
+               "-Werror", source, "-o", temporary, "-ldl"]
+    try:
+        proc = subprocess.run(command, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        if proc.returncode:
+            raise RuntimeError("compiler failed: %s" %
+                               (proc.stderr.strip() or proc.stdout.strip()))
+        os.chmod(temporary, 0o555)
+        os.replace(temporary, output_path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+    with open(output_path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    manifest = output_path + ".sha256"
+    manifest_tmp = manifest + ".tmp.%d" % os.getpid()
+    try:
+        with open(manifest_tmp, "w") as fh:
+            fh.write("%s  %s\n" % (digest, os.path.basename(output_path)))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(manifest_tmp, 0o444)
+        os.replace(manifest_tmp, manifest)
+    finally:
+        try:
+            os.unlink(manifest_tmp)
+        except OSError:
+            pass
+    return output_path
 
 
 def _make_executable(path):
@@ -237,6 +293,22 @@ def codex_plugin_config_block():
         "# is absent Codex skips it, and if present the hook exits unless",
         "# CCC_AGENT_SESSION is set.",
         'plugins."%s".enabled = true' % CODEX_PLUGIN_ID,
+        "# Read-only CCC tools may run automatically; every destructive tool",
+        "# must prompt before the server performs its own Form Mode elicitation.",
+        'plugins."%s".mcp_servers.ccc.default_tools_approval_mode = "prompt"'
+        % CODEX_PLUGIN_ID,
+        'plugins."%s".mcp_servers.ccc.tools.ccc_status.approval_mode = "approve"'
+        % CODEX_PLUGIN_ID,
+        'plugins."%s".mcp_servers.ccc.tools.ccc_list_kept.approval_mode = "approve"'
+        % CODEX_PLUGIN_ID,
+        'plugins."%s".mcp_servers.ccc.tools.ccc_keep_kept.approval_mode = "approve"'
+        % CODEX_PLUGIN_ID,
+        'plugins."%s".mcp_servers.ccc.tools.ccc_commit_kept.approval_mode = "prompt"'
+        % CODEX_PLUGIN_ID,
+        'plugins."%s".mcp_servers.ccc.tools.ccc_discard_kept.approval_mode = "prompt"'
+        % CODEX_PLUGIN_ID,
+        'plugins."%s".mcp_servers.ccc.tools.ccc_abort_session.approval_mode = "prompt"'
+        % CODEX_PLUGIN_ID,
         "# Trust only the bundled CCC hooks; do not bypass trust globally.",
     ]
     for key, trusted_hash in CODEX_HOOK_TRUSTED_HASHES:
@@ -856,6 +928,27 @@ def main(argv=None, prog="ccc-agent setup"):
         sys.stderr.write(
             "ccc-agent setup: initialized Claude plugin registry from %s\n"
             % claude_seed_dir)
+
+        if mode == "system":
+            hardening_path = os.path.join(
+                os.path.dirname(os.path.abspath(config_file)),
+                "libccc-agent-client-hardening.so")
+            try:
+                config["mcp_client_hardening_library"] = (
+                    build_mcp_client_hardening(hardening_path))
+            except (OSError, RuntimeError) as exc:
+                sys.stderr.write(
+                    "ccc-agent setup: WARNING could not build MCP client hardening; "
+                    "commit/discard/abort MCP tools will require external review: %s\n"
+                    % exc)
+            else:
+                sys.stderr.write(
+                    "ccc-agent setup: built MCP client hardening %s\n" %
+                    hardening_path)
+        else:
+            sys.stderr.write(
+                "ccc-agent setup: user-owned setup cannot authorize destructive "
+                "MCP tools; commit/discard/abort require external review\n")
 
     _write_json(config_file, config)
     sys.stderr.write("ccc-agent setup: wrote %s\n" % config_file)

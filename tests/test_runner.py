@@ -17,6 +17,8 @@ import time
 import unittest
 from unittest import mock
 
+from ccc_agent import runner as runner_mod
+from ccc_agent import setup as setup_mod
 from ccc_agent.branchfs import FakeBranchFS, StatusReport, StatusWarning
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import (BWRAP_AGENT_RUNNER, BWRAP_AGENT_RUNNER_ARG0,
@@ -914,6 +916,39 @@ time.sleep(0.18)
 
         self.assertEqual(proc.returncode, 7)
 
+    def test_pid1_runner_preloads_only_the_registered_client_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = getattr(setup_mod, "build_mcp_client_hardening")(
+                os.path.join(tmp, "hardening.so"))
+            probe = """import os, subprocess, sys
+r, w = os.pipe()
+child = '''import os, sys
+try:
+    os.open('/proc/%d/fd/%d' % (os.getppid(), int(sys.argv[1])), os.O_WRONLY)
+except OSError as exc:
+    print(exc.errno)
+    raise SystemExit(0)
+raise SystemExit(2)
+'''
+proc = subprocess.run([sys.executable, '-c', child, str(w)],
+                      stdout=subprocess.PIPE, text=True)
+print('preload=%s inheritable=%s errno=%s' %
+      (os.environ.get('LD_PRELOAD'), os.get_inheritable(w), proc.stdout.strip()))
+raise SystemExit(proc.returncode)
+"""
+            env = dict(os.environ,
+                       CCC_AGENT_CLIENT_PRELOAD=library)
+            proc = subprocess.run(
+                [sys.executable, "-c", BWRAP_AGENT_RUNNER,
+                 BWRAP_AGENT_RUNNER_ARG0, sys.executable, "-c", probe],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("preload=%s" % library, proc.stdout)
+        self.assertIn("inheritable=False", proc.stdout)
+        self.assertIn("errno=13", proc.stdout)
+
     def test_bwrap_uses_unshimmed_path_export_for_agent_lookup(self):
         seen = {}
 
@@ -1196,6 +1231,71 @@ time.sleep(0.18)
         token = seen["env"][ENV_CONTROL_TOKEN]
         self.assertTrue(token)
         self.assertNotIn(token, seen["argv"])
+
+    def test_hardening_library_requires_matching_digest_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = getattr(setup_mod, "build_mcp_client_hardening")(
+                os.path.join(tmp, "hardening.so"))
+            self.assertTrue(os.path.isfile(library + ".sha256"))
+            with mock.patch.object(runner_mod, "_secure_root_owned_path",
+                                   return_value=True):
+                self.assertTrue(runner_mod._secure_hardening_library(library))
+                os.chmod(library, 0o755)
+                with open(library, "ab") as fh:
+                    fh.write(b"tampered")
+                self.assertFalse(runner_mod._secure_hardening_library(library))
+
+    def test_bwrap_hardens_direct_claude_client_with_read_only_preload(self):
+        seen = {}
+        library = os.path.join(self._tmp.name, "libccc-client-hardening.so")
+        with open(library, "wb") as fh:
+            fh.write(b"test")
+        os.chmod(library, 0o555)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run), \
+                mock.patch("ccc_agent.runner._secure_hardening_library",
+                           return_value=True):
+            run_session(self._bwrap_config(
+                ["claude"], agent_kind="claude",
+                mcp_client_hardening_library=library), env={})
+
+        triples = [(seen["argv"][i], seen["argv"][i + 1], seen["argv"][i + 2])
+                   for i in range(len(seen["argv"]) - 2)]
+        self.assertIn(("--ro-bind", library,
+                       "/opt/ccc-agent/libccc-client-hardening.so"), triples)
+        self.assertIn(("--setenv", "CCC_AGENT_MCP_REGISTER_CLIENT", "1"), triples)
+        self.assertIn(("--setenv", "CCC_AGENT_CLIENT_PRELOAD",
+                       "/opt/ccc-agent/libccc-client-hardening.so"), triples)
+        self.assertNotIn("CCC_AGENT_HARDEN_CLIENT", seen["env"])
+        self.assertNotIn("LD_PRELOAD", seen["env"])
+
+    def test_bwrap_does_not_load_agent_writable_hardening_library(self):
+        seen = {}
+        library = os.path.join(self._tmp.name, "writable-hardening.so")
+        with open(library, "wb") as fh:
+            fh.write(b"test")
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(
+                ["claude"], agent_kind="claude",
+                mcp_client_hardening_library=library),
+                env={"LD_PRELOAD": "/tmp/evil.so",
+                     "CCC_AGENT_HARDEN_CLIENT": "1"})
+
+        self.assertNotIn("CCC_AGENT_HARDEN_CLIENT", seen["env"])
+        self.assertNotIn("LD_PRELOAD", seen["env"])
+        self.assertNotIn("/opt/ccc-agent/libccc-client-hardening.so",
+                         seen["argv"])
 
     def test_bwrap_mounts_session_env_handoff_for_remote_agent_children(self):
         seen = {}
