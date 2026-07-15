@@ -734,6 +734,7 @@ def main(argv=None, prog="ccc-agent setup"):
                         help="user install (~/.config/ccc-agent)")
     parser.add_argument("--config", help="config.json path (override)")
     parser.add_argument("--user-name", help="agent user (default: current)")
+    parser.add_argument("--home", help=argparse.SUPPRESS)
     parser.add_argument("--branchfs-bin")
     parser.add_argument("--bwrap-bin")
     parser.add_argument("--state-dir")
@@ -792,7 +793,7 @@ def main(argv=None, prog="ccc-agent setup"):
     user = args.user_name or os.environ.get("USER_NAME") or getpass.getuser()
     container_name = args.container_name or os.environ.get("CONTAINER_NAME") or ""
     if mode == "system":
-        home = "/home/%s" % user
+        home = args.home or "/home/%s" % user
         # The state_dir holds the BranchFS *mountpoints*, so it MUST sit where the
         # CCC FUSE sidecar can mount -- i.e. under a Docker bind mount. The sidecar
         # translates client->host paths and refuses the container's overlay, so a
@@ -805,7 +806,7 @@ def main(argv=None, prog="ccc-agent setup"):
         state_dir = args.state_dir or "/storage/user/.ccc-agent"
         config_file = args.config or "/etc/ccc-agent/config.json"
     else:
-        home = os.path.expanduser("~")
+        home = args.home or os.path.expanduser("~")
         state_dir = args.state_dir or os.path.join(home, ".ccc-agent")
         config_file = args.config or os.path.join(
             home, ".config", "ccc-agent", "config.json")
