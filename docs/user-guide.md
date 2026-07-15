@@ -84,7 +84,7 @@ ccc-agent ls
 ccc-agent list <session-prefix>
 ```
 
-Runs started with `--serve AGENT` use the `AGENT-remote` label. If adaptive
+Runs started with `ccc-agent serve AGENT` use the `AGENT-remote` label. If adaptive
 classification identifies a foreground bridge/proxy helper, its label changes to
 `AGENT-remote-bridge`; it is then omitted from this listing and discarded with
 its branch when it finishes.
@@ -150,7 +150,7 @@ A plugin may also expose agent-native commands such as `/ccc:status`,
 request into the trusted `ccc-agent turn-*` control operations.
 
 Hook-only workspace updates are for server-style agents whose active project can
-change inside a single outer `ccc-agent run` containment session. The outer
+change inside a single outer `ccc-agent serve` containment session. The outer
 session may contain several inner agent sessions, such as Codex app-server
 clients, Hermes gateway conversations, or Claude agent commands. Trusted hooks
 identify the inner agent session with `--agent-session`, set one current
@@ -158,11 +158,11 @@ workspace for that inner session, and remove only that workspace when the inner
 session ends. These commands are intentionally not agent self-service commands;
 they require the hook token on the control socket. They do not `cd` the running
 agent or remount anything. Additional static `--scope` paths stay allowed;
-anything still outside the active scopes is kept for review. An implicit
-`--serve` launch starts with no workspace scope: its SSH current directory is
-only the server process cwd. The first successful inner-session workspace hook
-establishes the first auto-commit scope. Operators may still deliberately seed a
-server scope with explicit `--workspace` or `--scope`.
+anything still outside the active scopes is kept for review. A `serve` launch
+without explicit `--workspace` starts with no workspace scope: its SSH current
+directory is only the server process cwd. The first successful inner-session
+workspace hook establishes the first auto-commit scope. Operators may still
+deliberately seed a server scope with explicit `--workspace` or `--scope`.
 
 ## Resuming and recovering
 

@@ -97,23 +97,23 @@ def normalize_path(token):
 def token_agent(token):
     path = normalize_path(token)
     base = os.path.basename(path).lower()
-    if base in ("claude", "claude.exe"):
-        return "claude"
-    if base in ("codex", "codex.exe"):
-        return "codex"
-    if base in ("hermes", "hermes.exe"):
-        return "hermes"
     if "/.claude/remote/srv/" in path and base == "server":
-        return "claude"
+        return "claude", "server"
     if "/.claude/remote/src/" in path and base == "server":
-        return "claude"
+        return "claude", "server"
     if "/.claude/remote/ccd-cli/" in path:
-        return "claude"
+        return "claude", "server"
     # Codex remote-control/server internals are less stable than Claude's public
     # claude-ssh layout, so match executable positions under ~/.codex only.  This
     # catches future ~/.codex/remote/* launchers without routing `grep .codex`.
     if "/.codex/" in path:
-        return "codex"
+        return "codex", "server"
+    if base in ("claude", "claude.exe"):
+        return "claude", "direct"
+    if base in ("codex", "codex.exe"):
+        return "codex", "direct"
+    if base in ("hermes", "hermes.exe"):
+        return "hermes", "direct"
     return None
 
 
@@ -136,9 +136,9 @@ def detect_command(command_string, depth=0):
         if tokens[i] in SEPARATORS:
             i += 1
             continue
-        agent = inspect_at(tokens, i, depth)
-        if agent:
-            return agent
+        detected = inspect_at(tokens, i, depth)
+        if detected:
+            return detected
         # Advance to next shell command segment.
         while i < len(tokens) and tokens[i] not in SEPARATORS:
             i += 1
@@ -153,12 +153,20 @@ def inspect_at(tokens, start, depth):
             saw_claude_remote_env = True
         i += 1
     if i >= len(tokens) or tokens[i] in SEPARATORS:
-        return "claude" if saw_claude_remote_env else None
+        return ("claude", "server") if saw_claude_remote_env else None
 
     exe = tokens[i]
     base = os.path.basename(normalize_path(exe)).lower()
     direct = token_agent(exe)
     if direct:
+        agent, invocation_class = direct
+        if saw_claude_remote_env:
+            return "claude", "server"
+        next_token = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
+        if agent == "codex" and next_token == "app-server":
+            return agent, "server"
+        if agent == "hermes" and next_token in ("gateway", "serve", "server"):
+            return agent, "server"
         return direct
 
     if base == "env":
@@ -180,13 +188,18 @@ def inspect_at(tokens, start, depth):
             break
         if i < len(tokens):
             nested = inspect_at(tokens, i, depth)
-            return nested or ("claude" if saw_claude_remote_env else None)
-        return "claude" if saw_claude_remote_env else None
+            if saw_claude_remote_env:
+                return "claude", "server"
+            return nested
+        return ("claude", "server") if saw_claude_remote_env else None
 
     if base in WRAPPERS:
         if i + 1 < len(tokens):
-            return inspect_at(tokens, i + 1, depth)
-        return None
+            nested = inspect_at(tokens, i + 1, depth)
+            if saw_claude_remote_env:
+                return "claude", "server"
+            return nested
+        return ("claude", "server") if saw_claude_remote_env else None
 
     if base == "timeout":
         i += 1
@@ -195,8 +208,11 @@ def inspect_at(tokens, start, depth):
         if i < len(tokens):
             i += 1  # duration
         if i < len(tokens):
-            return inspect_at(tokens, i, depth)
-        return None
+            nested = inspect_at(tokens, i, depth)
+            if saw_claude_remote_env:
+                return "claude", "server"
+            return nested
+        return ("claude", "server") if saw_claude_remote_env else None
 
     if base in SHELLS:
         j = i + 1
@@ -210,6 +226,8 @@ def inspect_at(tokens, start, depth):
                     command_index = j + 1
                     nested = detect_command(tokens[command_index], depth + 1)
                     if nested:
+                        if saw_claude_remote_env:
+                            return "claude", "server"
                         return nested
                     # Codex remote SSH wraps the real launch as:
                     #   sh -c 'CODEX_REMOTE_PAYLOAD="$1"; ... /bin/sh -c "$CODEX_REMOTE_PAYLOAD"' sh '<payload>'
@@ -228,19 +246,22 @@ def inspect_at(tokens, start, depth):
                         for payload in tokens[command_index + 2:]:
                             nested = detect_command(payload, depth + 1)
                             if nested:
+                                if saw_claude_remote_env:
+                                    return "claude", "server"
                                 return nested
-                    return None
+                    return (("claude", "server")
+                            if saw_claude_remote_env else None)
                 j += 1
                 continue
             break
-        return None
+        return ("claude", "server") if saw_claude_remote_env else None
 
-    return "claude" if saw_claude_remote_env else None
+    return ("claude", "server") if saw_claude_remote_env else None
 
 
-agent = detect_command(command)
-if agent:
-    print(agent)
+detected = detect_command(command)
+if detected:
+    print(*detected)
     raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -258,10 +279,12 @@ if [ "$#" -lt 2 ] || [ "${1:-}" != "-c" ]; then
 fi
 
 original_command="$2"
-agent="$(_detect_agent "${original_command}" || true)"
-if [ -z "${agent}" ]; then
+detected="$(_detect_agent "${original_command}" || true)"
+if [ -z "${detected}" ]; then
     _passthrough "${shell}" "$@"
 fi
+agent=${detected%% *}
+invocation_class=${detected#* }
 
 launcher="${CCC_AGENT_CLI:-ccc-agent}"
 if ! { [ -x "${launcher}" ] || command -v "${launcher}" >/dev/null 2>&1; }; then
@@ -274,4 +297,7 @@ if [ -z "${CCC_AGENT_SHIM_UNDERLYING_PATH:-}" ]; then
     CCC_AGENT_SHIM_UNDERLYING_PATH="$(_path_without_shims "${PATH:-}" "${agent}")"
     export CCC_AGENT_SHIM_UNDERLYING_PATH
 fi
-exec "${launcher}" run --serve "${agent}" --lifecycle adaptive -- "${shell}" -c "${original_command}"
+if [ "${invocation_class}" = "direct" ]; then
+    exec "${launcher}" serve "${agent}" --lifecycle foreground -- "${shell}" -c "${original_command}"
+fi
+exec "${launcher}" serve "${agent}" -- "${shell}" -c "${original_command}"

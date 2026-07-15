@@ -58,25 +58,10 @@ from .turn import TurnController
 CONFIG_ENV = "CCC_AGENT_CONFIG"
 CONFIG_PATHS = ("/etc/ccc-agent/config.json",
                 "/opt/ccc-agent/config/config.json")
-SERVER_MODE_ENV_VARS = (
-    "CCC_AGENT_SERVER_MODE",
-    "CCC_AGENT_SERVE",
-    "CCC_AGENT_NON_INTERACTIVE",
-    "NON_INTERACTIVE",
-)
 _KNOWN_SHELL_NAMES = frozenset((
     "sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "pdksh",
     "tcsh", "csh",
 ))
-
-
-def _env_truthy(value):
-    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _server_mode_from_env(env=None):
-    env = os.environ if env is None else env
-    return any(_env_truthy(env.get(name)) for name in SERVER_MODE_ENV_VARS)
 
 
 def _is_shell_argv0(value):
@@ -923,13 +908,19 @@ def _default_keep_before_finish(store, backend, alias_map, session):
         store.save(session)
 
 
-def main_run(argv=None, env=None, prog="ccc-agent run"):
-    parser = argparse.ArgumentParser(
-        prog=prog,
-        description="Run a command inside a contained BranchFS agent session.")
+def _main_launch(argv=None, env=None, prog="ccc-agent run", server_mode=False,
+                 serve_agent=None):
+    description = ("Serve a remote agent runtime inside a contained BranchFS "
+                   "session." if server_mode else
+                   "Run a command inside a contained BranchFS agent session.")
+    usage = ("%(prog)s AGENT [options] -- COMMAND..." if server_mode else None)
+    parser = argparse.ArgumentParser(prog=prog, description=description,
+                                     usage=usage)
     parser.add_argument("--config", help="path to config.json")
     parser.add_argument("--workspace",
-                        help="agent workspace (default: current directory)")
+                        help=("initial agent workspace (default: hook-owned "
+                              "workspaces only)" if server_mode else
+                              "agent workspace (default: current directory)"))
     parser.add_argument("--policy", default="workspace-auto",
                         help="policy mode (default: workspace-auto)")
     parser.add_argument("--scope", action="append", default=[],
@@ -937,16 +928,9 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     parser.add_argument("--hide", action="append", default=[],
                         help="hide/deny pattern for sensitive paths "
                              "(repeatable)")
-    agent_group = parser.add_mutually_exclusive_group()
-    agent_group.add_argument("--agent", default=None,
-                             help="agent kind label, e.g. codex, claude, hermes")
-    agent_group.add_argument("--serve", metavar="AGENT",
-                             help="server-style AGENT-remote session label; "
-                                  "suppress ccc-agent terminal output and "
-                                  "default to committing workspace changes "
-                                  "while keeping other paths for later review; "
-                                  "adaptive foreground bridges are hidden and "
-                                  "discarded at exit")
+    if not server_mode:
+        parser.add_argument("--agent", default=None,
+                            help="agent kind label, e.g. codex, claude, hermes")
     parser.add_argument("--protect-agent-state", action="store_true",
                         help="keep Codex/Hermes state and Claude Code runtime "
                              "paths inside BranchFS review instead of the "
@@ -955,11 +939,13 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
                         help="do not bind the existing container /run, /var, "
                              "or /dev into the bwrap sandbox; restores the "
                              "stricter no-ambient-runtime-sockets behavior")
+    lifecycle_default = "adaptive" if server_mode else "foreground"
     parser.add_argument("--lifecycle", choices=("foreground", "adaptive"),
-                        default="foreground",
+                        default=lifecycle_default,
                         help="process lifecycle: foreground kills leftover "
                              "children when the command exits; adaptive allows "
-                             "a clean early daemon handoff (default: foreground)")
+                             "a clean early daemon handoff (default: %s)"
+                             % lifecycle_default)
     parser.add_argument("--adaptive-bootstrap-seconds", type=float,
                         help="seconds before an adaptive command is permanently "
                              "classified as foreground")
@@ -968,24 +954,28 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     parser.add_argument("--adaptive-detach-seconds", type=float,
                         help="maximum time for a handoff candidate to release "
                              "stdout and stderr")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="print the full session event log (always shows "
-                             "the error detail on failure)")
-    parser.add_argument("command", nargs=argparse.REMAINDER,
-                        help="-- command to run (default: current shell)")
+    if not server_mode:
+        parser.add_argument("-v", "--verbose", action="store_true",
+                            help="print the full session event log (always shows "
+                                 "the error detail on failure)")
+    parser.add_argument(
+        "command", nargs=argparse.REMAINDER,
+        help=("server command to run (required)" if server_mode else
+              "-- command to run (default: current shell)"))
     args = parser.parse_args(argv)
 
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]
     if not command:
+        if server_mode:
+            parser.error("a server command is required after --")
         command = _current_shell_command(env=env)
 
     env_map = os.environ if env is None else env
-    server_mode = bool(args.serve) or _server_mode_from_env(env_map)
-    base_agent_kind = args.serve or args.agent or "command"
+    base_agent_kind = serve_agent if server_mode else (args.agent or "command")
     agent_kind = (remote_agent_kind(base_agent_kind)
-                  if args.serve else base_agent_kind)
+                  if server_mode else base_agent_kind)
 
     config = load_config(args.config, env=env)
     store, backend, alias_map, user, roots = build_runtime(config)
@@ -1133,6 +1123,55 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
     if session.exit_status not in (0, None):
         return session.exit_status
     return 0
+
+
+def _run_uses_removed_serve_option(argv):
+    """Detect the old launcher flag without inspecting child-command argv."""
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            return False
+        if token == "--serve" or token.startswith("--serve="):
+            return True
+        if token in _RUN_VALUE_OPTIONS:
+            i += 2
+            continue
+        if any(token.startswith(option + "=")
+               for option in _RUN_VALUE_OPTIONS):
+            i += 1
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return False
+    return False
+
+
+def main_run(argv=None, env=None, prog="ccc-agent run"):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if _run_uses_removed_serve_option(argv):
+        sys.stderr.write(
+            "%s: error: --serve was replaced by the dedicated serve command; "
+            "use 'ccc-agent serve AGENT -- COMMAND...'\n" % prog)
+        raise SystemExit(2)
+    return _main_launch(argv, env=env, prog=prog, server_mode=False)
+
+
+def main_serve(argv=None, env=None, prog="ccc-agent serve"):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("-h", "--help"):
+        return _main_launch(argv, env=env, prog=prog, server_mode=True,
+                            serve_agent="AGENT")
+    if not argv or argv[0].startswith("-"):
+        parser = argparse.ArgumentParser(
+            prog=prog, usage="%(prog)s AGENT [options] -- COMMAND...",
+            description="Serve a remote agent runtime inside a contained "
+                        "BranchFS session.")
+        parser.error("the following arguments are required: AGENT")
+    serve_agent = argv.pop(0)
+    return _main_launch(argv, env=env, prog=prog, server_mode=True,
+                        serve_agent=serve_agent)
 
 
 def _print_failure_details(store, session, verbose=False):
@@ -1936,7 +1975,7 @@ _SESSION_ID_COMPLETION_OPS = (
 )
 _MULTI_SESSION_ID_COMPLETION_OPS = set(_BATCH_SESSION_ID_CTL_OPS)
 _MAIN_OPS = tuple(sorted(_CTL_OPS | {
-    "run", "resume", "setup", "softsandbox", "completion",
+    "run", "serve", "resume", "setup", "softsandbox", "completion",
 }))
 _TOP_LEVEL_OPTIONS = ("--config", "--version", "--help")
 _GLOBAL_VALUE_OPTIONS = frozenset(("--config",))
@@ -1946,14 +1985,17 @@ _RESUME_VALUE_OPTIONS = frozenset(("--agent", "--cmd"))
 _RUN_VALUE_OPTIONS = frozenset((
     "--adaptive-bootstrap-seconds", "--adaptive-detach-seconds",
     "--adaptive-stability-seconds", "--agent", "--config", "--hide",
-    "--lifecycle", "--policy", "--scope", "--serve", "--workspace",
+    "--lifecycle", "--policy", "--scope", "--workspace",
 ))
+_SERVE_VALUE_OPTIONS = _RUN_VALUE_OPTIONS - {"--agent"}
 _RUN_OPTIONS = (
     "--adaptive-bootstrap-seconds", "--adaptive-detach-seconds",
-    "--adaptive-stability-seconds", "--agent", "--serve", "--lifecycle",
+    "--adaptive-stability-seconds", "--agent", "--lifecycle",
     "--full-isolation", "--hide", "--policy", "--protect-agent-state",
     "--scope", "--verbose", "--workspace", "-v", "--config", "--help",
 )
+_SERVE_OPTIONS = tuple(option for option in _RUN_OPTIONS
+                       if option not in ("--agent", "--verbose", "-v"))
 _CLEANUP_OPTIONS = ("--older-than", "-o", "--all-type", "--all-types", "-a",
                     "--dry-run", "--config", "--help")
 _DIFF_OPTIONS = ("--show-ignored", "--show-file-diffs", "--config", "--help")
@@ -2049,6 +2091,8 @@ def _value_options_for_completion(op):
         values.update(_RESUME_VALUE_OPTIONS)
     if op == "run":
         values.update(_RUN_VALUE_OPTIONS)
+    if op == "serve":
+        values.update(_SERVE_VALUE_OPTIONS)
     return values
 
 
@@ -2085,6 +2129,8 @@ def _options_for_completion(op):
         return _RESUME_OPTIONS
     if op == "run":
         return _RUN_OPTIONS
+    if op == "serve":
+        return _SERVE_OPTIONS
     if op == "turn-finalize":
         return ("--default-keep", "--default-keep-after", "--config", "--help")
     if op in _CTL_OPS or op in ("launch", "setup", "softsandbox",
@@ -2176,8 +2222,11 @@ def _print_main_help(stream=None):
         "Global options:\n"
         "  --version        print the ccc-agent release version and Git commit when known\n\n"
         "Primary user ops:\n"
-        "  run              start a contained BranchFS session; when no command "
-        "is given, open the invoking shell (legacy alias: launch)\n"
+        "  run              start a foreground contained BranchFS session in "
+        "the current workspace; when no command is given, open the invoking "
+        "shell (legacy alias: launch)\n"
+        "  serve AGENT      start a protocol-clean remote runtime; default to "
+        "adaptive lifecycle and hook-owned workspace scopes\n"
         "  resume           reopen an existing session and run the stored "
         "command, --cmd CMD, or a custom argv after --\n\n"
         "Session/control ops (run outside a contained session):\n"
@@ -2218,6 +2267,7 @@ def _print_main_help(stream=None):
         "  softsandbox      run the legacy diagnostic non-FUSE soft sandbox\n\n"
         "Examples:\n"
         "  ccc-agent run --workspace /home/$USER/project -- codex exec 'fix bug'\n"
+        "  ccc-agent serve claude -- remote-server --stdio\n"
         "  ccc-agent resume <session>             # rerun the stored command\n"
         "  ccc-agent resume <session> --cmd bash  # resume with a custom shell\n"
         "  ccc-agent resume <session> -- bash     # exact custom argv\n"
@@ -2246,6 +2296,8 @@ def main(argv=None, env=None):
         return main_completion(rest, prog="ccc-agent completion")
     if op in ("run", "launch"):
         return main_run(rest, env=env, prog="ccc-agent %s" % op)
+    if op == "serve":
+        return main_serve(rest, env=env, prog="ccc-agent serve")
     if op == "resume":
         return main_resume(rest, env=env, prog="ccc-agent resume")
     if op == "setup":

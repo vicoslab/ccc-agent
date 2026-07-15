@@ -13,7 +13,7 @@ process-exit freeze/status/policy review.
 | `ccc-agent run -- hermes "..."` | Process exit | No default Hermes per-run plugin env. | Session-end finalize. |
 | `ccc-agent run -- codex` | Interactive turns + process exit | Codex plugin Stop hook, version-dependent. | Workspace changes may commit per turn; kept paths reviewed later. |
 | `ccc-agent run -- claude` | Interactive Stop hooks + process exit | Claude hooks from the enabled `ccc@ccc-agent` plugin, if active. | Workspace changes may commit per turn; kept paths reviewed later. |
-| `ccc-agent run --serve codex -- <ssh/app-server wrapper>` | Server process + inner sessions | Treats the contained command as a server/runtime wrapper for the named agent. | `ccc-agent` prints nothing on the SSH stream; at process exit it commits workspace changes and keeps other paths for later review. |
+| `ccc-agent serve codex -- <ssh/app-server wrapper>` | Server process + inner sessions | Treats the contained command as a server/runtime wrapper for the named agent. | `ccc-agent` prints nothing on the SSH stream; at process exit it commits workspace changes and keeps other paths for later review. |
 | `ccc-agent run -- <other command>` | Process exit | No native plugin required. | Session-end finalize. |
 
 ## Plugin/config model
@@ -33,7 +33,7 @@ Manually configured `agent_plugins` may still specify `argv` or `setenv`.
 Argument activation remains restricted to direct agent CLI invocations; safe
 asset-discovery environment can reach an explicitly identified server wrapper.
 
-Use `--serve AGENT` for server-style entrypoints such as Codex app-server, Claude
+Use `ccc-agent serve AGENT` for server-style entrypoints such as Codex app-server, Claude
 remote server wrappers, or a Hermes gateway launched through SSH. Persisted
 server sessions use the `AGENT-remote` label (for example `codex-remote`) in
 `ccc-agent list`. Server mode is intended for protocols that parse stdout/stderr
@@ -47,21 +47,21 @@ final freeze server mode applies the same default as turn
 hooks: commit in-workspace changes, remember non-workspace changes as kept in the
 branch, and leave the session reviewable if anything still needs later attention.
 The SSH shell router uses this mode automatically for detected Codex/Claude/Hermes
-remote commands.
+commands. A direct CLI request such as `ssh user@host claude` uses
+`--lifecycle foreground`: it remains a normal reviewable `claude-remote` session
+and cannot be reclassified and discarded as a transport bridge. Recognized
+remote server/bootstrap commands retain the adaptive lifecycle.
 
 ## Adaptive SSH process lifecycle
 
-`--serve` controls protocol-safe output and review defaults; it does not decide
-whether the command is foreground or a daemon. The packaged SSH router invokes
-all broadly detected Claude, Codex, and Hermes requests with:
-
-```text
---lifecycle adaptive
-```
-
-The router does not inspect private operations such as `--serve`, `--bridge`,
-`app-server`, or `proxy`. Inside bwrap, namespace PID 1 classifies the opaque
-process behavior:
+`ccc-agent serve` controls protocol-safe output and review defaults. It uses the
+adaptive lifecycle by default; `--lifecycle foreground` is available for a
+direct or explicitly one-shot invocation. The packaged SSH router distinguishes
+direct agent CLIs from recognizable server/bootstrap surfaces. Bare
+`claude`/`codex`/`hermes` commands (including normal CLI arguments) are
+foreground. Claude remote paths and `CLAUDE_CODE_REMOTE*` environments, Codex
+app-server/remote-state launchers, and Hermes gateway/server commands remain
+adaptive. Inside bwrap, namespace PID 1 classifies adaptive process behavior:
 
 - a command that remains alive through the bootstrap window is permanently
   foreground; when it exits, leaked helpers are killed with the PID namespace;
@@ -82,10 +82,10 @@ still use independent containment while running; there is no active-lane or
 namespace-attachment router. Multiple true services therefore keep independent
 session IDs and branch views.
 
-Interactive SSH commands with a TTY stay on the existing foreground lifecycle so
-terminal ownership/job control is preserved. Ordinary local `ccc-agent run`
-commands also remain foreground unless `--lifecycle adaptive` is explicitly
-selected.
+Direct SSH agent commands use foreground lifecycle whether or not the client
+allocates a TTY, so ordinary agent work is finalized rather than discarded as a
+bridge. Ordinary local `ccc-agent run` commands also remain foreground unless
+`--lifecycle adaptive` is explicitly selected.
 
 If no plugin matches, the plugin directory is missing, the command uses a mode
 that disables plugins, or the agent version ignores hooks, the run degrades to
@@ -215,7 +215,7 @@ ccc-agent turn-remove-workspace --agent-session <inner-session-id> [PATH]
 
 Server-mode integrations may call the workspace commands when the agent runtime
 starts, resumes, updates, or ends an inner agent session inside the outer
-`ccc-agent run` containment session. Each inner agent session has one current
+`ccc-agent serve` containment session. Each inner agent session has one current
 workspace. Starting/updating that workspace releases only the previous workspace
 owned by that same inner session; ending it removes only the workspace that the
 hook actually added. The commands require the hook token and update only dynamic
@@ -232,13 +232,14 @@ Bundled lifecycle coverage:
 - Codex: documented `SessionStart` adds the root thread workspace;
   `SubagentStart`/`SubagentStop` add/remove subagent workspaces. Codex does not
   currently document a root `SessionEnd` event, so the root thread workspace is
-  cleared by the outer `ccc-agent run` lifecycle/resume reset rather than by an
+  cleared by the outer `ccc-agent serve` lifecycle/resume reset rather than by an
   in-Codex end hook.
 
 ## Environment propagation
 
-Contained commands inherit the complete environment of the `ccc-agent run`
-invocation by default. This is intentional for CCC images: integrations may rely
+Contained commands inherit the complete environment of the `ccc-agent run` or
+`ccc-agent serve` invocation by default. This is intentional for CCC images:
+integrations may rely
 on container identity and node variables, `CCC_FUSE_SIDECAR_SOCKET`, CUDA/NVIDIA
 settings, Conda activation, `SSH_AUTH_SOCK`, library paths, and future
 image-provided feature variables. External credential variables are inherited as
