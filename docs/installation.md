@@ -131,8 +131,10 @@ Without plugins, process-exit finalization still works for every command.
 Shims let users type the normal agent command names while launching through
 `ccc-agent run`. The SSH shell router is stricter for remote app-server/server
 commands: detected Codex/Claude remote commands are launched with
-`ccc-agent serve AGENT`, whose adaptive lifecycle and protocol-clean output keep
-the SSH stream owned by the original agent protocol.
+`ccc-agent serve AGENT`, whose protocol-clean output keeps the SSH stream owned
+by the original agent protocol. Direct commands such as `ssh user@host claude`
+use foreground lifecycle; recognized remote server/bootstrap commands use the
+adaptive default.
 
 Simple system case:
 

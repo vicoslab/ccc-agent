@@ -149,8 +149,10 @@ service records as `<agent>-remote`, does not inject interactive-agent argv/env
 activation into the server command, and keeps non-workspace changes for later
 review. An implicit server launch does not treat its SSH current directory as a
 workspace; trusted inner-session hooks establish auto-commit scopes. `serve`
-uses adaptive lifecycle by default, so
-foreground bridge/proxy runs are classified as `<agent>-remote-bridge`, hidden
+uses adaptive lifecycle by default. The SSH router overrides direct commands
+such as `ssh user@host claude` to foreground lifecycle, while recognized remote
+server/bootstrap commands remain adaptive. Adaptive foreground bridge/proxy
+runs are classified as `<agent>-remote-bridge`, hidden
 from `ccc-agent list`, aborted without commit at exit, and immediately removed
 after successful cleanup. For server-style runtimes, distinguish the outer
 `ccc-agent serve` containment session from inner agent sessions (for example a

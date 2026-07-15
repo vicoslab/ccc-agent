@@ -47,20 +47,21 @@ final freeze server mode applies the same default as turn
 hooks: commit in-workspace changes, remember non-workspace changes as kept in the
 branch, and leave the session reviewable if anything still needs later attention.
 The SSH shell router uses this mode automatically for detected Codex/Claude/Hermes
-remote commands.
+commands. A direct CLI request such as `ssh user@host claude` uses
+`--lifecycle foreground`: it remains a normal reviewable `claude-remote` session
+and cannot be reclassified and discarded as a transport bridge. Recognized
+remote server/bootstrap commands retain the adaptive lifecycle.
 
 ## Adaptive SSH process lifecycle
 
 `ccc-agent serve` controls protocol-safe output and review defaults. It uses the
-adaptive lifecycle by default; `--lifecycle foreground` is available for an
-explicit one-shot server wrapper. The packaged SSH router invokes all broadly
-detected Claude, Codex, and Hermes requests through `ccc-agent serve` without
-inspecting their private command operations.
-
-The router does not inspect private operations such as a remote server's own
-`--serve`, `--bridge`,
-`app-server`, or `proxy`. Inside bwrap, namespace PID 1 classifies the opaque
-process behavior:
+adaptive lifecycle by default; `--lifecycle foreground` is available for a
+direct or explicitly one-shot invocation. The packaged SSH router distinguishes
+direct agent CLIs from recognizable server/bootstrap surfaces. Bare
+`claude`/`codex`/`hermes` commands (including normal CLI arguments) are
+foreground. Claude remote paths and `CLAUDE_CODE_REMOTE*` environments, Codex
+app-server/remote-state launchers, and Hermes gateway/server commands remain
+adaptive. Inside bwrap, namespace PID 1 classifies adaptive process behavior:
 
 - a command that remains alive through the bootstrap window is permanently
   foreground; when it exits, leaked helpers are killed with the PID namespace;
@@ -81,10 +82,10 @@ still use independent containment while running; there is no active-lane or
 namespace-attachment router. Multiple true services therefore keep independent
 session IDs and branch views.
 
-Interactive SSH commands with a TTY stay on the existing foreground lifecycle so
-terminal ownership/job control is preserved. Ordinary local `ccc-agent run`
-commands also remain foreground unless `--lifecycle adaptive` is explicitly
-selected.
+Direct SSH agent commands use foreground lifecycle whether or not the client
+allocates a TTY, so ordinary agent work is finalized rather than discarded as a
+bridge. Ordinary local `ccc-agent run` commands also remain foreground unless
+`--lifecycle adaptive` is explicitly selected.
 
 If no plugin matches, the plugin directory is missing, the command uses a mode
 that disables plugins, or the agent version ignores hooks, the run degrades to
