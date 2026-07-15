@@ -1,21 +1,13 @@
-# Dockerfile snippet: pre-seed the bundled CCC Claude Code plugin.
+# Optional Dockerfile snippet: materialize the bundled CCC Claude plugin seed.
 #
-# Anthropic's documented container/CI mechanism expects a pre-populated plugin
-# tree. The local marketplace must remain under marketplaces/<name> because
-# Claude resolves seed marketplace content from that location at runtime.
-#
-# Install ccc-agent and Claude Code before this snippet:
+# `ccc-agent setup --system` now performs this automatically. This standalone
+# command is useful when an image build wants to create the seed in a separate
+# layer before runtime configuration is generated.
+
+# Install ccc-agent before this snippet:
 # RUN pip install --break-system-packages ccc-agent
-# RUN npm install -g @anthropic-ai/claude-code
 
-RUN mkdir -p /opt/claude-seed/marketplaces && \
-    python -m ccc_agent.claude_plugin \
-      --write-to /opt/claude-seed/marketplaces/ccc-agent
-
-RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-      claude plugin marketplace add /opt/claude-seed/marketplaces/ccc-agent && \
-    CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-      claude plugin install ccc@ccc-agent
+RUN python -m ccc_agent.claude_plugin --seed-dir /opt/claude-seed
 
 # ccc-agent setup writes only enabledPlugins for ccc@ccc-agent. It does not add
 # settings-level hooks or an extra marketplace source.

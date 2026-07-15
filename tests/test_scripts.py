@@ -121,6 +121,54 @@ class TestPluginAssets(unittest.TestCase):
                 claude_plugin.materialize_marketplace(dest)
             self.assertTrue(os.path.isfile(sentinel))
 
+    def test_claude_seed_materializer_is_self_contained_and_preserves_other_plugins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = os.path.join(tmp, "claude-seed")
+            os.makedirs(seed)
+            with open(os.path.join(seed, "known_marketplaces.json"), "w") as fh:
+                json.dump({"keep-market": {"source": {"source": "github",
+                                                        "repo": "org/keep"}}}, fh)
+            with open(os.path.join(seed, "installed_plugins.json"), "w") as fh:
+                json.dump({"version": 2, "plugins": {
+                    "keep@keep-market": [{"scope": "user", "version": "1.0.0"}]
+                }}, fh)
+
+            written = claude_plugin.materialize_seed(seed)
+
+            self.assertEqual(written, seed)
+            marketplace = os.path.join(
+                seed, "marketplaces", "ccc-agent", ".claude-plugin",
+                "marketplace.json")
+            cached_plugin = os.path.join(
+                seed, "cache", "ccc-agent", "ccc", "0.2.0",
+                ".claude-plugin", "plugin.json")
+            self.assertTrue(os.path.isfile(marketplace))
+            self.assertTrue(os.path.isfile(cached_plugin))
+            with open(os.path.join(seed, "known_marketplaces.json")) as fh:
+                known = json.load(fh)
+            with open(os.path.join(seed, "installed_plugins.json")) as fh:
+                installed = json.load(fh)
+            self.assertIn("keep-market", known)
+            self.assertEqual(
+                known["ccc-agent"]["installLocation"],
+                os.path.join(seed, "marketplaces", "ccc-agent"))
+            self.assertIn("keep@keep-market", installed["plugins"])
+            entry = installed["plugins"]["ccc@ccc-agent"][0]
+            self.assertEqual(entry["version"], "0.2.0")
+            self.assertEqual(
+                entry["installPath"],
+                os.path.join(seed, "cache", "ccc-agent", "ccc", "0.2.0"))
+
+    def test_claude_plugin_cli_can_materialize_complete_seed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = os.path.join(tmp, "seed")
+            self.assertEqual(claude_plugin.main(["--seed-dir", seed]), 0)
+            self.assertTrue(os.path.isfile(os.path.join(
+                seed, "installed_plugins.json")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                seed, "marketplaces", "ccc-agent", ".claude-plugin",
+                "marketplace.json")))
+
     def test_codex_plugin_layout(self):
         root = os.path.join(PLUGINS, "codex-ccc-containment")
         manifest_path = os.path.join(root, ".codex-plugin", "plugin.json")

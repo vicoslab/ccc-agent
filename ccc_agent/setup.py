@@ -25,6 +25,7 @@ from importlib import resources
 from shutil import which
 
 from . import branchfs_runtime
+from .claude_plugin import materialize_seed
 
 
 def assets_dir():
@@ -36,10 +37,10 @@ def plugins_dir():
     """On-disk path to bundled agent integration assets.
 
     Codex assets are mounted read-only into its plugin-cache path for contained
-    sessions. Claude plugin files can be materialized for image-build seeding via
-    ``python -m ccc_agent.claude_plugin``; contained runs point Claude at the
-    baked seed with ``CLAUDE_CODE_PLUGIN_SEED_DIR``. Hermes assets remain packaged
-    for explicit/operator use but are not injected by default.
+    sessions. Setup materializes Claude's complete seed from these packaged
+    assets; contained runs point Claude at it with
+    ``CLAUDE_CODE_PLUGIN_SEED_DIR``. Hermes assets remain packaged for explicit
+    operator use but are not injected by default.
     """
     return os.path.join(assets_dir(), "plugins")
 
@@ -365,12 +366,16 @@ CLAUDE_SYSTEM_SETTINGS = "/etc/claude-code/managed-settings.d/50-ccc-agent.json"
 def default_claude_plugin_seed_dir(mode=None, home=None):
     """Runtime path to a pre-populated Claude Code plugin seed.
 
-    This intentionally follows Anthropic's container/CI mechanism: the image
-    build creates the seed once, and ccc-agent only points contained Claude runs
-    at it. ``mode`` and ``home`` are accepted for call-site compatibility.
+    System setup uses ``/opt/claude-seed``. User setup defaults to a writable
+    per-user data directory. An explicit environment value overrides both.
     """
-    return os.environ.get(CLAUDE_PLUGIN_SEED_ENV,
-                          DEFAULT_CLAUDE_PLUGIN_SEED_DIR)
+    configured = os.environ.get(CLAUDE_PLUGIN_SEED_ENV)
+    if configured:
+        return configured
+    if mode == "user" and home:
+        return os.path.join(home, ".local", "share", "ccc-agent",
+                            "claude-seed")
+    return DEFAULT_CLAUDE_PLUGIN_SEED_DIR
 
 
 def _is_legacy_claude_hook_group(group):
@@ -566,7 +571,7 @@ def build_agent_plugins(home, src_dir=None, claude_seed_dir=None):
       codex  -- /etc/codex/config.toml or ~/.codex/config.toml enables/trusts
                 the plugin; ccc-agent run supplies the read-only plugin cache
                 bind at Codex's installed-plugin path.
-      claude -- the container image pre-seeds the plugin cache; ccc-agent run
+      claude -- setup materializes the packaged plugin seed; ccc-agent run
                 supplies the read-only seed bind and CLAUDE_CODE_PLUGIN_SEED_DIR.
       hermes -- no default per-run plugin env injection; process-exit review
                 remains authoritative.
@@ -705,8 +710,8 @@ def build_config(mode, user, home, branchfs_bin, bwrap_bin, state_dir,
         "cred_env": {},
         "_agent_plugins_comment": "Mount-only CCC plugin assets for tools that "
                                   "load persistent config. Setup enables/"
-                                  "trusts Codex and points Claude at a "
-                                  "pre-seeded plugin cache; ccc-agent run "
+                                  "trusts Codex and materializes Claude's "
+                                  "packaged plugin seed; ccc-agent run "
                                   "supplies read-only plugin asset binds plus "
                                   "Claude's documented plugin seed env. No "
                                   "default entry appends agent CLI argv.",
@@ -828,29 +833,28 @@ def main(argv=None, prog="ccc-agent setup"):
                                  else None))
         codex_config = ensure_codex_plugin_enabled(
             home, user=user, config_path=codex_config_path)
+        materialize_seed(claude_seed_dir)
         claude_settings = ensure_claude_seed_plugin_enabled(
             home, user=user, settings_path=claude_settings_path)
         claude_registry = ensure_claude_seed_plugin_registry(
             home, claude_seed_dir, user=user)
+        if not claude_registry:
+            raise RuntimeError("failed to initialize materialized Claude plugin seed")
+        sys.stderr.write(
+            "ccc-agent setup: materialized Claude plugin seed from packaged "
+            "assets at %s\n" % claude_seed_dir)
         sys.stderr.write(
             "ccc-agent setup: agent plugin assets under %s are mounted "
-            "read-only when needed; Claude uses pre-seeded plugin dir %s\n"
-            % (plugins_dir(), claude_seed_dir))
+            "read-only when needed\n" % plugins_dir())
         sys.stderr.write(
             "ccc-agent setup: ensured Codex plugin enablement in %s\n"
             % codex_config)
         sys.stderr.write(
             "ccc-agent setup: ensured Claude seed-plugin enablement in %s\n"
             % claude_settings)
-        if claude_registry:
-            sys.stderr.write(
-                "ccc-agent setup: initialized Claude plugin registry from %s\n"
-                % claude_seed_dir)
-        else:
-            sys.stderr.write(
-                "ccc-agent setup: WARNING Claude plugin seed is incomplete or "
-                "missing at %s; Claude will use process-exit review until the "
-                "image seed is installed\n" % claude_seed_dir)
+        sys.stderr.write(
+            "ccc-agent setup: initialized Claude plugin registry from %s\n"
+            % claude_seed_dir)
 
     _write_json(config_file, config)
     sys.stderr.write("ccc-agent setup: wrote %s\n" % config_file)
