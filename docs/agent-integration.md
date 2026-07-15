@@ -191,11 +191,14 @@ starts another agent or helper script: the task remains one review unit.
 Bundled plugins include user-facing command skills where the agent supports them:
 
 ```text
-/ccc:status [filter]
-/ccc:commit [paths|prompt]
-/ccc:discard [all|prompt]
-/ccc:op <natural-language request>
+/ccc-status [filter]
+/ccc-commit [paths|prompt]
+/ccc-discard [all|prompt]
+/ccc <natural-language request>
 ```
+
+These operation skills set `disable-model-invocation: true`, so they remain
+explicit user commands rather than operations the model may invoke by itself.
 
 The concrete trusted CLI operations are:
 

@@ -1,5 +1,5 @@
 ---
-name: op
+name: ccc
 description: Run a CCC contained-session turn operation from natural language
 disable-model-invocation: true
 argument-hint: [status|review|commit|discard|keep ...]

@@ -1,5 +1,5 @@
 ---
-name: status
+name: ccc-status
 description: Show CCC contained-session committed and kept files
 disable-model-invocation: true
 argument-hint: [optional filter]

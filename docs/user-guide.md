@@ -145,9 +145,10 @@ ccc-agent turn-resolve discard --paths a,b
 ccc-agent turn-resolve commit --all-kept
 ```
 
-A plugin may also expose agent-native commands such as `/ccc:status`,
-`/ccc:commit`, `/ccc:discard`, and `/ccc:op`. Those commands translate the user's
-request into the trusted `ccc-agent turn-*` control operations.
+A plugin may also expose agent-native commands such as `/ccc-status`,
+`/ccc-commit`, `/ccc-discard`, and `/ccc`. Those commands translate the user's
+request into the trusted `ccc-agent turn-*` control operations. They are marked
+`disable-model-invocation: true` and therefore remain explicit user commands.
 
 Hook-only workspace updates are for server-style agents whose active project can
 change inside a single outer `ccc-agent run` containment session. The outer

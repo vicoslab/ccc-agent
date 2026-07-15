@@ -7,7 +7,7 @@ by default; process-exit review remains authoritative when the plugin is absent.
 Hermes' native equivalent of Claude's ``additionalContext`` is the
 ``pre_llm_call`` plugin hook: returning ``{"context": text}`` injects text into
 the current turn's user message.  This plugin uses that hook to make the bundled
-``ccc-commit`` skill mandatory session context instead of relying on the model to
+``ccc-containment`` skill mandatory session context instead of relying on the model to
 choose a skill by description.  At final-response/idle boundaries it also
 signals the trusted CCC supervisor, maintains hook-owned workspace scopes, then
 appends or queues a kept-file review
@@ -41,7 +41,7 @@ CCC_REVIEW_HEADER = "CCC contained-session review is pending."
 
 
 FIRST_TURN_PREFIX = (
-    "CCC contained-session skill ccc-commit is active because "
+    "CCC contained-session skill ccc-containment is active because "
     "CCC_AGENT_SESSION is set. Its rules are part of the current Hermes "
     "session context."
 )
@@ -91,7 +91,7 @@ def _strip_frontmatter(text: str) -> str:
     return text.strip()
 
 
-def _skill_body(name: str = "ccc-commit") -> str:
+def _skill_body(name: str = "ccc-containment") -> str:
     path = _plugin_root() / "skills" / name / "SKILL.md"
     try:
         return _strip_frontmatter(path.read_text(encoding="utf-8"))
@@ -252,7 +252,7 @@ def _pre_llm_context(is_first_turn: bool = False, **_) -> Optional[dict]:
     parts = []
     if is_first_turn:
         _signal_workspace_start(**_)
-        body = _skill_body("ccc-commit")
+        body = _skill_body("ccc-containment")
         if body:
             parts.append("%s\n\n%s" % (FIRST_TURN_PREFIX, body))
     parts.append(TURN_REMINDER)

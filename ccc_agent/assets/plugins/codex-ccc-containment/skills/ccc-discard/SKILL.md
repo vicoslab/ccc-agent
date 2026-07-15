@@ -1,5 +1,5 @@
 ---
-name: discard
+name: ccc-discard
 description: Discard selected CCC kept files
 disable-model-invocation: true
 argument-hint: [all | paths | natural-language selector]

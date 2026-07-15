@@ -2,7 +2,7 @@
 # CCC Claude Code context hook.
 #
 # Claude plugin skills are model-invoked, not hard-preloaded.  This hook makes
-# the contained-session CCC rule explicit by injecting the bundled ccc-commit
+# the contained-session CCC rule explicit by injecting the bundled ccc-containment
 # skill at SessionStart, reminding before each user prompt, and asking for a
 # kept-file decision when Claude tries to stop with non-workspace changes still
 # held in the branch.
@@ -68,7 +68,7 @@ PLUGIN_ROOT=${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}
 if [ -z "$PLUGIN_ROOT" ]; then
     PLUGIN_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 fi
-SKILL_PATH="$PLUGIN_ROOT/skills/ccc-commit/SKILL.md"
+SKILL_PATH="$PLUGIN_ROOT/skills/ccc-containment/SKILL.md"
 CTL="${CCC_AGENT_CLI:-ccc-agent}"
 
 emit_context() {
@@ -159,7 +159,7 @@ case "$EVENT" in
         BODY=$(skill_body)
         if [ -n "$BODY" ]; then
             printf '%s\n\n%s\n' \
-                "CCC contained-session skill ccc-commit is active because CCC_AGENT_SESSION is set. Its rules are part of the current session context." \
+                "CCC contained-session skill ccc-containment is active because CCC_AGENT_SESSION is set. Its rules are part of the current session context." \
                 "$BODY" | emit_context SessionStart
         fi
         ;;

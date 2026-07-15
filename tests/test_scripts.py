@@ -202,20 +202,20 @@ class TestPluginAssets(unittest.TestCase):
         self.assertIn("turn-remove-workspace", workspace_body)
         self.assertIn("--agent-session", workspace_body)
 
-    def test_ccc_commit_skill_is_bundled_for_claude_codex_and_hermes(self):
+    def test_ccc_containment_skill_is_bundled_for_claude_codex_and_hermes(self):
         bodies = []
         for plugin in ("claude-ccc-containment", "codex-ccc-containment",
                        "hermes-ccc-containment"):
             for old_name in ("branchfs-commit", "contained-commit"):
                 old_path = os.path.join(PLUGINS, plugin, "skills", old_name)
                 self.assertFalse(os.path.exists(old_path), old_path)
-            path = os.path.join(PLUGINS, plugin, "skills", "ccc-commit",
+            path = os.path.join(PLUGINS, plugin, "skills", "ccc-containment",
                                 "SKILL.md")
             self.assertTrue(os.path.isfile(path), path)
             with open(path) as fh:
                 bodies.append(fh.read())
         self.assertEqual(len(set(bodies)), 1)
-        self.assertIn("name: ccc-commit", bodies[0])
+        self.assertIn("name: ccc-containment", bodies[0])
         self.assertLess(len(bodies[0].split()), 190)
         self.assertNotIn("BranchFS", bodies[0])
         self.assertNotIn("branchfs", bodies[0].lower())
@@ -229,16 +229,19 @@ class TestPluginAssets(unittest.TestCase):
         self.assertIn("turn-review-kept", bodies[0])
         self.assertIn("turn-resolve", bodies[0])
 
-    def test_ccc_user_command_skills_are_bundled_for_claude_and_codex(self):
+    def test_ccc_user_command_skills_are_bundled_with_prefixed_names(self):
         expected = {
-            "status": "ccc-agent turn-kept-status",
-            "commit": "ccc-agent turn-resolve commit",
-            "discard": "ccc-agent turn-resolve discard",
-            "op": "ccc-agent turn-",
+            "ccc-status": "ccc-agent turn-kept-status",
+            "ccc-commit": "ccc-agent turn-resolve commit",
+            "ccc-discard": "ccc-agent turn-resolve discard",
+            "ccc": "ccc-agent turn-",
         }
         bodies = []
         for plugin in ("claude-ccc-containment", "codex-ccc-containment",
                        "hermes-ccc-containment"):
+            for old_name in ("status", "commit", "discard", "op"):
+                old_path = os.path.join(PLUGINS, plugin, "skills", old_name)
+                self.assertFalse(os.path.exists(old_path), old_path)
             for name, command in expected.items():
                 path = os.path.join(PLUGINS, plugin, "skills", name,
                                     "SKILL.md")
@@ -246,6 +249,7 @@ class TestPluginAssets(unittest.TestCase):
                 with open(path) as fh:
                     body = fh.read()
                 bodies.append(body)
+                self.assertIn("name: %s" % name, body)
                 self.assertIn("disable-model-invocation: true", body)
                 self.assertIn("$ARGUMENTS", body)
                 self.assertIn(command, body)
@@ -271,9 +275,9 @@ class TestPluginAssets(unittest.TestCase):
         self.assertIn("turn-add-workspace", src)
         self.assertIn("turn-remove-workspace", src)
         self.assertIn("--agent-session", src)
-        self.assertIn("ccc-commit", src)
+        self.assertIn("ccc-containment", src)
         self.assertTrue(os.path.isfile(
-            os.path.join(root, "skills", "ccc-commit", "SKILL.md")))
+            os.path.join(root, "skills", "ccc-containment", "SKILL.md")))
 
     def test_bundled_stop_hooks_are_agent_specific(self):
         with open(PLUGIN_STOP_HOOKS[0]) as fh:
@@ -444,7 +448,7 @@ class TestClaudeContextHook(unittest.TestCase):
         data = json.loads(proc.stdout)
         out = data["hookSpecificOutput"]
         self.assertEqual(out["hookEventName"], "SessionStart")
-        self.assertIn("ccc-commit", out["additionalContext"])
+        self.assertIn("ccc-containment", out["additionalContext"])
         self.assertIn("turn-kept-status", out["additionalContext"])
         self.assertIn("contained filesystem", out["additionalContext"])
 
@@ -468,7 +472,7 @@ class TestClaudeContextHook(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
         data = json.loads(proc.stdout)
-        self.assertIn("ccc-commit",
+        self.assertIn("ccc-containment",
                       data["hookSpecificOutput"]["additionalContext"])
         with open(claude_env) as fh:
             persisted = fh.read()
@@ -644,7 +648,7 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             self.restore_env(old)
         self.assertIsInstance(result, dict)
         context = result["context"]
-        self.assertIn("ccc-commit", context)
+        self.assertIn("ccc-containment", context)
         self.assertIn("turn-kept-status", context)
         self.assertIn("contained filesystem", context)
         self.assertIn("Hermes would otherwise idle", context)
