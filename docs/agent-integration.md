@@ -120,20 +120,16 @@ session end.
 Contained Claude Code uses the packaged `ccc@ccc-agent` Claude plugin, not
 settings-level hook duplication and not a session-only `--plugin-dir` flag.
 The production path is Anthropic's container/CI seed mechanism:
-`CLAUDE_CODE_PLUGIN_SEED_DIR` points to a read-only, pre-populated
-`~/.claude/plugins` tree baked into the image (normally `/opt/claude-seed`).
+`CLAUDE_CODE_PLUGIN_SEED_DIR` points to a read-only, pre-populated plugin tree.
+System setup uses `/opt/claude-seed`; user setup uses
+`~/.local/share/ccc-agent/claude-seed`.
 
-The pip package owns the static plugin files. During the image build, materialize
-the local marketplace source and let Claude Code perform the one-time install:
+The pip package owns all static plugin files. `ccc-agent setup` materializes the
+complete seed directly without invoking Claude or requiring an image rebuild.
+An image can optionally create the system seed in a separate layer:
 
 ```bash
-mkdir -p /opt/claude-seed/marketplaces
-python -m ccc_agent.claude_plugin \
-  --write-to /opt/claude-seed/marketplaces/ccc-agent
-CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-  claude plugin marketplace add /opt/claude-seed/marketplaces/ccc-agent
-CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-  claude plugin install ccc@ccc-agent
+python -m ccc_agent.claude_plugin --seed-dir /opt/claude-seed
 ```
 
 Setup-managed settings enable `ccc@ccc-agent` but do not duplicate hooks or

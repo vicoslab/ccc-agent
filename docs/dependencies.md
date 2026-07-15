@@ -28,7 +28,7 @@ environments without pulling a dependency tree into the protected runtime.
 |---|---|
 | `ccc-fuse-sidecar` | Privileged local FUSE/mount brokering when the application container does not have `CAP_SYS_ADMIN`. The sidecar remains policy-free. |
 | Codex CLI | Agent command and native plugin/Stop-hook integration via persistent Codex config plus a read-only plugin-cache bind. |
-| Claude Code | Agent command and native plugin/Stop-hook integration via Anthropic's pre-seeded plugin cache (`CLAUDE_CODE_PLUGIN_SEED_DIR`) plus a read-only seed bind. |
+| Claude Code | Agent command and native plugin/Stop-hook integration. `ccc-agent setup` materializes the packaged seed; runtime exposes it read-only through `CLAUDE_CODE_PLUGIN_SEED_DIR`. |
 | Hermes Agent | Agent command; process-exit review by default unless Hermes is explicitly configured. |
 | OpenCode | Command can be wrapped and reviewed at process exit; native plugin integration is not part of the current bundled set. |
 | Docker/ssh-agent/runtime sockets | Available inside the sandbox only if the surrounding runtime exposes them and `container_run_access` remains enabled. |

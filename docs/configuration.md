@@ -126,9 +126,9 @@ per tool:
 
 - Codex: setup enables/trusts the bundled plugin in Codex config; runtime mounts
   the package-owned plugin cache path read-only.
-- Claude: the container image pre-seeds Claude's plugin cache at build time using
-  `CLAUDE_CODE_PLUGIN_SEED_DIR`; runtime mounts that seed read-only and sets the
-  same env var inside bwrap. Setup-managed settings contain only
+- Claude: setup materializes a complete seed from pip package data; runtime
+  mounts it read-only and sets `CLAUDE_CODE_PLUGIN_SEED_DIR` inside bwrap.
+  Setup-managed settings contain only
   `enabledPlugins["ccc@ccc-agent"] = true`; hooks stay inside the plugin.
 
 ```json
@@ -151,16 +151,12 @@ per tool:
 }
 ```
 
-Build the Claude seed during the image build, not during runtime setup:
+`ccc-agent setup --system` creates `/opt/claude-seed`; user setup creates
+`~/.local/share/ccc-agent/claude-seed`. No Claude CLI invocation or image rebuild
+is required. To materialize the system seed in a dedicated image layer:
 
 ```dockerfile
-RUN mkdir -p /opt/claude-seed/marketplaces && \
-    python -m ccc_agent.claude_plugin \
-      --write-to /opt/claude-seed/marketplaces/ccc-agent
-RUN CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-      claude plugin marketplace add /opt/claude-seed/marketplaces/ccc-agent && \
-    CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed \
-      claude plugin install ccc@ccc-agent
+RUN python -m ccc_agent.claude_plugin --seed-dir /opt/claude-seed
 ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed
 ```
 
@@ -187,10 +183,10 @@ Generated defaults do not append Codex YOLO args and do not append Claude
 there are no separate Claude settings-level hooks. Manual operator config may
 still include `argv` or extra `setenv`, but that is an explicit override.
 
-`ccc-agent setup --system` writes persistent Codex config under `/etc/codex` and
-Claude plugin enablement under `/etc/claude-code/managed-settings.d`. User mode
-writes equivalent enablement under `~/.codex` and `~/.claude`. Claude plugin
-installation remains an image-build responsibility via the seed directory above.
+`ccc-agent setup --system` writes persistent Codex config under `/etc/codex`,
+Claude plugin enablement under `/etc/claude-code/managed-settings.d`, and the
+system seed under `/opt`. User mode writes equivalent config under the user's
+home and materializes a user-local seed.
 
 Set `agent_hook_mode: "disabled"` and `agent_plugins: {}` to disable native
 plugin/config setup.

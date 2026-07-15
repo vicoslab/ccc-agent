@@ -36,7 +36,7 @@
   "cred_mask": [],
   "cred_env": {},
 
-  "_agent_plugins_comment": "Mount-only CCC plugin assets for tools that load persistent config. Setup enables/trusts Codex. Claude uses Anthropic's production seed mechanism: bake the plugin into CLAUDE_CODE_PLUGIN_SEED_DIR (default /opt/claude-seed) at image build; setup enables it and initializes per-user metadata; ccc-agent run points contained Claude at that read-only seed. No default entry appends agent CLI argv. agent_hook_mode=plugins (default) | disabled. Per-turn hooks are best-effort: if a plugin fails to load, process-exit review still finalizes the session.",
+  "_agent_plugins_comment": "Mount-only CCC plugin assets for tools that load persistent config. Setup enables/trusts Codex and materializes Claude's complete seed from pip package data (system default /opt/claude-seed; user default ~/.local/share/ccc-agent/claude-seed). ccc-agent run points contained Claude at that read-only seed. No default entry appends agent CLI argv. agent_hook_mode=plugins (default) | disabled. Per-turn hooks are best-effort: if a plugin fails to load, process-exit review still finalizes the session.",
   "agent_hook_mode": "plugins",
   "agent_plugins": {
     "codex": {

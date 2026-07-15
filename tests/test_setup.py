@@ -286,7 +286,7 @@ class TestSetupConfig(unittest.TestCase):
         self.assertEqual(cfg["bwrap_setenv"], {})
         plugins = cfg["agent_plugins"]
         self.assertEqual(sorted(plugins), ["claude", "codex"])
-        seed = "/opt/claude-seed"
+        seed = "/home/domen/.local/share/ccc-agent/claude-seed"
         self.assertEqual(plugins["claude"]["src"], seed)
         self.assertEqual(plugins["claude"]["sandbox_path"], seed)
         self.assertEqual(plugins["claude"]["setenv"],
@@ -314,23 +314,21 @@ class TestSetupConfig(unittest.TestCase):
         self.assertFalse(cfg["protect_agent_state"])
         self.assertNotIn("workspace", cfg)
 
-    def test_setup_enables_codex_and_points_claude_at_preseeded_plugin_dir(self):
+    def test_user_setup_materializes_and_enables_claude_seed(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
             os.makedirs(home)
             config_path = os.path.join(tmp, "config.json")
             state_dir = os.path.join(tmp, "state")
-            claude_seed = os.path.join(tmp, "opt", "claude-seed")
             with mock.patch.dict(os.environ, {"HOME": home, "USER": "domen"}, clear=False):
                 rc = setup_mod.main([
                     "--user",
                     "--config", config_path,
                     "--state-dir", state_dir,
-                    "--claude-plugin-seed-dir", claude_seed,
                 ])
             self.assertEqual(rc, 0)
-            # Codex loads enabled/trusted plugins from config; user-mode setup
-            # writes the managed block to ~/.codex/config.toml.
+            claude_seed = os.path.join(
+                home, ".local", "share", "ccc-agent", "claude-seed")
             codex_config = os.path.join(home, ".codex", "config.toml")
             self.assertTrue(os.path.isfile(codex_config))
             with open(codex_config) as fh:
@@ -345,14 +343,21 @@ class TestSetupConfig(unittest.TestCase):
                 self.assertIn('hooks.state."%s".trusted_hash = "%s"'
                               % (key, trusted_hash), codex_toml)
 
-            # Claude is production-seeded at image build time. Runtime setup
-            # writes only plugin enablement: no hooks and no marketplace source.
+            # Setup creates a complete seed from package data. It does not need
+            # Docker or invoke Claude's marketplace installer.
             claude_settings = os.path.join(home, ".claude", "settings.json")
             with open(claude_settings) as fh:
                 claude = json.load(fh)
             self.assertEqual(claude,
                              {"enabledPlugins": {"ccc@ccc-agent": True}})
-            self.assertFalse(os.path.exists(claude_seed))
+            self.assertTrue(os.path.isfile(os.path.join(
+                claude_seed, "marketplaces", "ccc-agent", ".claude-plugin",
+                "marketplace.json")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                claude_seed, "cache", "ccc-agent", "ccc", "0.2.0",
+                ".claude-plugin", "plugin.json")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                claude_seed, "installed_plugins.json")))
 
             with open(config_path) as fh:
                 cfg = json.load(fh)
@@ -396,7 +401,8 @@ class TestSetupConfig(unittest.TestCase):
                 os.path.join(home, ".codex", "config.toml")))
             self.assertFalse(os.path.exists(
                 os.path.join(home, ".claude", "settings.json")))
-            self.assertFalse(os.path.exists(claude_seed))
+            self.assertTrue(os.path.isfile(os.path.join(
+                claude_seed, "installed_plugins.json")))
             with open(codex_config) as fh:
                 self.assertIn('plugins."ccc@ccc-agent".enabled = true',
                               fh.read())
