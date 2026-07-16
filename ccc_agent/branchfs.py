@@ -62,6 +62,30 @@ def _daemon_socket(root):
     return os.path.join(root.store, "daemon.sock")
 
 
+def _validate_nested_roots(outer_root, child_root):
+    """Fail closed unless two root records describe one nested BranchFS tree."""
+    if os.path.abspath(outer_root.store) != os.path.abspath(child_root.store):
+        raise BranchfsError("nested branch must use the outer BranchFS store")
+    if os.path.abspath(outer_root.base) != os.path.abspath(child_root.base):
+        raise BranchfsError("nested branch must use the outer BranchFS base")
+    if outer_root.branch == "main":
+        raise BranchfsError("nested branch parent must be an outer delta, not main")
+    if outer_root.branch == child_root.branch:
+        raise BranchfsError("nested branch must differ from its outer branch")
+    declared_parent = getattr(child_root, "parent_branch", outer_root.branch)
+    if declared_parent != outer_root.branch:
+        raise BranchfsError(
+            "nested root declares parent %s; expected parent %s"
+            % (declared_parent, outer_root.branch))
+
+
+def _remove_path(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
 def _unix_socket_ready(path):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -546,6 +570,50 @@ class BranchfsCli(object):
             argv.extend(["--hide", hidden])
         self._invoke(*argv)
 
+    def create_nested_branch(self, outer_root, child_root):
+        """Create ``child_root`` strictly beneath an existing outer delta."""
+        _validate_nested_roots(outer_root, child_root)
+        self.create_branch(child_root, parent=outer_root.branch)
+
+    # ``child`` terminology is kept as an API alias for callers that model the
+    # BranchFS relationship rather than the supervisor's nested route.
+    create_child_branch = create_nested_branch
+
+    def _require_nested_parent(self, outer_root, child_root):
+        _validate_nested_roots(outer_root, child_root)
+        self.start_daemon(child_root)
+        out = self._invoke("status", child_root.branch, "--storage",
+                           child_root.store, "--json")
+        try:
+            data = json.loads(out)
+        except ValueError as exc:
+            raise BranchfsError("unparseable nested branch status: %s" % exc)
+        actual_parent = data.get("parent")
+        if actual_parent != outer_root.branch:
+            raise BranchfsError(
+                "nested branch %s has parent %s; expected parent %s; "
+                "refusing an operation that could target base"
+                % (child_root.branch, actual_parent, outer_root.branch))
+
+    def commit_nested_branch(self, outer_root, child_root):
+        """Merge a verified child into its outer branch, never directly to base."""
+        self._require_nested_parent(outer_root, child_root)
+        outcome = self.commit(child_root)
+        if outcome.get("parent") != outer_root.branch:
+            raise BranchfsError(
+                "nested commit reported parent %s; expected parent %s"
+                % (outcome.get("parent"), outer_root.branch))
+        return outcome
+
+    commit_child_branch = commit_nested_branch
+
+    def abort_nested_branch(self, outer_root, child_root):
+        """Discard a verified nested child without changing the outer delta."""
+        self._require_nested_parent(outer_root, child_root)
+        return self.abort(child_root)
+
+    abort_child_branch = abort_nested_branch
+
     def mount(self, root, agent=True, allow_other=False):
         self.start_daemon(root)
         argv = ["mount", "--storage", root.store, "--branch", root.branch]
@@ -639,6 +707,7 @@ class FakeBranchFS(object):
     def __init__(self):
         self._state = {}      # (store, branch) -> "open" | "frozen"
         self._deletes = {}    # (store, branch) -> set(relpath)
+        self._parents = {}    # (store, branch) -> immediate parent branch
         self._mounted = {}    # mount -> (store, branch)
 
     # -- helpers -----------------------------------------------------------
@@ -663,6 +732,41 @@ class FakeBranchFS(object):
         os.makedirs(self._files_dir(root), exist_ok=True)
         self._state[self._key(root)] = "open"
         self._deletes.setdefault(self._key(root), set())
+        self._parents[self._key(root)] = parent
+
+    def create_nested_branch(self, outer_root, child_root):
+        _validate_nested_roots(outer_root, child_root)
+        if self._key(outer_root) not in self._state:
+            raise BranchfsError("outer branch does not exist in fake BranchFS")
+        self.create_branch(child_root, parent=outer_root.branch)
+
+    create_child_branch = create_nested_branch
+
+    def _require_nested_parent(self, outer_root, child_root):
+        _validate_nested_roots(outer_root, child_root)
+        actual_parent = self._parents.get(self._key(child_root))
+        if actual_parent != outer_root.branch:
+            raise BranchfsError(
+                "nested branch %s has parent %s; expected parent %s; "
+                "refusing an operation that could target base"
+                % (child_root.branch, actual_parent, outer_root.branch))
+
+    def commit_nested_branch(self, outer_root, child_root):
+        self._require_nested_parent(outer_root, child_root)
+        outcome = self.commit(child_root)
+        if outcome.get("parent") != outer_root.branch:
+            raise BranchfsError(
+                "nested commit reported parent %s; expected parent %s"
+                % (outcome.get("parent"), outer_root.branch))
+        return outcome
+
+    commit_child_branch = commit_nested_branch
+
+    def abort_nested_branch(self, outer_root, child_root):
+        self._require_nested_parent(outer_root, child_root)
+        return self.abort(child_root)
+
+    abort_child_branch = abort_nested_branch
 
     def mount(self, root, agent=True, allow_other=False):
         files = self._files_dir(root)
@@ -704,27 +808,100 @@ class FakeBranchFS(object):
     def status(self, root):
         return self.status_report(root).changes
 
-    def _apply_to_base(self, root):
-        files = self._files_dir(root)
-        if os.path.isdir(files):
-            for dirpath, _dirnames, filenames in os.walk(files):
-                for name in filenames:
-                    full = os.path.join(dirpath, name)
-                    rel = os.path.relpath(full, files)
-                    dest = os.path.join(root.base, rel)
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    def _branch_files(self, store, branch):
+        return os.path.join(store, "branches", branch, "files")
+
+    def _is_deleted(self, key, rel):
+        rel = rel.strip("/")
+        return any(rel == deleted or rel.startswith(deleted.rstrip("/") + "/")
+                   for deleted in self._deletes.get(key, ()))
+
+    def _visible_path_exists(self, store, branch, base, rel, seen=None):
+        """Resolve fake inheritance without ever materializing it in a mount."""
+        key = (store, branch)
+        if seen is None:
+            seen = set([key])
+        else:
+            seen = set(seen)
+            if key in seen:
+                raise BranchfsError("cycle in fake BranchFS parent graph")
+            seen.add(key)
+        if os.path.lexists(os.path.join(self._branch_files(store, branch), rel)):
+            return True
+        if self._is_deleted(key, rel):
+            return False
+        parent = self._parents.get(key, "main")
+        if parent == "main":
+            return os.path.lexists(os.path.join(base, rel))
+        return self._visible_path_exists(store, parent, base, rel, seen=seen)
+
+    def _inherited_path_exists(self, root, branch, rel):
+        parent = self._parents.get((root.store, branch), "main")
+        if parent == "main":
+            return os.path.lexists(os.path.join(root.base, rel))
+        return self._visible_path_exists(root.store, parent, root.base, rel)
+
+    def _copy_delta_files(self, source, destination, on_copy=None):
+        if not os.path.isdir(source):
+            return
+        for dirpath, _dirnames, filenames in os.walk(source):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, source)
+                dest = os.path.join(destination, rel)
+                _remove_path(dest)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                if os.path.islink(full):
+                    os.symlink(os.readlink(full), dest)
+                else:
                     shutil.copy2(full, dest)
+                if on_copy is not None:
+                    on_copy(rel)
+
+    def _apply_to_base(self, root):
+        # BranchFS resolves a delta over a same-path tombstone. Applying deletes
+        # first and copies second preserves that final state in the fake.
         for rel in self._deletes.get(self._key(root), ()):
-            target = os.path.join(root.base, rel)
-            if os.path.isfile(target) or os.path.islink(target):
-                os.unlink(target)
-            elif os.path.isdir(target):
-                shutil.rmtree(target)
+            _remove_path(os.path.join(root.base, rel))
+        self._copy_delta_files(self._files_dir(root), root.base)
+
+    def _merge_into_parent(self, root, parent):
+        parent_key = (root.store, parent)
+        if parent_key not in self._state:
+            raise BranchfsError("parent branch %s does not exist" % parent)
+        parent_files = self._branch_files(root.store, parent)
+        os.makedirs(parent_files, exist_ok=True)
+        parent_deletes = self._deletes.setdefault(parent_key, set())
+
+        # Child tombstones remove parent deltas. They remain tombstones only if
+        # there is still an inherited object below the parent branch; deleting a
+        # file created solely in the outer delta must collapse to a no-op.
+        for rel in sorted(self._deletes.get(self._key(root), ())):
+            rel = rel.strip("/")
+            inherited_exists = self._inherited_path_exists(root, parent, rel)
+            _remove_path(os.path.join(parent_files, rel))
+            parent_deletes.difference_update(
+                item for item in list(parent_deletes)
+                if item == rel or item.startswith(rel.rstrip("/") + "/"))
+            if inherited_exists:
+                parent_deletes.add(rel)
+
+        def child_delta_copied(rel):
+            parent_deletes.difference_update(
+                item for item in list(parent_deletes)
+                if item == rel or item.startswith(rel.rstrip("/") + "/"))
+
+        self._copy_delta_files(self._files_dir(root), parent_files,
+                               on_copy=child_delta_copied)
 
     def commit(self, root):
-        self._apply_to_base(root)
+        parent = self._parents.get(self._key(root), "main")
+        if parent == "main":
+            self._apply_to_base(root)
+        else:
+            self._merge_into_parent(root, parent)
         self._cleanup(root)
-        return {"parent": "main", "auto_merges": [], "conflicts": []}
+        return {"parent": parent, "auto_merges": [], "conflicts": []}
 
     def abort(self, root):
         self._cleanup(root)

@@ -24,6 +24,12 @@ def make_root(tmp, branch="agent-20260611T000000Z-abc12345"):
     )
 
 
+def make_child_root(tmp, branch="route-0123456789abcdef0123456789abcdef"):
+    root = make_root(tmp, branch=branch)
+    root.mount = os.path.join(tmp, "mounts", "nested-storage_user")
+    return root
+
+
 STATUS_JSON = {
     "name": "agent-20260611T000000Z-abc12345",
     "parent": "main",
@@ -151,6 +157,75 @@ class TestBranchfsCli(unittest.TestCase):
         self.assertEqual(call.count("--hide"), 2)
         self.assertIn(".ssh", call)
         self.assertIn(".netrc", call)
+
+    def test_create_nested_branch_uses_outer_branch_as_parent(self):
+        child = make_child_root(self.tmp.name)
+        runner = RecordingRunner()
+        cli = BranchfsCli(run=runner)
+
+        cli.create_nested_branch(self.root, child)
+
+        call = runner.calls[-1]
+        self.assertEqual(call[1], "create")
+        self.assertEqual(call[call.index("--parent") + 1], self.root.branch)
+        self.assertIn(child.branch, call)
+
+    def test_commit_nested_branch_preflights_parent_then_commits(self):
+        child = make_child_root(self.tmp.name)
+        runner = RecordingRunner(outputs={
+            "status": json.dumps({"name": child.branch,
+                                  "parent": self.root.branch, "diff": []}),
+            "commit-branch": json.dumps({
+                "parent": self.root.branch, "auto_merges": [], "conflicts": []
+            }),
+        })
+        cli = BranchfsCli(run=runner)
+
+        outcome = cli.commit_nested_branch(self.root, child)
+
+        subcommands = [call[1] for call in runner.calls]
+        self.assertEqual(subcommands, ["start-daemon", "status",
+                                       "start-daemon", "commit-branch"])
+        self.assertEqual(outcome["parent"], self.root.branch)
+
+    def test_commit_nested_branch_refuses_parent_mismatch_before_commit(self):
+        child = make_child_root(self.tmp.name)
+        runner = RecordingRunner(outputs={
+            "status": json.dumps({"name": child.branch,
+                                  "parent": "main", "diff": []}),
+        })
+        cli = BranchfsCli(run=runner)
+
+        with self.assertRaises(BranchfsError) as ctx:
+            cli.commit_nested_branch(self.root, child)
+
+        self.assertIn("expected parent", str(ctx.exception))
+        self.assertNotIn("commit-branch", [call[1] for call in runner.calls])
+
+    def test_abort_nested_branch_preflights_parent_then_discards_child(self):
+        child = make_child_root(self.tmp.name)
+        runner = RecordingRunner(outputs={
+            "status": json.dumps({"name": child.branch,
+                                  "parent": self.root.branch, "diff": []}),
+        })
+        cli = BranchfsCli(run=runner)
+
+        cli.abort_nested_branch(self.root, child)
+
+        self.assertEqual([call[1] for call in runner.calls],
+                         ["start-daemon", "status",
+                          "start-daemon", "abort-branch"])
+
+    def test_nested_operations_reject_different_branchfs_stores(self):
+        child = make_child_root(self.tmp.name)
+        child.store = os.path.join(self.tmp.name, "other-store")
+        runner = RecordingRunner()
+        cli = BranchfsCli(run=runner)
+
+        with self.assertRaises(BranchfsError):
+            cli.create_nested_branch(self.root, child)
+
+        self.assertEqual(runner.calls, [])
 
     def test_mount_agent_view(self):
         runner = RecordingRunner()
@@ -668,6 +743,69 @@ class TestFakeBranchFS(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.root.base, "new.txt")))
         self.assertFalse(os.path.exists(os.path.join(self.root.base,
                                                      "existing.txt")))
+
+    def test_nested_child_commit_merges_into_outer_delta_never_base(self):
+        child = make_child_root(self.tmp.name)
+        self.fake.start_daemon(self.root)
+        self.fake.create_branch(self.root)
+        self.fake.create_nested_branch(self.root, child)
+        self.fake.mount(child)
+        with open(os.path.join(child.mount, "nested.txt"), "w") as fh:
+            fh.write("child delta\n")
+        self.fake.record_delete(child, "existing.txt")
+
+        outcome = self.fake.commit_nested_branch(self.root, child)
+
+        self.assertEqual(outcome["parent"], self.root.branch)
+        self.assertFalse(os.path.exists(os.path.join(self.root.base,
+                                                     "nested.txt")))
+        self.assertTrue(os.path.exists(os.path.join(self.root.base,
+                                                    "existing.txt")))
+        outer_ops = {change.path: change.op
+                     for change in self.fake.status(self.root)}
+        self.assertEqual(outer_ops["/storage/user/nested.txt"], "A")
+        self.assertEqual(outer_ops["/storage/user/existing.txt"], "D")
+
+        self.fake.commit(self.root)
+        self.assertTrue(os.path.isfile(os.path.join(self.root.base,
+                                                    "nested.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.root.base,
+                                                     "existing.txt")))
+
+    def test_nested_child_delete_of_outer_only_delta_is_a_noop_not_base_delete(self):
+        child = make_child_root(self.tmp.name)
+        self.fake.create_branch(self.root)
+        self.fake.mount(self.root)
+        with open(os.path.join(self.root.mount, "outer-only.txt"), "w") as fh:
+            fh.write("outer delta\n")
+        self.fake.create_nested_branch(self.root, child)
+        self.fake.record_delete(child, "outer-only.txt")
+
+        self.fake.commit_nested_branch(self.root, child)
+
+        paths = [change.path for change in self.fake.status(self.root)]
+        self.assertNotIn("/storage/user/outer-only.txt", paths)
+        self.assertFalse(os.path.exists(os.path.join(self.root.base,
+                                                     "outer-only.txt")))
+
+    def test_nested_child_abort_discards_only_child_delta(self):
+        child = make_child_root(self.tmp.name)
+        self.fake.create_branch(self.root)
+        self.fake.mount(self.root)
+        with open(os.path.join(self.root.mount, "outer.txt"), "w") as fh:
+            fh.write("outer delta\n")
+        self.fake.create_nested_branch(self.root, child)
+        self.fake.mount(child)
+        with open(os.path.join(child.mount, "child.txt"), "w") as fh:
+            fh.write("child delta\n")
+
+        self.fake.abort_nested_branch(self.root, child)
+
+        paths = [change.path for change in self.fake.status(self.root)]
+        self.assertIn("/storage/user/outer.txt", paths)
+        self.assertNotIn("/storage/user/child.txt", paths)
+        self.assertFalse(os.path.exists(os.path.join(self.root.base,
+                                                     "child.txt")))
 
     def test_abort_discards_deltas(self):
         self.fake.start_daemon(self.root)
