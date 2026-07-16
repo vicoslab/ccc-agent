@@ -67,6 +67,22 @@ scripts/test-plugin-hooks.sh   # bundled plugin/hook behavior where supported
 scripts/test-e2e-bwrap.sh      # real bwrap + FUSE path; needs capable host
 ```
 
+The opt-in user-facing acceptance suite launches real Codex, Claude, and Hermes
+clients through local CLI, direct SSH, and desktop/server-equivalent paths:
+
+```bash
+scripts/run-user-facing-acceptance.sh --self-test-only
+scripts/run-user-facing-acceptance.sh /tmp/acceptance.json core
+scripts/run-user-facing-acceptance.sh /tmp/acceptance.json full
+```
+
+`core` runs the three actual local `ccc-agent run` flows. `full` also requires
+direct SSH and official desktop/server protocol drivers for all three agents.
+These tests make real model calls and filesystem changes below a dedicated test
+root, so they never run from ordinary `unittest discover`. See
+[User-facing acceptance testing](user-facing-acceptance-testing.md) for the
+manifest, pass evidence, remote-driver contract, and manual desktop fallback.
+
 Do not claim FUSE runtime validation passed unless a real BranchFS mount and
 bwrap run succeeded on a host with working `/dev/fuse`/sidecar support.
 
