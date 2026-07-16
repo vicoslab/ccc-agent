@@ -16,7 +16,35 @@ that target, but the verifier must read that node's configured `state_dir` and
 local session lifecycle. Shared NFS visibility does not make live FUSE or
 session state cluster-global.
 
-## Certification boundary
+## Certification layers
+
+The acceptance tooling has two deliberately separate layers:
+
+1. **Platform acceptance** is deterministic and performs no model calls. It runs
+   the deployed executable against real BranchFS/FUSE and bwrap, exercises
+   foreground `run`, dedicated `serve`, the generic pending-review boundary,
+   both accept and abort endings, outer workspace turn decisions plus
+   conservative shared/unattributed routing fallback, protocol-clean server
+   output, package assets, and mount/socket cleanup.
+2. **Model/plugin acceptance** is the existing `core`/`full` matrix below. It
+   requires authenticated vendor clients and proves native plugin behavior and
+   actual user interaction.
+
+Run platform acceptance first after every install or upgrade:
+
+```bash
+cp tests/user_facing_acceptance/platform.example.json \
+   /tmp/ccc-agent-platform.json
+scripts/run-user-facing-acceptance.sh \
+   --platform /tmp/ccc-agent-platform.json
+```
+
+A platform pass does not imply that Codex, Claude, or Hermes credentials,
+plugins, or official remote drivers are installed. Conversely, model prose is
+not a substitute for the platform checks. Release certification should report
+both layers and explicitly list unavailable vendor cells.
+
+## Model/plugin certification boundary
 
 A full pass covers this matrix:
 

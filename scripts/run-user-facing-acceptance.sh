@@ -11,13 +11,16 @@ usage() {
     cat <<'EOF'
 usage:
   scripts/run-user-facing-acceptance.sh --self-test-only
+  scripts/run-user-facing-acceptance.sh --platform MANIFEST
   scripts/run-user-facing-acceptance.sh MANIFEST [core|full]
 
-core  actual local `ccc-agent run` interactive flow for Codex, Claude, Hermes
-full  core + direct SSH CLI + official desktop/server protocol flow (default)
+--platform  deterministic real BranchFS/bwrap/run/serve/review/routing-fallback
+            deployment checks; no model client or credentials required
+core        actual local `ccc-agent run` interactive flow for Codex, Claude, Hermes
+full        core + direct SSH CLI + official desktop/server protocol flow (default)
 
-This command performs real model calls and writes only below MANIFEST.test_root.
-It first runs the non-destructive harness tests. The real suite remains opt-in.
+The platform mode writes only below MANIFEST.test_root and performs no model calls.
+Core/full perform real model calls. Every mode first runs non-destructive harness tests.
 EOF
 }
 
@@ -26,10 +29,18 @@ if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
     exit 0
 fi
 
-python3 -m unittest tests.user_facing_acceptance.test_harness -v
+python3 -m unittest tests.user_facing_acceptance.test_harness \
+  tests.user_facing_acceptance.test_platform_acceptance -v
 
 if [[ ${1:-} == "--self-test-only" ]]; then
     exit 0
+fi
+if [[ ${1:-} == "--platform" ]]; then
+    if [[ $# -ne 2 || ! -f $2 ]]; then
+        echo "platform acceptance manifest not found: ${2:-}" >&2
+        exit 2
+    fi
+    exec python3 -m tests.user_facing_acceptance.platform "$2"
 fi
 if [[ $# -lt 1 || $# -gt 2 ]]; then
     usage >&2

@@ -1,0 +1,8 @@
+{
+  "ccc_agent": "/usr/local/bin/ccc-agent",
+  "ccc_agent_config": "/etc/ccc-agent/config.json",
+  "test_root": "/storage/user/ccc-agent-acceptance-platform",
+  "artifacts_dir": "/storage/user/ccc-agent-acceptance-artifacts",
+  "timeout_seconds": 300,
+  "poll_seconds": 0.2
+}
