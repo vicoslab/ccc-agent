@@ -22,7 +22,8 @@ def _write_json(path, data):
 
 def _is_review_cache_file(name):
     if name in ("session.json", "policy-decision.json", "summary.md",
-                "commit-permission-denied.json"):
+                "commit-permission-denied.json",
+                "route-reconciliation.json"):
         return True
     return ((name.startswith("status.") or name.startswith("ignored.") or
              name.startswith("warnings.")) and name.endswith(".json"))
@@ -66,6 +67,10 @@ def write_review(store, session, changes_by_root, decision,
     if failures:
         _write_json(os.path.join(review, "commit-permission-denied.json"),
                     failures)
+    reconciliation = session.policy.get("route_reconciliation")
+    if isinstance(reconciliation, dict):
+        _write_json(os.path.join(review, "route-reconciliation.json"),
+                    reconciliation)
     _write_json(os.path.join(review, "policy-decision.json"),
                 decision.to_dict())
 
@@ -172,6 +177,21 @@ def render_summary(session, changes_by_root, decision, warnings_by_root=None,
             for warning in warnings:
                 out("- `%s` `%s`: %s" % (root_name, warning.path,
                                            warning.message))
+        out("")
+    reconciliation = session.policy.get("route_reconciliation")
+    if isinstance(reconciliation, dict):
+        out("## Session-delta reconciliation")
+        out("")
+        counts = reconciliation.get("category_counts") or {}
+        if counts:
+            out("- path categories: %s" % ", ".join(
+                "%s=%s" % item for item in sorted(counts.items())))
+        coverage = reconciliation.get("coverage") or {}
+        out("- bwrap coverage: routed=%s, bypassed/unattributed=%s" % (
+            coverage.get("routed_bwrap_calls", 0),
+            coverage.get("bypassed_or_unattributed_calls", 0)))
+        for blocker in reconciliation.get("blockers") or ():
+            out("- review blocker: %s" % blocker)
         out("")
     out("## Changed paths")
     out("")

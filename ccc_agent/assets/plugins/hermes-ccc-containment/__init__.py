@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 _FINALIZED_TURNS = set()
 _LAST_REVIEW_DIGEST = None
 _WORKSPACE_PATHS = {}
+_WORKSPACE_GENERATIONS = {}
 _HOOK_WORKSPACE_PATHS = {}
 _WORKSPACE_CONTROL = None
 _WORKSPACE_LOCK = threading.RLock()
@@ -141,11 +142,16 @@ def _hook_session_from_kwargs(**kwargs) -> str:
     return os.environ.get("CCC_AGENT_HOOK_SESSION") or os.environ.get("CCC_AGENT_SESSION", "")
 
 
-def _confirm_workspaces(workspaces) -> bool:
-    """Replace roots through the process-pinned in-process Hermes channel."""
+def _replace_workspace_session(logical_session: str, workspace: str = "",
+                               state: str = "active") -> bool:
+    """Replace one logical session through the process-pinned channel."""
     global _WORKSPACE_CONTROL
-    roots = sorted(set(str(path) for path in workspaces if path))
+    roots = [str(workspace)] if workspace else []
     with _WORKSPACE_LOCK:
+        generation = int(_WORKSPACE_GENERATIONS.get(logical_session, 0)) + 1
+        # Retain monotonicity even if delivery becomes ambiguous. Gaps are safe;
+        # reusing an old generation is not.
+        _WORKSPACE_GENERATIONS[logical_session] = generation
         if _WORKSPACE_CONTROL is None:
             sock = os.environ.get("CCC_AGENT_CONTROL_SOCK")
             token = os.environ.get("CCC_AGENT_CONTROL_TOKEN")
@@ -159,15 +165,16 @@ def _confirm_workspaces(workspaces) -> bool:
                 logger.debug("ccc Hermes workspace admission failed: %s", exc)
                 return False
         try:
-            _WORKSPACE_CONTROL.confirm_workspace_roots(roots)
+            _WORKSPACE_CONTROL.replace_workspace_session(
+                logical_session, generation, roots, state=state)
             return True
         except (ControlError, OSError) as exc:
-            logger.debug("ccc Hermes workspace confirmation failed: %s", exc)
+            logger.debug("ccc Hermes workspace replacement failed: %s", exc)
             return False
 
 
 def _signal_workspace_start(**kwargs) -> None:
-    """Confirm the per-session root union; hooks remain proposal hints."""
+    """Confirm one per-session root; hooks remain proposal hints."""
     if not _contained() or not _has_control_socket():
         return
     hook_session = _hook_session_from_kwargs(**kwargs)
@@ -196,9 +203,7 @@ def _signal_workspace_start(**kwargs) -> None:
                     logger.debug("ccc turn-add-workspace exited %s: %s",
                                  proc.returncode, proc.stderr.strip())
 
-            candidate = dict(_WORKSPACE_PATHS)
-            candidate[hook_session] = workspace
-            if _confirm_workspaces(candidate.values()):
+            if _replace_workspace_session(hook_session, workspace):
                 _WORKSPACE_PATHS[hook_session] = workspace
         except Exception as exc:
             logger.debug("ccc turn-add-workspace signal failed: %s", exc)
@@ -215,9 +220,7 @@ def _signal_workspace_end(**kwargs) -> None:
         confirmed_workspace = _WORKSPACE_PATHS.get(hook_session)
         hook_workspace = _HOOK_WORKSPACE_PATHS.get(hook_session)
         if confirmed_workspace is not None:
-            candidate = dict(_WORKSPACE_PATHS)
-            candidate.pop(hook_session, None)
-            _confirm_workspaces(candidate.values())
+            _replace_workspace_session(hook_session, state="ended")
             # Never let a later successful replacement resurrect an ended
             # session after a transient clear failure.
             _WORKSPACE_PATHS.pop(hook_session, None)

@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Read-only CCC bwrap route adapter entry point."""
+
+import os
+import sys
+
+# Works both from a source checkout and when assets are installed below the
+# ccc_agent package in site-packages.
+_package_parent = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                               "..", "..", ".."))
+if _package_parent not in sys.path:
+    sys.path.insert(0, _package_parent)
+
+from ccc_agent.bwrap_route import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

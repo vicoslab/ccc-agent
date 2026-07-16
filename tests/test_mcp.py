@@ -385,8 +385,7 @@ class TestMCPControlAdmission(unittest.TestCase):
             self.assertFalse(reply["ok"])
             self.assertIn("MCP", reply["error"])
             self.assertEqual([req["op"] for req in calls], [
-                "turn-kept-status", "turn-confirm-workspace-roots"])
-            self.assertEqual(calls[-1]["paths"], [])
+                "turn-kept-status"])
 
     def test_raw_control_token_cannot_confirm_workspace_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -565,6 +564,40 @@ raise SystemExit(proc.returncode)
                                   return_value=False):
             self.assertIsNone(server._eligible_workspace_peer(20))
 
+    def test_route_lookup_requires_exact_wrapper_descendant_and_vendor(self):
+        server = ControlServer("/unused", lambda req: {}, "token",
+                               expected_clients=("codex",),
+                               require_launch_boundary=False)
+        server._registered_client_fingerprint = (20, 2)
+        server._registered_client_name = "codex"
+        server.route_wrapper_paths = frozenset(("/opt/vendor/bwrap",))
+        identities = {
+            20: {"pid": 20, "ppid": 1, "start_time": 2,
+                 "argv": ["codex", "app-server"], "exe": "/opt/codex"},
+            30: {"pid": 30, "ppid": 40, "start_time": 3,
+                 "argv": ["/usr/bin/python3", "/opt/vendor/bwrap"],
+                 "exe": "/usr/bin/python3"},
+            40: {"pid": 40, "ppid": 20, "start_time": 4,
+                 "argv": ["codex-linux-sandbox"], "exe": "/opt/codex"},
+            50: {"pid": 50, "ppid": 20, "start_time": 5,
+                 "argv": ["bash"], "exe": "/usr/bin/bash"},
+        }
+        with mock.patch.object(control_mod, "peer_credentials",
+                               return_value=(30, os.geteuid(), os.getegid())), \
+                mock.patch.object(control_mod, "_proc_identity",
+                                  side_effect=lambda pid: identities.get(pid)):
+            admitted = server._eligible_route_peer(object(), {
+                "op": "route-lookup", "provider": "codex"})
+            self.assertEqual(admitted["client"], "codex")
+            self.assertIsNone(server._eligible_route_peer(object(), {
+                "op": "route-lookup", "provider": "claude"}))
+        with mock.patch.object(control_mod, "peer_credentials",
+                               return_value=(50, os.geteuid(), os.getegid())), \
+                mock.patch.object(control_mod, "_proc_identity",
+                                  side_effect=lambda pid: identities.get(pid)):
+            self.assertIsNone(server._eligible_route_peer(object(), {
+                "op": "route-lookup", "provider": "codex"}))
+
     def test_lost_pinned_transport_revokes_roots_only_while_client_is_live(self):
         calls = []
         server = ControlServer("/unused", lambda req: calls.append(req) or {},
@@ -572,14 +605,20 @@ raise SystemExit(proc.returncode)
         mcp_conn = object()
         server._mcp_conn = mcp_conn
         server._mcp_fingerprint = (20, 2, 10, 1)
+        server._mcp_client_name = "codex"
+        server._mcp_destructive_authorized = True
         with mock.patch.object(control_mod, "_proc_identity",
-                               return_value={"pid": 10, "start_time": 1}):
+                               return_value={"pid": 10, "start_time": 1}), \
+                mock.patch.object(server, "_mcp_connection_valid",
+                                  return_value=True):
             server._release_pinned_connection(mcp_conn)
 
         self.assertIsNone(server._mcp_conn)
         self.assertEqual(calls, [{
-            "op": "turn-confirm-workspace-roots", "paths": [],
-            "source": "trusted-transport-closed",
+            "op": "workspace-authority-revoke",
+            "source": "mcp-codex",
+            "authority_instance": "mcp-20-2-10-1",
+            "reason": "trusted-transport-closed",
         }])
 
         calls[:] = []

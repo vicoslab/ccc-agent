@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import selectors
 import shutil
 import socket
@@ -37,6 +38,7 @@ from .paths import is_within, normalize
 from .policy import (ABORT, AUTO_COMMIT, NO_CHANGES, PENDING_REVIEW,
                      PolicyConfig, PolicyDecision, evaluate, split_ignored)
 from .previous_commits import split_previously_committed_changes
+from .route_manager import DeltaRouteManager
 from .session import (ProtectedRoot, Session, is_remote_bridge,
                       remote_bridge_agent_kind)
 from .turn import TurnController
@@ -57,6 +59,8 @@ ENV_HARDEN_CLIENT = "CCC_AGENT_HARDEN_CLIENT"
 ENV_MCP_REGISTER_CLIENT = "CCC_AGENT_MCP_REGISTER_CLIENT"
 ENV_CONFIRM_LAUNCH_WORKSPACE = "CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE"
 ENV_CLIENT_PRELOAD = "CCC_AGENT_CLIENT_PRELOAD"
+ENV_ROUTE_VENDOR = "CCC_AGENT_ROUTE_VENDOR"
+ENV_REAL_BWRAP = "CCC_AGENT_REAL_BWRAP"
 
 # Values from an enclosing/stale ccc-agent session must never become authority in
 # a new session.  Remove them before assigning this launch's fresh identity and
@@ -69,6 +73,7 @@ TRANSIENT_INTERNAL_ENV = (
     ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
     ENV_HARDEN_CLIENT, ENV_MCP_REGISTER_CLIENT,
     ENV_CONFIRM_LAUNCH_WORKSPACE, ENV_CLIENT_PRELOAD,
+    ENV_ROUTE_VENDOR, ENV_REAL_BWRAP,
 )
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -402,6 +407,15 @@ class RunnerConfig(object):
             self.workspace_admission_roots)
         self.policy["allow_protected_root_workspace"] = (
             self.allow_protected_root_workspace)
+        self.policy["session_delta_routing"] = self.session_delta_routing
+        self.policy["session_delta_routing_vendors"] = list(
+            self.session_delta_routing_vendors)
+        route_uid = bwrap_uid if bwrap_uid is not None else os.getuid()
+        self.policy["sandbox_route_root"] = (
+            "/run/user/%d/ccc-agent-routes" % int(route_uid))
+        if self._launch_workspace_admission is not None:
+            self.policy["launch_workspace_admission"] = dict(
+                self._launch_workspace_admission)
         if "allowed_scopes" not in self.policy:
             self.policy["allowed_scopes"] = ([workspace] if workspace else [])
         PolicyConfig.from_dict(self.policy)  # validate early
@@ -1134,6 +1148,102 @@ def _bwrap_gid(config):
     return os.getgid()
 
 
+_SIMPLE_EXEC_RE = re.compile(
+    r"^\s*exec\s+(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))", re.MULTILINE)
+
+
+def _resolved_vendor_launcher(config, env=None):
+    source_env = os.environ if env is None else env
+    command = config.agent_command[0] if config.agent_command else None
+    if not command:
+        return None
+    path = command if os.path.isabs(command) else shutil.which(
+        command, path=(source_env.get(ENV_SHIM_UNDERLYING_PATH) or
+                       source_env.get("PATH") or BWRAP_DEFAULT_PATH))
+    if not path:
+        return None
+    path = os.path.realpath(path)
+    try:
+        if os.path.getsize(path) <= 16384:
+            with open(path, errors="replace") as fh:
+                match = _SIMPLE_EXEC_RE.search(fh.read())
+            if match:
+                target = next(value for value in match.groups() if value)
+                if os.path.isabs(target) and os.path.isfile(target):
+                    path = os.path.realpath(target)
+    except (OSError, StopIteration):
+        pass
+    return path
+
+
+def _vendor_bwrap_paths(config, env=None):
+    source_env = os.environ if env is None else env
+    if (not config.session_delta_routing or
+            "codex" not in config.session_delta_routing_vendors):
+        return []
+    candidates = []
+    launcher = _resolved_vendor_launcher(config, env=source_env)
+    if launcher:
+        candidates.append(os.path.join(os.path.dirname(launcher), "bwrap"))
+    path_bwrap = shutil.which(
+        "bwrap", path=(source_env.get(ENV_SHIM_UNDERLYING_PATH) or
+                       source_env.get("PATH") or BWRAP_DEFAULT_PATH))
+    if path_bwrap:
+        candidates.append(path_bwrap)
+    result = []
+    for candidate in candidates:
+        candidate = os.path.realpath(candidate)
+        if (os.path.isfile(candidate) and os.access(candidate, os.X_OK) and
+                candidate not in result):
+            result.append(candidate)
+    return result
+
+
+def _prepare_delta_routing(session, config, env=None):
+    candidates = _vendor_bwrap_paths(config, env=env)
+    wrapper = os.path.join(os.path.dirname(__file__), "assets", "scripts",
+                           "ccc-bwrap-route")
+    runtime_root = os.path.join(
+        "/dev/shm", "ccc-agent-%s" % session.session_id)
+    sandbox_routes = os.path.join(runtime_root, "routes")
+    session.policy["sandbox_route_root"] = sandbox_routes
+    available = bool(
+        config.session_delta_routing and config.per_turn and
+        config.confinement == "bwrap" and candidates and
+        os.path.isfile(wrapper) and os.path.isdir("/dev/shm") and
+        os.access("/dev/shm", os.W_OK | os.X_OK))
+    session.policy["route_interposer_available"] = available
+    session.policy["route_interposer_bwrap_paths"] = candidates if available else []
+    if config.session_delta_routing:
+        detail = ("codex bwrap adapter ready" if available else
+                  "delta routing unavailable; writes remain shared/unattributed")
+        session.add_event("session-delta-routing", detail)
+    if available:
+        os.makedirs(sandbox_routes, mode=0o700, exist_ok=True)
+        os.chmod(runtime_root, 0o700)
+        os.chmod(sandbox_routes, 0o700)
+        route_mounts = os.path.join(
+            config.store.bundle_dir(session.session_id), "route-mounts")
+        os.makedirs(route_mounts, mode=0o711, exist_ok=True)
+        os.chmod(route_mounts, 0o711)
+    config.store.save(session)
+    return available
+
+
+def _cleanup_delta_routing_runtime(session):
+    expected = os.path.join("/dev/shm", "ccc-agent-%s" % session.session_id)
+    root = os.path.dirname(str(session.policy.get("sandbox_route_root") or ""))
+    if os.path.normpath(root) != os.path.normpath(expected):
+        return
+    try:
+        if os.path.islink(root):
+            os.unlink(root)
+        elif os.path.isdir(root):
+            shutil.rmtree(root)
+    except OSError:
+        pass
+
+
 def _bwrap_command(session, config, control=None, lifecycle_socket=None,
                    session_env_path=None):
     """Build a bubblewrap command that confines the agent rootlessly.
@@ -1209,6 +1319,18 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
     if config.container_run_access and os.path.isdir("/run"):
         argv += ["--bind", "/run", "/run"]
 
+    if session.policy.get("route_interposer_available"):
+        sandbox_routes = session.policy["sandbox_route_root"]
+        route_mounts = os.path.join(
+            config.store.bundle_dir(session.session_id), "route-mounts")
+        candidates = list(session.policy.get(
+            "route_interposer_bwrap_paths") or ())
+        real_bwrap = os.path.join(os.path.dirname(sandbox_routes),
+                                  "ccc-agent-real-bwrap")
+        argv += ["--dir", sandbox_routes,
+                 "--bind", route_mounts, sandbox_routes,
+                 "--ro-bind", candidates[0], real_bwrap]
+
     # the BranchFS view, read-write, at its visible path and at $HOME; the
     # --bind overlays (and thus hides) the real underlay at the same path.
     argv += ["--bind", primary.mount, alias_map.canonicalize(primary.visible)]
@@ -1259,6 +1381,17 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
 
     plugin_spec = _matched_agent_plugin(config)
     _append_agent_plugin_binds(argv, plugin_spec)
+
+    if session.policy.get("route_interposer_available"):
+        sandbox_routes = session.policy["sandbox_route_root"]
+        real_bwrap = os.path.join(os.path.dirname(sandbox_routes),
+                                  "ccc-agent-real-bwrap")
+        wrapper = os.path.join(os.path.dirname(__file__), "assets", "scripts",
+                               "ccc-bwrap-route")
+        for candidate in session.policy["route_interposer_bwrap_paths"]:
+            argv += ["--ro-bind", wrapper, candidate]
+        argv += ["--setenv", ENV_ROUTE_VENDOR, "codex",
+                 "--setenv", ENV_REAL_BWRAP, real_bwrap]
 
     _expected_mcp, direct_mcp_client = _mcp_admission_config(config)
     if direct_mcp_client:
@@ -1461,6 +1594,29 @@ def collect_status(session, backend):
             for name, report in collect_status_reports(session, backend).items()}
 
 
+def _verify_apply_parent(root, base):
+    """Reject underlay parent symlinks before a selective apply."""
+    root_base = os.path.normpath(root.base)
+    parent = os.path.dirname(os.path.normpath(base))
+    try:
+        rel = os.path.relpath(parent, root_base)
+    except ValueError:
+        raise ValueError("apply destination is outside protected root")
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        raise ValueError("apply destination is outside protected root")
+    current = root_base
+    if rel == os.curdir:
+        return
+    for component in rel.split(os.sep):
+        current = os.path.join(current, component)
+        if not os.path.lexists(current):
+            break
+        if os.path.islink(current):
+            raise ValueError("apply parent is a symlink: %s" % current)
+        if not os.path.isdir(current):
+            raise ValueError("apply parent is not a directory: %s" % current)
+
+
 def apply_change_from_store(root, change, alias_map):
     """Apply one reviewed change to the base by reading its delta from the
     BranchFS store (used at session end, when the branch is unmounted).  This
@@ -1468,6 +1624,7 @@ def apply_change_from_store(root, change, alias_map):
     out-of-scope deltas left in the branch are never written to base — unlike
     branchfs ``commit-branch`` which would apply the whole branch."""
     rel, delta, base = store_paths(root, change, alias_map)
+    _verify_apply_parent(root, base)
     if change.op == "D":
         if os.path.islink(base) or os.path.isfile(base):
             os.unlink(base)
@@ -1527,6 +1684,137 @@ def _rewrite_review_for_permission_failures(session, store, backend, alias_map,
     session.add_event("review-artifacts", review)
 
 
+def _apply_preflight_errors(session, changes_by_root, alias_map):
+    errors = []
+    for name, changes in sorted(changes_by_root.items()):
+        root = session.protected_roots[name]
+        for change in changes:
+            try:
+                _rel, _delta, base = store_paths(root, change, alias_map)
+                _verify_apply_parent(root, base)
+            except (OSError, ValueError) as exc:
+                errors.append("%s: %s" % (change.path, exc))
+    return errors
+
+
+def _revalidate_commit_admissions(session, alias_map):
+    """Revalidate every persisted admission identity before writing underlay."""
+    policy = WorkspaceAdmissionPolicy(
+        session.protected_roots, alias_map,
+        workspace_admission_roots=session.policy.get(
+            "workspace_admission_roots"),
+        allow_protected_root_workspace=session.policy.get(
+            "allow_protected_root_workspace", False))
+    records = []
+    launch = session.policy.get("launch_workspace_admission")
+    if isinstance(launch, dict):
+        records.append(launch)
+    for route_id, payload in session.session_delta_routes.items():
+        if not isinstance(payload, dict):
+            return ["route %s admission metadata is malformed" % route_id]
+        admitted = payload.get("admitted_roots") or ()
+        if not isinstance(admitted, list):
+            return ["route %s admitted roots are malformed" % route_id]
+        records.extend(item for item in admitted if isinstance(item, dict))
+
+    errors = []
+    seen = set()
+    for record in records:
+        key = record.get("canonical_key") or record.get("canonical_path")
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            policy.revalidate(record)
+        except (OSError, ValueError) as exc:
+            errors.append("workspace admission %s changed: %s" % (key, exc))
+    return errors
+
+
+def _route_reconciliation(session, changes_by_root, alias_map):
+    """Reconcile route attribution with the complete frozen outer delta."""
+    raw = session.policy.get("route_path_attribution")
+    records = raw if isinstance(raw, dict) else {}
+    by_key = {}
+    for path, record in records.items():
+        if isinstance(path, str) and isinstance(record, dict):
+            by_key[alias_map.canonicalize(path)] = record
+
+    items = []
+    authorized_paths = []
+    blockers = []
+    category_counts = {}
+    for name, changes in sorted(changes_by_root.items()):
+        root = session.protected_roots[name]
+        for change in changes:
+            key = alias_map.canonicalize(change.path)
+            record = by_key.get(key)
+            if record is None:
+                category = "shared/unattributed"
+                authorized = False
+                route_ids = []
+            else:
+                category = str(record.get("category") or "conflicted")
+                authorized = record.get("authorized") is True
+                route_ids = list(record.get("route_ids") or ())
+                if authorized:
+                    try:
+                        current = DeltaRouteManager._fingerprint_change(
+                            root, change)
+                    except (OSError, ValueError) as exc:
+                        current = None
+                        blockers.append(
+                            "%s could not be revalidated: %s" % (key, exc))
+                    if current != record.get("fingerprint"):
+                        authorized = False
+                        category = "conflicted-after-merge"
+                        record["authorized"] = False
+                        record["category"] = category
+                        blockers.append(
+                            "%s changed after its route merge" % key)
+                if category in ("conflicted", "multiply-influenced",
+                                "attributed-out-of-scope"):
+                    blockers.append("%s is %s" % (key, category))
+            if authorized:
+                authorized_paths.append(key)
+            category_counts[category] = category_counts.get(category, 0) + 1
+            items.append({
+                "path": key, "root": name, "op": change.op,
+                "category": category, "authorized": authorized,
+                "route_ids": route_ids,
+            })
+
+    route_states = {}
+    coverage = {"routed_bwrap_calls": 0,
+                "bypassed_or_unattributed_calls": 0}
+    for route_id, payload in sorted(session.session_delta_routes.items()):
+        if not isinstance(payload, dict):
+            blockers.append("route %s metadata is malformed" % route_id)
+            continue
+        state = str(payload.get("state") or "unknown")
+        route_states[route_id] = state
+        route_coverage = payload.get("coverage") or {}
+        coverage["routed_bwrap_calls"] += int(
+            route_coverage.get("routed_bwrap_calls", 0))
+        coverage["bypassed_or_unattributed_calls"] += int(
+            route_coverage.get("bypassed_or_unattributed_calls", 0))
+        if state in ("provisioning", "active", "quiescing", "frozen",
+                     "pending-review"):
+            blockers.append("route %s remains %s" % (route_id, state))
+
+    reconciliation = {
+        "schema_version": 1,
+        "items": items,
+        "category_counts": category_counts,
+        "authorized_paths": sorted(set(authorized_paths)),
+        "blockers": sorted(set(blockers)),
+        "route_states": route_states,
+        "coverage": coverage,
+    }
+    session.policy["route_reconciliation"] = reconciliation
+    return reconciliation
+
+
 def finalize_session(session, store, backend, alias_map):
     """freeze -> status -> policy -> artifacts -> apply decision.
 
@@ -1560,7 +1848,31 @@ def finalize_session(session, store, backend, alias_map):
                     for c in changes]
     flat_warnings = [w for warnings in warnings_by_root.values()
                      for w in warnings]
+    admission_errors = _revalidate_commit_admissions(session, alias_map)
+    admission_errors.extend(
+        _apply_preflight_errors(session, changes_by_root, alias_map))
+    reconciliation = None
+    if (session.policy.get("session_delta_routing") or
+            session.session_delta_routes):
+        reconciliation = _route_reconciliation(
+            session, changes_by_root, alias_map)
+        policy_config.allowed_scopes.extend(
+            reconciliation["authorized_paths"])
     decision = evaluate(flat_changes, policy_config, alias_map)
+    if admission_errors:
+        reason = ("safe apply preflight failed: %s" %
+                  "; ".join(admission_errors[:8]))
+        if reason not in decision.reasons:
+            decision.reasons.append(reason)
+        if decision.decision in (AUTO_COMMIT, NO_CHANGES):
+            decision.decision = PENDING_REVIEW
+    if reconciliation and reconciliation["blockers"]:
+        reason = ("session-delta reconciliation requires review: %s" %
+                  "; ".join(reconciliation["blockers"][:8]))
+        if reason not in decision.reasons:
+            decision.reasons.append(reason)
+        if decision.decision in (AUTO_COMMIT, NO_CHANGES):
+            decision.decision = PENDING_REVIEW
     if flat_warnings:
         reason = ("%d BranchFS status warning(s); manual review required "
                   "because status may be incomplete or commit may fail"
@@ -1954,7 +2266,9 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         cwd = _agent_cwd(session, config.alias_map, config.launch_cwd)
         os.makedirs(cwd, exist_ok=True)
         run_env = _fresh_run_env(env, session, config.store.state_dir)
+        _prepare_delta_routing(session, config, env=run_env)
         control = None
+        turn_ctl = None
         _mcp_supported = False
         if config.per_turn:
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
@@ -1964,11 +2278,14 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
                 session, config.store, config.backend, config.alias_map,
                 workspace_admission_policy=_workspace_admission_policy(
                     session, config))
+            turn_ctl.route_manager.recover()
             turn_ctl.reset_agent_workspaces()
             expected_clients, _mcp_supported = _mcp_admission_config(config)
             control_server = ControlServer(
                 host_sock, turn_ctl.handle, token, hook_token=hook_token,
-                expected_clients=expected_clients)
+                expected_clients=expected_clients,
+                route_wrapper_paths=session.policy.get(
+                    "route_interposer_bwrap_paths"))
             control_server.start()
             session.add_event("control-server", host_sock)
             run_env[ENV_CONTROL_SOCK] = host_sock
@@ -2003,6 +2320,12 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         listener = None
         session.exit_status = returncode
         session.add_event("agent-exit", str(returncode))
+        if turn_ctl is not None:
+            route_outcomes = turn_ctl.route_manager.recover()
+            if route_outcomes:
+                session.add_event("session-delta-route-recovery",
+                                  json.dumps(route_outcomes, sort_keys=True))
+                config.store.save(session)
 
         if is_remote_bridge(session):
             _discard_remote_bridge_session(session, config.store, config.backend)
@@ -2029,6 +2352,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             pass
         _unmount_all(session, config.backend)
         _remove_session_env_handoff(session_env_path)
+        _cleanup_delta_routing_runtime(session)
 
     _adaptive_status(status_fd, "finished", session=session.to_dict())
     try:
@@ -2106,6 +2430,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
         cwd = _agent_cwd(session, config.alias_map, config.launch_cwd)
         os.makedirs(cwd, exist_ok=True)
         run_env = _fresh_run_env(env, session, config.store.state_dir)
+        _prepare_delta_routing(session, config, env=run_env)
 
         # Per-turn control channel: start the supervisor-side server (outside
         # the sandbox) BEFORE launching the agent, so the socket exists for the
@@ -2113,6 +2438,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
         # token go into the agent env (bwrap remaps the path to the in-sandbox
         # mount); finalize at process exit still runs as the session-end pass.
         control = None
+        turn_ctl = None
         _mcp_supported = False
         if config.per_turn:
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
@@ -2122,11 +2448,14 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
                 session, config.store, config.backend, config.alias_map,
                 workspace_admission_policy=_workspace_admission_policy(
                     session, config))
+            turn_ctl.route_manager.recover()
             turn_ctl.reset_agent_workspaces()
             expected_clients, _mcp_supported = _mcp_admission_config(config)
             control_server = ControlServer(
                 host_sock, turn_ctl.handle, token, hook_token=hook_token,
-                expected_clients=expected_clients)
+                expected_clients=expected_clients,
+                route_wrapper_paths=session.policy.get(
+                    "route_interposer_bwrap_paths"))
             control_server.start()
             session.add_event("control-server", host_sock)
             run_env[ENV_CONTROL_SOCK] = host_sock
@@ -2163,12 +2492,19 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
                 control_server=control_server, mcp_supported=False)
         session.exit_status = proc.returncode
         session.add_event("agent-exit", str(proc.returncode))
+        if turn_ctl is not None:
+            route_outcomes = turn_ctl.route_manager.recover()
+            if route_outcomes:
+                session.add_event("session-delta-route-recovery",
+                                  json.dumps(route_outcomes, sort_keys=True))
+                config.store.save(session)
     except Exception as exc:
         _fail(config.store, session, "agent launch failed: %s" % exc)
         if control_server is not None:
             control_server.stop()
         _remove_session_env_handoff(session_env_path)
         _unmount_all(session, config.backend)
+        _cleanup_delta_routing_runtime(session)
         return session
 
     try:
@@ -2185,6 +2521,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             control_server.stop()
         _remove_session_env_handoff(session_env_path)
         _unmount_all(session, config.backend)
+        _cleanup_delta_routing_runtime(session)
 
     return session
 

@@ -97,6 +97,10 @@ class TestRunSession(unittest.TestCase):
         self.assertEqual(config.session_delta_routing_vendors,
                          ("codex", "hermes"))
         self.assertTrue(config.policy["allow_protected_root_workspace"])
+        self.assertTrue(config.policy["session_delta_routing"])
+        self.assertEqual(config.policy["session_delta_routing_vendors"],
+                         ["codex", "hermes"])
+        self.assertIn("launch_workspace_admission", config.policy)
 
         with self.assertRaises(ValueError):
             self.h.config(["true"], workspace_admission_roots=["/tmp"])
@@ -723,6 +727,52 @@ os.execvpe(command[0], command, env)
                 return session
             time.sleep(0.01)
         self.fail("adaptive supervisor did not finalize session %s" % session_id)
+
+    def test_codex_routing_discovers_adjacent_bwrap_and_overlays_after_outer_view(self):
+        runtime = os.path.join(self._tmp.name, "codex-runtime", "bin")
+        os.makedirs(runtime)
+        real_codex = os.path.join(runtime, "codex-real")
+        vendor_bwrap = os.path.join(runtime, "bwrap")
+        launcher = os.path.join(self._tmp.name, "codex")
+        for path in (real_codex, vendor_bwrap):
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+        with open(launcher, "w") as fh:
+            fh.write('#!/bin/sh\nexec "%s" "$@"\n' % real_codex)
+        os.chmod(launcher, 0o755)
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = self._bwrap_config(
+            [launcher, "app-server"], agent_kind="codex-remote",
+            server_mode=True, per_turn=True, session_delta_routing=True)
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(config)
+
+        argv = seen["argv"]
+        wrapper = os.path.join(os.path.dirname(runner_mod.__file__),
+                               "assets", "scripts", "ccc-bwrap-route")
+        outer_index = next(i for i in range(len(argv) - 2)
+                           if argv[i:i + 3] == [
+                               "--bind", session.protected_roots[
+                                   "storage_user"].mount, "/storage/user"])
+        overlay_index = next(i for i in range(len(argv) - 2)
+                             if argv[i:i + 3] == [
+                                 "--ro-bind", wrapper,
+                                 os.path.realpath(vendor_bwrap)])
+        self.assertGreater(overlay_index, outer_index)
+        self.assertIn("--setenv", argv)
+        self.assertIn("CCC_AGENT_ROUTE_VENDOR", argv)
+        self.assertIn("codex", argv)
+        self.assertIn(os.path.realpath(vendor_bwrap),
+                      session.policy["route_interposer_bwrap_paths"])
+        self.assertTrue(session.policy["route_interposer_available"])
+        self.assertFalse(os.path.exists(os.path.dirname(
+            session.policy["sandbox_route_root"])))
 
     def test_adaptive_requires_bwrap(self):
         with self.assertRaisesRegex(ValueError, "requires bwrap"):

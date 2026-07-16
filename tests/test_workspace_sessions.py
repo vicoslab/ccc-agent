@@ -1,9 +1,11 @@
 """Per-logical-session trusted workspace authority tests."""
 
 import json
+import os
 import tempfile
 import unittest
 
+from ccc_agent.runner import finalize_session
 from ccc_agent.session import Session
 from tests.test_turn import TurnHarness
 
@@ -123,7 +125,6 @@ class TestWorkspaceSessionReplacement(unittest.TestCase):
         self.h.write("Projects/proj-a/unsafe.txt", "must-not-commit")
         original = self.h.base + "/Projects/proj-a"
         moved = self.h.base + "/Projects/proj-a-old"
-        import os
         os.rename(original, moved)
         os.makedirs(original)
 
@@ -135,6 +136,102 @@ class TestWorkspaceSessionReplacement(unittest.TestCase):
             self.h.session.authenticated_workspace_sessions.values()))
         self.assertEqual(record["state"], "invalid")
         self.assertEqual(self.h.session.policy["mcp_workspace_roots"], [])
+
+    def test_codex_workspace_lifecycle_provisions_and_merges_route(self):
+        self.h.session.policy["session_delta_routing"] = True
+        self.h.session.policy["session_delta_routing_vendors"] = ["codex"]
+        active = self.replace(
+            "thread-route", 1, ["/storage/user/Projects/proj-a"])
+        route = self.h.tc.route_manager.get(active["route"]["route_id"])
+        child = route.roots["r"]
+        routed = os.path.join(
+            child.mount, "Projects", "proj-a", "from-route.txt")
+        os.makedirs(os.path.dirname(routed), exist_ok=True)
+        with open(routed, "w") as fh:
+            fh.write("attributed")
+
+        ended = self.replace("thread-route", 2, [], state="ended")
+
+        self.assertEqual(ended["route"]["state"], "merged")
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.h.root.mount, "Projects", "proj-a", "from-route.txt")))
+        self.assertFalse(os.path.isfile(os.path.join(
+            self.h.base, "Projects", "proj-a", "from-route.txt")))
+
+    def _ended_route_change(self, content="attributed", relative="safe.txt"):
+        self.h.session.policy["allowed_scopes"] = []
+        self.h.session.policy["workspace_scope_ceiling"] = []
+        self.h.session.policy["session_delta_routing"] = True
+        self.h.session.policy["session_delta_routing_vendors"] = ["codex"]
+        active = self.replace(
+            "thread-safe-apply", 1, ["/storage/user/Projects/proj-a"])
+        route = self.h.tc.route_manager.get(active["route"]["route_id"])
+        routed = os.path.join(
+            route.roots["r"].mount, "Projects", "proj-a", relative)
+        os.makedirs(os.path.dirname(routed), exist_ok=True)
+        with open(routed, "w") as fh:
+            fh.write(content)
+        self.replace("thread-safe-apply", 2, [], state="ended")
+        return route
+
+    def test_fingerprint_checked_route_path_is_exactly_auto_applied(self):
+        self._ended_route_change()
+        self.h.session.transition("mounting")
+        self.h.session.transition("running")
+        self.h.session.transition("finalizing")
+
+        decision = finalize_session(
+            self.h.session, self.h.store, self.h.backend, self.h.alias)
+
+        self.assertEqual(decision.decision, "auto-commit")
+        self.assertEqual(self.h.session.state, "auto-committed")
+        with open(os.path.join(
+                self.h.base, "Projects", "proj-a", "safe.txt")) as fh:
+            self.assertEqual(fh.read(), "attributed")
+        reconciliation = os.path.join(
+            self.h.store.review_dir(self.h.session.session_id),
+            "route-reconciliation.json")
+        self.assertTrue(os.path.isfile(reconciliation))
+
+    def test_post_merge_mutation_forces_pending_review_not_apply(self):
+        self._ended_route_change()
+        with open(os.path.join(
+                self.h.root.mount, "Projects", "proj-a", "safe.txt"),
+                "w") as fh:
+            fh.write("changed-after-merge")
+        self.h.session.transition("mounting")
+        self.h.session.transition("running")
+        self.h.session.transition("finalizing")
+
+        decision = finalize_session(
+            self.h.session, self.h.store, self.h.backend, self.h.alias)
+
+        self.assertEqual(decision.decision, "pending-review")
+        self.assertEqual(self.h.session.state, "pending-review")
+        self.assertFalse(os.path.exists(os.path.join(
+            self.h.base, "Projects", "proj-a", "safe.txt")))
+        blocker = " ".join(
+            self.h.session.policy["route_reconciliation"]["blockers"])
+        self.assertIn("changed after its route merge", blocker)
+
+    def test_symlinked_underlay_parent_fails_preflight_without_escape(self):
+        self._ended_route_change(relative="redirected/file.txt")
+        outside = os.path.join(os.path.dirname(self.h.base), "outside")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(
+            self.h.base, "Projects", "proj-a", "redirected"))
+        self.h.session.transition("mounting")
+        self.h.session.transition("running")
+        self.h.session.transition("finalizing")
+
+        decision = finalize_session(
+            self.h.session, self.h.store, self.h.backend, self.h.alias)
+
+        self.assertEqual(decision.decision, "pending-review")
+        self.assertEqual(self.h.session.state, "pending-review")
+        self.assertFalse(os.path.exists(os.path.join(outside, "file.txt")))
+        self.assertIn("apply parent is a symlink",
+                      " ".join(decision.reasons))
 
 
 if __name__ == "__main__":

@@ -29,6 +29,9 @@ MCP_ONLY_OPS = frozenset(("turn-approve", "turn-resolve",
 WORKSPACE_CONFIRM_OP = "turn-confirm-workspace-roots"
 WORKSPACE_SESSION_REPLACE_OP = "workspace-session-replace"
 WORKSPACE_AUTHORITY_REVOKE_OP = "workspace-authority-revoke"
+ROUTE_LOOKUP_OP = "route-lookup"
+ROUTE_RESULT_OP = "route-record-result"
+ROUTE_OPS = frozenset((ROUTE_LOOKUP_OP, ROUTE_RESULT_OP))
 
 
 class ControlError(Exception):
@@ -169,13 +172,17 @@ class ControlServer(object):
 
     def __init__(self, socket_path, handler, token, hook_token=None,
                  expected_clients=(), require_launch_boundary=True,
-                 enforce_mcp_admission=True, transport_revoke_grace=0.25):
+                 enforce_mcp_admission=True, transport_revoke_grace=0.25,
+                 route_wrapper_paths=None):
         self.socket_path = socket_path
         self.handler = handler
         self.token = token
         self.hook_token = hook_token
         self.expected_clients = tuple(os.path.basename(str(name)).lower()
                                       for name in expected_clients if name)
+        self.route_wrapper_paths = frozenset(
+            os.path.normpath(str(path)) for path in (route_wrapper_paths or ())
+            if isinstance(path, str) and os.path.isabs(path))
         self.require_launch_boundary = bool(require_launch_boundary)
         self.enforce_mcp_admission = bool(enforce_mcp_admission)
         self.transport_revoke_grace = max(0.0, float(transport_revoke_grace))
@@ -448,6 +455,39 @@ class ControlServer(object):
                     _proc_fds_hidden(client_pid))
         return True
 
+    def _eligible_route_peer(self, conn, request):
+        try:
+            peer_pid, uid, _gid = peer_credentials(conn)
+        except ControlError:
+            return None
+        if uid != os.geteuid():
+            return None
+        peer = _proc_identity(peer_pid)
+        with self._launch_ready:
+            registered = self._registered_client_fingerprint
+            client_name = self._registered_client_name
+        if peer is None or registered is None or client_name not in ("codex", "claude"):
+            return None
+        client = _proc_identity(registered[0])
+        if (client is None or client["start_time"] != registered[1] or
+                peer_pid == client["pid"] or
+                not _is_descendant(peer_pid, client["pid"]) or
+                not self._launch_boundary_valid(client["pid"])):
+            return None
+        argv_paths = {
+            os.path.normpath(arg) for arg in (peer.get("argv") or ())[:4]
+            if isinstance(arg, str) and os.path.isabs(arg)
+        }
+        exact_wrapper = bool(argv_paths & self.route_wrapper_paths)
+        if (not exact_wrapper and _process_match_name(
+                peer, ("ccc-bwrap-route", "ccc-bwrap-route.py")) is None):
+            return None
+        if (request.get("op") == ROUTE_LOOKUP_OP and
+                str(request.get("provider") or "").lower() != client_name):
+            return None
+        return {"pid": peer_pid, "start_time": peer["start_time"],
+                "client": client_name}
+
     def _workspace_authority(self, conn):
         with self._admission_lock:
             mcp = (self._mcp_conn is conn, self._mcp_fingerprint,
@@ -508,17 +548,15 @@ class ControlServer(object):
             # Normal client/PID-1 teardown has already ended agent authority;
             # preserve the last valid roots for immediate finalization.
             return
+        if authority is None:
+            return
         try:
-            if authority is None:
-                self.handler({"op": WORKSPACE_CONFIRM_OP, "paths": [],
-                              "source": "trusted-transport-closed"})
-            else:
-                self.handler({
-                    "op": WORKSPACE_AUTHORITY_REVOKE_OP,
-                    "source": authority[0],
-                    "authority_instance": authority[1],
-                    "reason": "trusted-transport-closed",
-                })
+            self.handler({
+                "op": WORKSPACE_AUTHORITY_REVOKE_OP,
+                "source": authority[0],
+                "authority_instance": authority[1],
+                "reason": "trusted-transport-closed",
+            })
         except Exception:
             # Connection teardown must not kill the control server. A later
             # trusted replacement/reset still fails closed.
@@ -533,6 +571,27 @@ class ControlServer(object):
                 except ControlError as exc:
                     if "closed before response" not in str(exc):
                         _send_line(conn, {"ok": False, "error": str(exc)})
+                    return
+                if req.get("op") in ROUTE_OPS:
+                    eligibility = self._eligible_route_peer(conn, req)
+                    if eligibility is None:
+                        _send_line(conn, {"ok": False,
+                                          "error": "route operation requires the live official bwrap adapter"})
+                        return
+                    req = dict(req)
+                    req["trusted_peer_pid"] = eligibility["pid"]
+                    req["trusted_client"] = eligibility["client"]
+                    try:
+                        resp = self.handler(req)
+                        if not isinstance(resp, dict):
+                            resp = {"ok": False,
+                                    "error": "handler returned non-dict"}
+                        else:
+                            resp.setdefault("ok", True)
+                    except Exception as exc:
+                        resp = {"ok": False, "error": "%s: %s" %
+                                (type(exc).__name__, exc)}
+                    _send_line(conn, resp)
                     return
                 if req.get("token") != self.token:
                     _send_line(conn, {"ok": False, "error": "unauthorized"})

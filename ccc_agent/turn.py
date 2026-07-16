@@ -48,6 +48,7 @@ from .control import (VERDICT_COMMITTED, VERDICT_DISCARDED, VERDICT_HELD,
 from .paths import is_within, normalize
 from .policy import PolicyConfig, classify, filter_ignored
 from .previous_commits import DECISION_COMMITTED, TURN_PATH_DECISIONS
+from .route_manager import DeltaRouteManager
 from .session import utc_now
 from .workspace import WorkspaceAdmissionPolicy
 
@@ -76,7 +77,7 @@ class TurnController(object):
     from a connection thread)."""
 
     def __init__(self, session, store, backend, alias_map,
-                 workspace_admission_policy=None):
+                 workspace_admission_policy=None, route_manager=None):
         self.session = session
         self.store = store
         self.backend = backend
@@ -88,6 +89,8 @@ class TurnController(object):
                     "workspace_admission_roots"),
                 allow_protected_root_workspace=session.policy.get(
                     "allow_protected_root_workspace", False)))
+        self.route_manager = (route_manager or
+                              DeltaRouteManager(session, store, backend))
         self._lock = threading.Lock()
         self._pending = {}       # approval_token -> frozenset(visible paths)
 
@@ -630,6 +633,22 @@ class TurnController(object):
                     confirmed,
                     "turn-workspace-session-replaced",
                     "%s generation %d %s" % (source, generation, state)))
+            route = None
+            if source == "codex-app-server":
+                if state == "active":
+                    route = self.route_manager.provision(
+                        provider="codex",
+                        logical_session_id=logical_session_id,
+                        workspace_session_key=key,
+                        workspace_generation=generation,
+                        admitted_roots=roots)
+                else:
+                    route = self.route_manager.end_workspace_session(key)
+            route_summary = (None if route is None else {
+                "route_id": route.route_id,
+                "state": route.state,
+                "capability": route.coverage.get("capability"),
+            })
             return {
                 "verdict": VERDICT_WORKSPACE_UPDATED,
                 "action": "replace-session-roots",
@@ -642,6 +661,7 @@ class TurnController(object):
                 "allowed_scopes": allowed,
                 "proposals": sorted(entry["path"]
                                     for entry in proposals.values()),
+                "route": route_summary,
                 "idempotent": False,
             }
 
@@ -652,12 +672,16 @@ class TurnController(object):
             source = str(source or "").strip().lower()
             authority_instance = str(authority_instance or "").strip()
             changed = 0
-            for record in self._workspace_session_records().values():
+            route_outcomes = {}
+            for key, record in self._workspace_session_records().items():
                 if (not isinstance(record, dict) or
                         record.get("source") != source or
                         record.get("authority_instance") != authority_instance or
                         record.get("state") != "active"):
                     continue
+                route = self.route_manager.end_workspace_session(key)
+                if route is not None:
+                    route_outcomes[route.route_id] = route.state
                 record["state"] = "ended"
                 record["roots"] = []
                 record["generation"] = int(record.get("generation", 0)) + 1
@@ -675,6 +699,7 @@ class TurnController(object):
                 "source": source,
                 "authority_instance": authority_instance,
                 "revoked": changed,
+                "route_outcomes": route_outcomes,
                 "derived_roots": confirmed,
                 "workspaces": workspaces,
                 "allowed_scopes": allowed,
@@ -1206,6 +1231,13 @@ class TurnController(object):
             return self.revoke_workspace_authority(
                 request.get("source"), request.get("authority_instance"),
                 reason=request.get("reason", "trusted-transport-closed"))
+        if op == "route-lookup":
+            return self.route_manager.lookup(
+                request.get("provider"), request.get("logical_session_hint"))
+        if op == "route-record-result":
+            return self.route_manager.record_result(
+                request.get("route_id"), request.get("outcome"),
+                request.get("reason"))
         if op == "turn-workspace-proposal-status":
             return self.workspace_proposal_status()
         if op == "turn-kept-status":

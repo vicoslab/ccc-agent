@@ -32,9 +32,9 @@ ROUTE_STATES = (
 TERMINAL_ROUTE_STATES = ("merged", "aborted", "failed")
 
 _ROUTE_TRANSITIONS = {
-    "provisioning": ("active", "aborted", "failed"),
-    "active": ("quiescing", "failed"),
-    "quiescing": ("active", "frozen", "failed"),
+    "provisioning": ("active", "pending-review", "aborted", "failed"),
+    "active": ("quiescing", "pending-review", "failed"),
+    "quiescing": ("active", "frozen", "pending-review", "failed"),
     "frozen": ("active", "merged", "pending-review", "aborted", "failed"),
     "pending-review": ("active", "merged", "aborted", "failed"),
     "merged": (),
@@ -90,8 +90,22 @@ def _validate_session_digest(digest):
     return digest
 
 
-def _coverage_record(coverage=None):
-    coverage = dict(coverage or {})
+def _copy_json_mapping(value, field):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("%s must be a mapping" % field)
+    try:
+        copied = json.loads(json.dumps(value, sort_keys=True))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("%s must be JSON serializable: %s" % (field, exc))
+    if not isinstance(copied, dict):
+        raise ValueError("%s must be a mapping" % field)
+    return copied
+
+
+def _coverage_record(value=None):
+    coverage = dict(value or {})
     normalized = {
         "routed_bwrap_calls": int(coverage.get("routed_bwrap_calls", 0)),
         "bypassed_or_unattributed_calls": int(
@@ -204,7 +218,9 @@ class DeltaRoute(object):
     def __init__(self, route_id, provider, parent_session_id, roots,
                  vendor_session_id=None, logical_session_digest=None,
                  state="provisioning", created_at=None, updated_at=None,
-                 events=None, coverage=None):
+                 events=None, coverage=None, workspace_session_key=None,
+                 workspace_generation=None, admitted_roots=None,
+                 outer_baseline=None):
         self.route_id = _validate_route_id(route_id)
         self.provider = _required_string(provider, "provider")
         if logical_session_digest is None:
@@ -234,10 +250,28 @@ class DeltaRoute(object):
         self.updated_at = updated_at or self.created_at
         self.events = _copy_json_records(events, "route events")
         self.coverage = _coverage_record(coverage)
+        self.workspace_session_key = (None if workspace_session_key is None else
+                                      _required_string(
+                                          workspace_session_key,
+                                          "workspace_session_key"))
+        if workspace_generation is None:
+            self.workspace_generation = None
+        elif isinstance(workspace_generation, bool):
+            raise ValueError("workspace_generation must be an integer")
+        else:
+            self.workspace_generation = int(workspace_generation)
+            if self.workspace_generation < 0:
+                raise ValueError("workspace_generation cannot be negative")
+        self.admitted_roots = _copy_json_records(
+            admitted_roots, "admitted workspace roots")
+        self.outer_baseline = _copy_json_mapping(
+            outer_baseline, "outer route baseline")
 
     @classmethod
     def create(cls, provider, vendor_session_id, parent_session_id,
-               parent_roots, mount_dir, route_id=None):
+               parent_roots, mount_dir, route_id=None,
+               workspace_session_key=None, workspace_generation=None,
+               admitted_roots=None, outer_baseline=None):
         """Create an opaque route and child records for all outer roots."""
         route_id = _validate_route_id(route_id or new_route_id(vendor_session_id))
         if not isinstance(parent_roots, dict):
@@ -254,6 +288,10 @@ class DeltaRoute(object):
             vendor_session_id=vendor_session_id,
             parent_session_id=parent_session_id,
             roots=roots,
+            workspace_session_key=workspace_session_key,
+            workspace_generation=workspace_generation,
+            admitted_roots=admitted_roots,
+            outer_baseline=outer_baseline,
         )
 
     def transition(self, new_state, at=None, detail=None):
@@ -278,7 +316,7 @@ class DeltaRoute(object):
             self.coverage["routed_bwrap_calls"] += 1
         elif outcome in ("bypassed", "unattributed"):
             self.coverage["bypassed_or_unattributed_calls"] += 1
-        else:
+        elif outcome != "warning":
             raise ValueError("unknown routing coverage outcome %r" % outcome)
         if warning is not None:
             self.coverage["last_warning"] = _required_string(
@@ -310,6 +348,12 @@ class DeltaRoute(object):
                       for name, root in sorted(self.roots.items())},
             "events": _copy_json_records(self.events, "route events"),
             "coverage": _coverage_record(self.coverage),
+            "workspace_session_key": self.workspace_session_key,
+            "workspace_generation": self.workspace_generation,
+            "admitted_roots": _copy_json_records(
+                self.admitted_roots, "admitted workspace roots"),
+            "outer_baseline": _copy_json_mapping(
+                self.outer_baseline, "outer route baseline"),
         }
 
     @classmethod
@@ -335,6 +379,10 @@ class DeltaRoute(object):
                 updated_at=data["updated_at"],
                 events=data.get("events", ()),
                 coverage=data.get("coverage"),
+                workspace_session_key=data.get("workspace_session_key"),
+                workspace_generation=data.get("workspace_generation"),
+                admitted_roots=data.get("admitted_roots"),
+                outer_baseline=data.get("outer_baseline"),
             )
         except KeyError as exc:
             raise ValueError("delta route record is missing %s" % exc.args[0])

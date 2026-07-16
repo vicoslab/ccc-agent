@@ -13,7 +13,7 @@ import socket
 import sys
 
 
-DEFAULT_ROUTE_SOCKET = "/tmp/ccc-agent/route.sock"
+DEFAULT_ROUTE_SOCKET = "/tmp/ccc-agent/control.sock"
 DEFAULT_REAL_BWRAP = "/run/ccc-agent/real-bwrap"
 ROUTE_SOURCE_ROOT = "/run/ccc-agent/routes"
 MAX_MESSAGE_BYTES = 65536
@@ -21,6 +21,14 @@ MAX_BINDINGS = 16
 
 _ROUTE_ID_RE = re.compile(r"^route-[0-9a-f]{32}$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_ROUTE_SOURCE_RE = re.compile(
+    r"^(?:/run/ccc-agent/routes|/run/user/[0-9]+/ccc-agent-routes|"
+    r"/dev/shm/ccc-agent-agent-[A-Za-z0-9-]+/routes)"
+    r"/(route-[0-9a-f]{32})(?:/|$)")
+_REAL_BWRAP_RE = re.compile(
+    r"^(?:/run/ccc-agent/real-bwrap|"
+    r"/run/user/[0-9]+/ccc-agent-real-bwrap|"
+    r"/dev/shm/ccc-agent-agent-[A-Za-z0-9-]+/ccc-agent-real-bwrap)$")
 
 
 class RouteProtocolError(ValueError):
@@ -115,7 +123,6 @@ def _route_bind_args(route):
     bindings = route.get("bindings")
     if not isinstance(bindings, list) or len(bindings) > MAX_BINDINGS:
         raise RouteProtocolError("route bindings must be a bounded array")
-    prefix = ROUTE_SOURCE_ROOT + "/" + route_id
     result = []
     destinations = set()
     for binding in bindings:
@@ -124,7 +131,8 @@ def _route_bind_args(route):
         source = _safe_absolute(binding.get("source"), "route source")
         destination = _safe_absolute(
             binding.get("destination"), "route destination")
-        if source != prefix and not source.startswith(prefix + "/"):
+        match = _ROUTE_SOURCE_RE.match(source)
+        if match is None or match.group(1) != route_id:
             raise RouteProtocolError("route source is outside its opaque route")
         if destination == "/" or destination in destinations:
             raise RouteProtocolError("route destination is unsafe or duplicated")
@@ -156,11 +164,16 @@ def _logical_hint(provider, environ):
     return None
 
 
-def main(argv=None, environ=None, real_bwrap=DEFAULT_REAL_BWRAP,
+def main(argv=None, environ=None, real_bwrap=None,
          socket_path=DEFAULT_ROUTE_SOCKET):
     argv = list(sys.argv[1:] if argv is None else argv)
     environ = os.environ if environ is None else environ
+    if real_bwrap is None:
+        real_bwrap = environ.get(
+            "CCC_AGENT_REAL_BWRAP", DEFAULT_REAL_BWRAP)
     real_bwrap = _safe_absolute(real_bwrap, "real bwrap")
+    if not _REAL_BWRAP_RE.match(real_bwrap):
+        raise RouteProtocolError("real bwrap path is outside the trusted runtime")
 
     routed_argv = argv
     provider = str(environ.get("CCC_AGENT_ROUTE_VENDOR", "")).lower()
