@@ -959,6 +959,58 @@ time.sleep(0.18)
                 root = session.protected_roots["storage_user"]
                 self.assertEqual(self.h.backend.status(root), [])
 
+    def test_adaptive_remote_bridge_closes_control_before_bundle_removal(self):
+        self.h.backend = FakeBranchFS()
+        config = self.h.config(
+            [sys.executable, "-c", "import time; time.sleep(0.08)"],
+            agent_kind="codex-remote", server_mode=True,
+            confinement="bwrap", bwrap_bin=self._fake_bwrap(),
+            lifecycle="adaptive", adaptive_bootstrap_seconds=0.02,
+            adaptive_stability_seconds=0.01,
+            adaptive_detach_seconds=0.05, per_turn=True)
+
+        real_remove = self.h.store.remove
+
+        def remove_after_control_teardown(session_id):
+            control_dir = self.h.store.control_dir(session_id)
+            if os.path.isdir(control_dir) and os.listdir(control_dir):
+                raise OSError("control runtime still active")
+            return real_remove(session_id)
+
+        with mock.patch.object(
+                self.h.store, "remove", side_effect=remove_after_control_teardown):
+            session = run_session(config)
+
+        self.assertEqual(session.agent_kind, "codex-remote-bridge")
+        self.assertEqual(session.state, "aborted")
+        self.assertFalse(any(
+            e["event"] == "error" and "bundle cleanup failed" in e.get("detail", "")
+            for e in session.events))
+        self.assertEqual(self.h.store.list(), [])
+        self.assertFalse(os.path.exists(
+            self.h.store.bundle_dir(session.session_id)))
+
+    def test_adaptive_remote_bridge_reports_unexpected_cleanup_failure(self):
+        self.h.backend = FakeBranchFS()
+        config = self.h.config(
+            [sys.executable, "-c", "import time; time.sleep(0.08)"],
+            agent_kind="codex-remote", server_mode=True,
+            confinement="bwrap", bwrap_bin=self._fake_bwrap(),
+            lifecycle="adaptive", adaptive_bootstrap_seconds=0.02,
+            adaptive_stability_seconds=0.01,
+            adaptive_detach_seconds=0.05, per_turn=True)
+
+        with mock.patch.object(
+                self.h.store, "remove",
+                side_effect=RuntimeError("unexpected remove failure")):
+            session = run_session(config)
+
+        self.assertEqual(session.state, "aborted")
+        self.assertTrue(any(
+            e["event"] == "error" and
+            "unexpected remove failure" in e.get("detail", "")
+            for e in session.events))
+
     def test_bwrap_server_without_workspace_uses_launch_cwd_for_pwd(self):
         seen = {}
 
