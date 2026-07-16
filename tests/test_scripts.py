@@ -321,6 +321,41 @@ class TestPluginAssets(unittest.TestCase):
             self.assertIn("turn-finalize --default-keep", call_log)
             self.assertIn("turn-review-kept", call_log)
 
+    def test_codex_stop_hook_restores_stripped_remote_session_from_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            handoff = os.path.join(tmp, "session-env.json")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            with open(handoff, "w") as fh:
+                json.dump({
+                    "CCC_AGENT_SESSION": "agent-remote-codex",
+                    "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                    "CCC_AGENT_CONTROL_TOKEN": "control-token",
+                    "CCC_AGENT_HOOK_TOKEN": "hook-token",
+                    "CCC_AGENT_HOOK_SESSION": "agent-remote-codex",
+                    "CCC_AGENT_CLI": ctl,
+                }, fh)
+
+            proc = subprocess.run(
+                ["sh", PLUGIN_STOP_HOOKS[1]],
+                env={"PATH": "/usr/bin:/bin",
+                     "CCC_AGENT_SESSION_ENV_FILE": handoff,
+                     "CCC_AGENT_TEST_CALLS": calls,
+                     "TMPDIR": tmp},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "")
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn("turn-finalize --default-keep", call_log)
+            self.assertIn("turn-review-kept", call_log)
+
     def test_codex_workspace_hook_adds_and_removes_silently(self):
         with tempfile.TemporaryDirectory() as tmp:
             calls = os.path.join(tmp, "calls")
@@ -371,6 +406,84 @@ class TestPluginAssets(unittest.TestCase):
             self.assertIn("turn-add-workspace --agent-session codex-inner-1 /storage/user/Projects/proj-a", call_log)
             self.assertIn("turn-add-workspace --agent-session codex-parent/sub-1 /storage/user/Projects/proj-b", call_log)
             self.assertIn("turn-remove-workspace --agent-session codex-parent/sub-1 /storage/user/Projects/proj-b", call_log)
+
+    def test_codex_workspace_hook_restores_stripped_remote_session_from_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            handoff = os.path.join(tmp, "session-env.json")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            with open(handoff, "w") as fh:
+                json.dump({
+                    "CCC_AGENT_SESSION": "agent-outer-codex",
+                    "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                    "CCC_AGENT_CONTROL_TOKEN": "control-token",
+                    "CCC_AGENT_HOOK_TOKEN": "hook-token",
+                    "CCC_AGENT_HOOK_SESSION": "agent-outer-codex",
+                    "CCC_AGENT_CLI": ctl,
+                }, fh)
+
+            proc = subprocess.run(
+                ["sh", CODEX_WORKSPACE_HOOK],
+                env={"PATH": "/usr/bin:/bin",
+                     "CCC_AGENT_SESSION_ENV_FILE": handoff,
+                     "CCC_AGENT_TEST_CALLS": calls},
+                input=json.dumps({"hook_event_name": "SessionStart",
+                                  "session_id": "codex-inner-remote",
+                                  "cwd": "/storage/user/Projects/proj-a"}),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "")
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn(
+                "turn-add-workspace --agent-session codex-inner-remote "
+                "/storage/user/Projects/proj-a", call_log)
+
+    def test_codex_session_handoff_cannot_inject_commands_or_variable_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            handoff = os.path.join(tmp, "session-env.json")
+            marker = os.path.join(tmp, "must-not-exist")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "test -z \"${UNRELATED_INJECTED_NAME:-}\" || "
+                         "touch \"$CCC_AGENT_TEST_MARKER\"\n"
+                         "printf '%s\\n' \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            session_value = "agent-x; touch %s" % marker
+            with open(handoff, "w") as fh:
+                json.dump({
+                    "CCC_AGENT_SESSION": session_value,
+                    "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                    "CCC_AGENT_CONTROL_TOKEN": "control-token",
+                    "CCC_AGENT_HOOK_TOKEN": "hook-token",
+                    "CCC_AGENT_CLI": ctl,
+                    "UNRELATED_INJECTED_NAME": "bad",
+                }, fh)
+
+            proc = subprocess.run(
+                ["sh", CODEX_WORKSPACE_HOOK],
+                env={"PATH": "/usr/bin:/bin",
+                     "CCC_AGENT_SESSION_ENV_FILE": handoff,
+                     "CCC_AGENT_TEST_CALLS": calls,
+                     "CCC_AGENT_TEST_MARKER": marker},
+                input=json.dumps({"hook_event_name": "SessionStart",
+                                  "cwd": "/storage/user/Projects/proj-a"}),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(os.path.exists(marker))
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn("--agent-session %s " % session_value, call_log)
 
     def test_codex_workspace_hook_degrades_safe_outside_contained_session(self):
         proc = subprocess.run(
