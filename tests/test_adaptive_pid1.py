@@ -319,10 +319,13 @@ for line in sys.stdin:
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["id"], 7)
         self.assertEqual([item["op"] for item in control.requests], [
-            "mcp-register-client", "turn-confirm-workspace-roots",
+            "mcp-register-client", "workspace-session-replace",
         ])
         self.assertEqual(control.requests[-1]["paths"],
                          ["/storage/user/Projects/observed"])
+        self.assertEqual(control.requests[-1]["logical_session_id"], "thread-1")
+        self.assertEqual(control.requests[-1]["generation"], 1)
+        self.assertEqual(control.requests[-1]["state"], "active")
 
 
 if __name__ == "__main__":

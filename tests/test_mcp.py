@@ -48,6 +48,12 @@ class FakeControl(object):
         self.calls.append(("confirm-workspace-roots", list(paths)))
         return {"verdict": "workspace-updated", "confirmed": list(paths)}
 
+    def replace_workspace_session(self, logical_session_id, generation, paths,
+                                  state="active"):
+        self.calls.append(("replace-workspace-session", logical_session_id,
+                           generation, list(paths), state))
+        return {"verdict": "workspace-updated", "confirmed": list(paths)}
+
     def close(self):
         pass
 
@@ -222,8 +228,8 @@ class TestMCPProtocol(unittest.TestCase):
         self.assertEqual(output[1]["method"], "roots/list")
         self.assertEqual(output[1]["id"], "ccc-roots-1")
         self.assertEqual(control.calls[-1],
-                         ("confirm-workspace-roots", [
-                             "/storage/user/Projects/new-project"]))
+                         ("replace-workspace-session", "mcp-root-set", 1,
+                          ["/storage/user/Projects/new-project"], "active"))
         self.assertFalse(any(item.get("method") == "elicitation/create"
                              for item in output))
 
@@ -250,11 +256,13 @@ class TestMCPProtocol(unittest.TestCase):
         self.assertEqual([item["id"] for item in requests],
                          ["ccc-roots-1", "ccc-roots-2"])
         confirmations = [call for call in control.calls
-                         if call[0] == "confirm-workspace-roots"]
+                         if call[0] == "replace-workspace-session"]
         self.assertEqual(confirmations, [
-            ("confirm-workspace-roots", ["/storage/user/Projects/a"]),
-            ("confirm-workspace-roots", []),
-            ("confirm-workspace-roots", ["/storage/user/Projects/b"]),
+            ("replace-workspace-session", "mcp-root-set", 1,
+             ["/storage/user/Projects/a"], "active"),
+            ("replace-workspace-session", "mcp-root-set", 2, [], "active"),
+            ("replace-workspace-session", "mcp-root-set", 3,
+             ["/storage/user/Projects/b"], "active"),
         ])
 
     def test_roots_change_while_request_pending_forces_followup_refresh(self):
@@ -283,10 +291,11 @@ class TestMCPProtocol(unittest.TestCase):
         self.assertEqual([item["id"] for item in requests],
                          ["ccc-roots-1", "ccc-roots-2"])
         confirmations = [call for call in control.calls
-                         if call[0] == "confirm-workspace-roots"]
+                         if call[0] == "replace-workspace-session"]
         self.assertEqual(confirmations, [
-            ("confirm-workspace-roots", []),
-            ("confirm-workspace-roots", ["/storage/user/Projects/b"]),
+            ("replace-workspace-session", "mcp-root-set", 1, [], "active"),
+            ("replace-workspace-session", "mcp-root-set", 2,
+             ["/storage/user/Projects/b"], "active"),
         ])
 
     def test_roots_reject_non_file_and_remote_file_uris(self):
@@ -306,8 +315,8 @@ class TestMCPProtocol(unittest.TestCase):
         ])
 
         self.assertEqual(control.calls[-1],
-                         ("confirm-workspace-roots", [
-                             "/storage/user/Projects/good name"]))
+                         ("replace-workspace-session", "mcp-root-set", 1,
+                          ["/storage/user/Projects/good name"], "active"))
 
     def test_unhardened_client_does_not_confirm_roots(self):
         output, control = self.run_server([
@@ -317,7 +326,7 @@ class TestMCPProtocol(unittest.TestCase):
         ], destructive_authorized=False)
 
         self.assertEqual(len(output), 1)
-        self.assertFalse(any(call[0] == "confirm-workspace-roots"
+        self.assertFalse(any(call[0] == "replace-workspace-session"
                              for call in control.calls))
 
     def test_malformed_roots_response_is_ignored_without_killing_server(self):
@@ -335,7 +344,7 @@ class TestMCPProtocol(unittest.TestCase):
 
         self.assertEqual(output[-1], {"jsonrpc": "2.0", "id": 9,
                                       "result": {}})
-        self.assertFalse(any(call[0] == "confirm-workspace-roots"
+        self.assertFalse(any(call[0] == "replace-workspace-session"
                              for call in control.calls))
 
 
@@ -401,6 +410,34 @@ class TestMCPControlAdmission(unittest.TestCase):
 
         self.assertFalse(reply["ok"])
         self.assertIn("pinned hardened client", reply["error"])
+        self.assertEqual(calls, [])
+
+    def test_raw_control_token_cannot_replace_logical_workspace_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "control.sock")
+            calls = []
+            server = ControlServer(path, lambda req: calls.append(req) or
+                                   {"verdict": "workspace-updated"}, "token")
+            server.start()
+            self.addCleanup(server.stop)
+            raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                raw.connect(path)
+                raw.sendall((json.dumps({
+                    "version": 1, "token": "token",
+                    "op": "workspace-session-replace",
+                    "source": "codex-app-server",
+                    "logical_session_id": "forged-thread",
+                    "generation": 1,
+                    "paths": ["/storage/user/Projects/forged"],
+                    "state": "active",
+                }) + "\n").encode())
+                reply = json.loads(raw.makefile("r").readline())
+            finally:
+                raw.close()
+
+        self.assertFalse(reply["ok"])
+        self.assertIn("pinned official client", reply["error"])
         self.assertEqual(calls, [])
 
     def test_hardened_parent_and_mcp_child_receive_destructive_capability(self):

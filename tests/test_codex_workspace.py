@@ -54,7 +54,9 @@ class TestCodexWorkspaceMonitor(unittest.TestCase):
                                 "params": {"threadId": "a",
                                            "cwd": "/storage/user/a2"}})
         roots = monitor.observe_server({"id": 3, "result": {"turn": {"id": "t"}}})
-        self.assertEqual(roots, ["/storage/user/a2", "/storage/user/b"])
+        self.assertEqual(roots, ["/storage/user/a2"])
+        self.assertEqual(roots.logical_session_id, "a")
+        self.assertEqual(roots.generation, 3)
 
     def test_relative_and_non_path_values_are_ignored(self):
         monitor = CodexWorkspaceMonitor()
@@ -83,13 +85,15 @@ class TestCodexWorkspaceMonitor(unittest.TestCase):
         roots = monitor.observe_server({
             "id": 2, "result": {"thread": {"id": "forked"}},
         })
-        self.assertEqual(roots, ["/storage/user/fork",
-                                 "/storage/user/parent"])
+        self.assertEqual(roots, ["/storage/user/fork"])
+        self.assertEqual(roots.logical_session_id, "forked")
 
         monitor.observe_client({"id": 3, "method": "thread/archive",
                                 "params": {"threadId": "forked"}})
         roots = monitor.observe_server({"id": 3, "result": {}})
-        self.assertEqual(roots, ["/storage/user/parent"])
+        self.assertEqual(roots, [])
+        self.assertEqual(roots.state, "ended")
+        self.assertEqual(monitor.roots(), ["/storage/user/parent"])
 
     def test_out_of_order_successes_cannot_restore_stale_thread_scope(self):
         monitor = CodexWorkspaceMonitor()
@@ -114,7 +118,9 @@ class TestCodexWorkspaceMonitor(unittest.TestCase):
                                            "cwd": "/storage/user/resurrect"}})
         monitor.observe_client({"id": 5, "method": "thread/archive",
                                 "params": {"threadId": "thread"}})
-        self.assertEqual(monitor.observe_server({"id": 5, "result": {}}), [])
+        ended = monitor.observe_server({"id": 5, "result": {}})
+        self.assertEqual(ended, [])
+        self.assertEqual(ended.state, "ended")
         self.assertIsNone(monitor.observe_server({"id": 4, "result": {}}))
         self.assertEqual(monitor.roots(), [])
 

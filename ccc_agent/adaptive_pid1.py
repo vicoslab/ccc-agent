@@ -64,15 +64,20 @@ def _harden_runner_transport():
         raise OSError(err, os.strerror(err))
 
 
-def _confirm_runner_workspace(paths):
-    if isinstance(paths, str):
-        paths = [paths]
-    if (not isinstance(paths, list) or
-            any(not isinstance(path, str) or not os.path.isabs(path)
-                for path in paths)):
-        raise ValueError("workspace roots must be absolute paths")
-    return _control_request({"op": "turn-confirm-workspace-roots",
-                             "paths": paths})
+def _confirm_runner_workspace(update):
+    if hasattr(update, "to_request"):
+        request = update.to_request()
+    else:
+        if isinstance(update, str):
+            update = [update]
+        if (not isinstance(update, list) or
+                any(not isinstance(path, str) or not os.path.isabs(path)
+                    for path in update)):
+            raise ValueError("workspace roots must be absolute paths")
+        # Compatibility for non-session-aware official clients. Codex app-server
+        # observation always uses the typed branch above.
+        request = {"op": "turn-confirm-workspace-roots", "paths": update}
+    return _control_request(request)
 
 
 def _client_environment():
@@ -337,8 +342,6 @@ def run(command, channel, bootstrap, stability, detach):
         if _register_initial_client(child.pid):
             _harden_runner_transport()
             trusted_runner = True
-            if os.environ.get("CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE") == "1":
-                _confirm_runner_workspace(os.getcwd())
     except Exception as exc:
         sys.stderr.write(
             "ccc-agent adaptive runner: initial client/workspace registration "

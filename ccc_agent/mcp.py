@@ -80,6 +80,8 @@ class MCPServer(object):
         self._roots_id = 0
         self._pending_roots_id = None
         self._roots_refresh_pending = False
+        self._workspace_generation = 0
+        self._workspace_logical_id = "mcp-root-set"
 
     def _write(self, message):
         self.writer.write(json.dumps(message, separators=(",", ":")) + "\n")
@@ -178,12 +180,18 @@ class MCPServer(object):
         self._write({"jsonrpc": "2.0", "id": self._pending_roots_id,
                      "method": "roots/list", "params": {}})
 
+    def _replace_workspace_roots(self, paths, state="active"):
+        self._workspace_generation += 1
+        return self.control.replace_workspace_session(
+            self._workspace_logical_id, self._workspace_generation,
+            list(paths), state=state)
+
     def _roots_changed(self):
         if not self.destructive_authorized or not self._supports_roots():
             return
         # The previous set is stale as soon as the trusted client announces a
         # change. Revoke it before waiting for a replacement round trip.
-        self.control.confirm_workspace_roots([])
+        self._replace_workspace_roots([])
         self._request_roots()
 
     @staticmethod
@@ -221,7 +229,7 @@ class MCPServer(object):
                     paths = self._root_paths(response)
                 except ValueError:
                     return True
-                self.control.confirm_workspace_roots(paths)
+                self._replace_workspace_roots(paths)
             return True
         finally:
             if refresh:

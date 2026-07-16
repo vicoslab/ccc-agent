@@ -7,6 +7,39 @@ authority.
 """
 
 
+class WorkspaceSessionUpdate(object):
+    """Successful app-server lifecycle update awaiting supervisor admission."""
+
+    source = "codex-app-server"
+
+    def __init__(self, logical_session_id, generation, roots, state="active"):
+        self.logical_session_id = str(logical_session_id)
+        self.generation = int(generation)
+        self.roots = tuple(sorted(set(roots)))
+        self.state = str(state)
+
+    def to_request(self):
+        return {
+            "op": "workspace-session-replace",
+            "source": self.source,
+            "logical_session_id": self.logical_session_id,
+            "generation": self.generation,
+            "paths": list(self.roots),
+            "state": self.state,
+        }
+
+    def __eq__(self, other):
+        # Compatibility for clients that displayed the old derived-union return.
+        if isinstance(other, (list, tuple)):
+            return list(self.roots) == list(other)
+        if not isinstance(other, WorkspaceSessionUpdate):
+            return False
+        return self.to_request() == other.to_request()
+
+    def __repr__(self):
+        return "WorkspaceSessionUpdate(%r)" % self.to_request()
+
+
 class CodexWorkspaceMonitor(object):
     def __init__(self, launch_cwd=None):
         self._pending = {}
@@ -78,7 +111,8 @@ class CodexWorkspaceMonitor(object):
                 return None
             self._thread_versions[thread_id] = sequence
             self._threads.pop(thread_id, None)
-            return self.roots()
+            return WorkspaceSessionUpdate(
+                thread_id, sequence, (), state="ended")
         result = message.get("result") or {}
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
@@ -90,13 +124,14 @@ class CodexWorkspaceMonitor(object):
         else:
             thread_id = pending["thread_id"] or response_thread_id
         paths = pending["paths"] or self._paths(thread)
-        if thread_id and paths:
+        if thread_id and (paths or self._launch):
             thread_id = str(thread_id)
             if sequence < self._thread_versions.get(thread_id, 0):
                 return None
+            paths = sorted(set(list(paths) + self._launch))
             self._thread_versions[thread_id] = sequence
             self._threads[thread_id] = paths
-            return self.roots()
+            return WorkspaceSessionUpdate(thread_id, sequence, paths)
         return None
 
     def roots(self):

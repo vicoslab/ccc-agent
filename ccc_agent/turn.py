@@ -34,7 +34,9 @@ production supervisor.
 """
 
 import binascii
+import hashlib
 import os
+import re
 import shutil
 import threading
 
@@ -46,6 +48,7 @@ from .control import (VERDICT_COMMITTED, VERDICT_DISCARDED, VERDICT_HELD,
 from .paths import is_within, normalize
 from .policy import PolicyConfig, classify, filter_ignored
 from .previous_commits import DECISION_COMMITTED, TURN_PATH_DECISIONS
+from .session import utc_now
 from .workspace import WorkspaceAdmissionPolicy
 
 
@@ -57,6 +60,11 @@ WORKSPACE_PROPOSALS = "hook_workspace_proposals"
 MCP_WORKSPACE_ROOTS = "mcp_workspace_roots"
 VERDICT_WORKSPACE_PROPOSED = "workspace-proposed"
 VERDICT_WORKSPACE_PROPOSAL_STATUS = "workspace-proposal-status"
+
+_WORKSPACE_SESSION_SOURCES = frozenset((
+    "codex-app-server", "mcp-claude", "mcp-codex", "hermes-client",
+))
+_AUTHORITY_INSTANCE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 def _new_token():
@@ -117,6 +125,35 @@ class TurnController(object):
         paths = set(out_of_scope)
         paths.update(m.path for m in deny)
         return paths
+
+    def _revalidate_active_workspace_sessions(self):
+        invalid = []
+        for key, record in self._workspace_session_records().items():
+            if not isinstance(record, dict) or record.get("state") != "active":
+                continue
+            refreshed = []
+            try:
+                for root in record.get("roots") or ():
+                    refreshed.append(
+                        self.workspace_admission_policy.revalidate(root))
+            except ValueError as exc:
+                invalid.append((key, record, str(exc)))
+                continue
+            record["roots"] = refreshed
+        if not invalid:
+            return
+        for _key, record, reason in invalid:
+            record["state"] = "invalid"
+            record["roots"] = []
+            record["updated_at"] = utc_now()
+            record["invalid_reason"] = reason[:256]
+        confirmed = self._derived_workspace_roots()
+        self._replace_dynamic_workspace_union_locked(
+            confirmed, "turn-workspace-session-invalidated",
+            "%d logical session(s) failed identity revalidation" % len(invalid))
+        raise ValueError(
+            "workspace identity changed; automatic apply refused for %d session(s)"
+            % len(invalid))
 
     def _change_root_rel(self, ch):
         roots = self._roots()
@@ -443,6 +480,206 @@ class TurnController(object):
             return {"verdict": VERDICT_WORKSPACE_PROPOSAL_STATUS,
                     "proposals": paths, "count": len(paths)}
 
+    def _workspace_session_records(self):
+        records = self.session.authenticated_workspace_sessions
+        if not isinstance(records, dict):
+            records = {}
+            self.session.authenticated_workspace_sessions = records
+        return records
+
+    @staticmethod
+    def _workspace_session_key(source, authority_instance, logical_session_id):
+        source = str(source or "").strip().lower()
+        if source not in _WORKSPACE_SESSION_SOURCES:
+            raise ValueError("unsupported workspace authority source %r" % source)
+        authority_instance = str(authority_instance or "").strip()
+        if not _AUTHORITY_INSTANCE_RE.match(authority_instance):
+            raise ValueError("invalid workspace authority instance")
+        if (not isinstance(logical_session_id, str) or
+                not logical_session_id or "\x00" in logical_session_id or
+                len(logical_session_id.encode("utf-8")) > 4096):
+            raise ValueError("logical workspace session id is invalid")
+        digest = hashlib.sha256(logical_session_id.encode("utf-8")).hexdigest()
+        key = "%s:%s:%s" % (source, authority_instance, digest)
+        return key, "sha256:" + digest, source, authority_instance
+
+    def _derived_workspace_roots(self):
+        roots = []
+        seen = set()
+        for record in self._workspace_session_records().values():
+            if not isinstance(record, dict) or record.get("state") != "active":
+                continue
+            for root in record.get("roots") or ():
+                if not isinstance(root, dict):
+                    continue
+                visible = root.get("visible_path")
+                canonical = root.get("canonical_path")
+                if (not isinstance(visible, str) or
+                        not isinstance(canonical, str) or canonical in seen):
+                    continue
+                roots.append(visible)
+                seen.add(canonical)
+        return sorted(roots, key=self._canonical_key)
+
+    def _replace_dynamic_workspace_union_locked(self, confirmed,
+                                                 event, detail):
+        old_roots = self._unique_paths_by_canonical(
+            self.session.policy.get(MCP_WORKSPACE_ROOTS, ()))
+        old_keys = {self._canonical_key(path) for path in old_roots}
+        new_keys = {self._canonical_key(path) for path in confirmed}
+        ceiling_keys = {self._canonical_key(path)
+                        for path in self._workspace_ceiling()}
+        refs = self._hook_workspace_refs()
+        proposals = self._workspace_proposals()
+        workspaces = []
+        for item in self._workspace_scopes():
+            key = self._canonical_key(item)
+            if (key in old_keys and key not in new_keys and
+                    key not in ceiling_keys and key not in refs):
+                continue
+            workspaces.append(item)
+
+        workspace_keys = {self._canonical_key(path) for path in workspaces}
+        for workspace in confirmed:
+            key = self._canonical_key(workspace)
+            if key not in workspace_keys:
+                workspaces.append(workspace)
+                workspace_keys.add(key)
+            proposals.pop(key, None)
+
+        self.session.policy[MCP_WORKSPACE_ROOTS] = list(confirmed)
+        workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
+        if not self.session.workspace and confirmed:
+            self.session.workspace = confirmed[0]
+        self.session.add_event(event, detail)
+        self.store.save(self.session)
+        return workspaces, allowed, proposals
+
+    def replace_workspace_session(self, source, logical_session_id, generation,
+                                  paths, state="active",
+                                  authority_instance="current"):
+        """Atomically replace one authenticated logical session's exact roots."""
+        with self._lock:
+            key, digest, source, authority_instance = self._workspace_session_key(
+                source, authority_instance, logical_session_id)
+            if isinstance(generation, bool) or not isinstance(generation, int):
+                raise ValueError("workspace generation must be an integer")
+            if generation < 0:
+                raise ValueError("workspace generation cannot be negative")
+            if state not in ("active", "ended"):
+                raise ValueError("workspace session state must be active or ended")
+            if not isinstance(paths, (list, tuple)):
+                raise ValueError("workspace roots must be an array")
+            if len(paths) > 128:
+                raise ValueError("workspace root replacement is too large")
+            if state == "ended" and paths:
+                raise ValueError("ended workspace sessions must have no roots")
+
+            roots = []
+            seen = set()
+            for path in paths:
+                admitted = self.workspace_admission_policy.admit(
+                    path, require_existing=True)
+                canonical = admitted["canonical_path"]
+                if canonical in seen:
+                    continue
+                roots.append({
+                    "visible_path": admitted["visible_path"],
+                    "canonical_path": canonical,
+                    "canonical_key": admitted["canonical_key"],
+                    "protected_root": admitted["protected_root"],
+                    "relative_path": admitted["relative_path"],
+                    "admission_root": admitted["admission_root"],
+                    "identity": admitted["identity"],
+                    "components": admitted["components"],
+                })
+                seen.add(canonical)
+            roots.sort(key=lambda item: item["canonical_path"])
+
+            records = self._workspace_session_records()
+            old = records.get(key)
+            if isinstance(old, dict):
+                old_generation = old.get("generation")
+                if isinstance(old_generation, int) and generation < old_generation:
+                    raise ValueError("stale generation cannot replace workspace roots")
+                if generation == old_generation:
+                    if old.get("state") != state or old.get("roots") != roots:
+                        raise ValueError("workspace generation collision")
+                    return {
+                        "verdict": VERDICT_WORKSPACE_UPDATED,
+                        "action": "replace-session-roots",
+                        "workspace_session_key": key,
+                        "generation": generation,
+                        "state": state,
+                        "confirmed": [root["visible_path"] for root in roots],
+                        "idempotent": True,
+                    }
+
+            records[key] = {
+                "source": source,
+                "authority_instance": authority_instance,
+                "logical_session_digest": digest,
+                "generation": generation,
+                "roots": roots,
+                "state": state,
+                "updated_at": utc_now(),
+            }
+            confirmed = self._derived_workspace_roots()
+            workspaces, allowed, proposals = (
+                self._replace_dynamic_workspace_union_locked(
+                    confirmed,
+                    "turn-workspace-session-replaced",
+                    "%s generation %d %s" % (source, generation, state)))
+            return {
+                "verdict": VERDICT_WORKSPACE_UPDATED,
+                "action": "replace-session-roots",
+                "workspace_session_key": key,
+                "generation": generation,
+                "state": state,
+                "confirmed": [root["visible_path"] for root in roots],
+                "derived_roots": confirmed,
+                "workspaces": workspaces,
+                "allowed_scopes": allowed,
+                "proposals": sorted(entry["path"]
+                                    for entry in proposals.values()),
+                "idempotent": False,
+            }
+
+    def revoke_workspace_authority(self, source, authority_instance,
+                                   reason="trusted-transport-closed"):
+        """End only logical sessions owned by one dead trusted transport."""
+        with self._lock:
+            source = str(source or "").strip().lower()
+            authority_instance = str(authority_instance or "").strip()
+            changed = 0
+            for record in self._workspace_session_records().values():
+                if (not isinstance(record, dict) or
+                        record.get("source") != source or
+                        record.get("authority_instance") != authority_instance or
+                        record.get("state") != "active"):
+                    continue
+                record["state"] = "ended"
+                record["roots"] = []
+                record["generation"] = int(record.get("generation", 0)) + 1
+                record["updated_at"] = utc_now()
+                changed += 1
+            confirmed = self._derived_workspace_roots()
+            workspaces, allowed, _proposals = (
+                self._replace_dynamic_workspace_union_locked(
+                    confirmed, "turn-workspace-authority-revoked",
+                    "%s %s %d session(s): %s" %
+                    (source, authority_instance, changed, str(reason)[:128])))
+            return {
+                "verdict": VERDICT_WORKSPACE_UPDATED,
+                "action": "revoke-workspace-authority",
+                "source": source,
+                "authority_instance": authority_instance,
+                "revoked": changed,
+                "derived_roots": confirmed,
+                "workspaces": workspaces,
+                "allowed_scopes": allowed,
+            }
+
     def confirm_workspace_roots(self, paths):
         """Synchronize roots reported by the process-pinned official MCP client."""
         with self._lock:
@@ -505,6 +742,9 @@ class TurnController(object):
         with self._lock:
             refs = self._hook_workspace_refs()
             proposals = self._workspace_proposals()
+            had_workspace_sessions = bool(
+                self.session.authenticated_workspace_sessions)
+            self.session.authenticated_workspace_sessions = {}
             mcp_roots = self._unique_paths_by_canonical(
                 self.session.policy.get(MCP_WORKSPACE_ROOTS, ()))
             stale_keys = set(refs)
@@ -523,9 +763,11 @@ class TurnController(object):
                                     for entry in proposals.values())
             self.session.policy[WORKSPACE_PROPOSALS] = {}
             workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
-            if removed:
-                self.session.add_event("turn-workspace-reset",
-                                       "%d stale scope(s)" % len(removed))
+            if removed or had_workspace_sessions:
+                self.session.add_event(
+                    "turn-workspace-reset",
+                    "%d stale scope(s), logical sessions cleared=%s" %
+                    (len(removed), had_workspace_sessions))
             self.store.save(self.session)
             return {"verdict": VERDICT_WORKSPACE_UPDATED,
                     "action": "reset",
@@ -605,6 +847,8 @@ class TurnController(object):
             to_apply = [c for c in changes
                         if c.path in committed_paths or
                         (c.path not in oos and c.path not in held_paths)]
+            if to_apply:
+                self._revalidate_active_workspace_sessions()
             committed, permission_denied = self._apply(to_apply)
             self._mark_paths(committed, DECISION_COMMITTED)
             permission_kept = []
@@ -667,6 +911,8 @@ class TurnController(object):
         if not paths:
             return []
         changes = [c for c in self._live_changes() if c.path in paths]
+        if changes:
+            self._revalidate_active_workspace_sessions()
         committed, denied = self._apply(changes)
         self._mark_paths(committed, DECISION_COMMITTED)
         if denied:
@@ -950,6 +1196,16 @@ class TurnController(object):
             return self.request_abort()
         if op == "turn-confirm-workspace-roots":
             return self.confirm_workspace_roots(request.get("paths"))
+        if op == "workspace-session-replace":
+            return self.replace_workspace_session(
+                request.get("source"), request.get("logical_session_id"),
+                request.get("generation"), request.get("paths"),
+                state=request.get("state", "active"),
+                authority_instance=request.get("authority_instance", "current"))
+        if op == "workspace-authority-revoke":
+            return self.revoke_workspace_authority(
+                request.get("source"), request.get("authority_instance"),
+                reason=request.get("reason", "trusted-transport-closed"))
         if op == "turn-workspace-proposal-status":
             return self.workspace_proposal_status()
         if op == "turn-kept-status":

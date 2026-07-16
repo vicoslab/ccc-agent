@@ -27,6 +27,8 @@ WORKSPACE_HOOK_OPS = frozenset(("turn-add-workspace", "turn-remove-workspace"))
 MCP_ONLY_OPS = frozenset(("turn-approve", "turn-resolve",
                           "turn-request-abort"))
 WORKSPACE_CONFIRM_OP = "turn-confirm-workspace-roots"
+WORKSPACE_SESSION_REPLACE_OP = "workspace-session-replace"
+WORKSPACE_AUTHORITY_REVOKE_OP = "workspace-authority-revoke"
 
 
 class ControlError(Exception):
@@ -123,16 +125,23 @@ def _registered_child_host_pid(parent_pid, child_namespace_pid):
     return matches[0] if len(matches) == 1 else None
 
 
-def _process_matches(identity, expected):
+def _process_match_name(identity, expected):
     if identity is None:
-        return False
-    names = {os.path.basename(identity.get("exe") or "").lower()}
+        return None
+    names = [os.path.basename(identity.get("exe") or "").lower()]
     argv = identity.get("argv") or []
     if argv:
-        names.add(os.path.basename(argv[0]).lower())
-        # Node/python launchers can name their script/module just after argv[0].
-        names.update(os.path.basename(arg).lower() for arg in argv[1:3])
-    return bool(names & set(expected))
+        names.append(os.path.basename(argv[0]).lower())
+        names.extend(os.path.basename(arg).lower() for arg in argv[1:3])
+    expected = tuple(str(item).lower() for item in expected)
+    for candidate in expected:
+        if candidate in names:
+            return candidate
+    return None
+
+
+def _process_matches(identity, expected):
+    return _process_match_name(identity, expected) is not None
 
 
 def _is_descendant(pid, ancestor_pid, limit=64):
@@ -178,11 +187,14 @@ class ControlServer(object):
         self._launch_supported = False
         self._launch_ready = threading.Condition()
         self._registered_client_fingerprint = None
+        self._registered_client_name = None
         self._registered_runner_fingerprint = None
         self._mcp_fingerprint = None
+        self._mcp_client_name = None
         self._mcp_conn = None
         self._mcp_destructive_authorized = False
         self._workspace_fingerprint = None
+        self._workspace_client_name = None
         self._workspace_conn = None
         self._admission_lock = threading.Lock()
 
@@ -254,7 +266,8 @@ class ControlServer(object):
             return {"ok": False, "error": "registration peer is not trusted PID 1"}
         child_pid = _registered_child_host_pid(runner_pid, child_namespace_pid)
         child = _proc_identity(child_pid) if child_pid is not None else None
-        if child is None or not _process_matches(child, self.expected_clients):
+        client_name = _process_match_name(child, self.expected_clients)
+        if child is None or client_name is None:
             return {"ok": False, "error": "registered child is not the expected client"}
         fingerprint = (child["pid"], child["start_time"])
         with self._launch_ready:
@@ -262,6 +275,7 @@ class ControlServer(object):
                     self._registered_client_fingerprint != fingerprint):
                 return {"ok": False, "error": "initial client is already registered"}
             self._registered_client_fingerprint = fingerprint
+            self._registered_client_name = client_name
             self._registered_runner_fingerprint = (
                 runner["pid"], runner["start_time"])
             self._launch_ready.notify_all()
@@ -371,6 +385,7 @@ class ControlServer(object):
                 return {"ok": False,
                         "error": "a workspace client is already pinned"}
             self._workspace_fingerprint = fingerprint
+            self._workspace_client_name = "hermes"
             self._workspace_conn = conn
         return {"ok": True, "admitted": True}
 
@@ -385,7 +400,10 @@ class ControlServer(object):
                     self._launch_boundary_valid(peer["pid"]) and
                     _proc_fds_hidden(peer["pid"]))
 
-    def _admit_mcp(self, conn):
+    def _admit_mcp(self, conn, client_name=None):
+        client_name = str(client_name or "").strip().lower()
+        if client_name not in ("codex", "claude"):
+            return {"ok": False, "error": "unsupported MCP client identity"}
         try:
             pid, uid, _gid = peer_credentials(conn)
         except ControlError as exc:
@@ -401,6 +419,7 @@ class ControlServer(object):
                 return {"ok": False,
                         "error": "an MCP process/connection is already pinned"}
             self._mcp_fingerprint = eligibility["fingerprint"]
+            self._mcp_client_name = client_name
             self._mcp_conn = conn
             self._mcp_destructive_authorized = bool(
                 eligibility["destructive_authorized"])
@@ -429,9 +448,37 @@ class ControlServer(object):
                     _proc_fds_hidden(client_pid))
         return True
 
+    def _workspace_authority(self, conn):
+        with self._admission_lock:
+            mcp = (self._mcp_conn is conn, self._mcp_fingerprint,
+                   self._mcp_client_name, self._mcp_destructive_authorized)
+            workspace = (self._workspace_conn is conn,
+                         self._workspace_fingerprint)
+        if mcp[0]:
+            if mcp[1] and mcp[3] and self._mcp_connection_valid(conn):
+                fp, name = mcp[1], mcp[2]
+                if name in ("codex", "claude"):
+                    return ("mcp-" + name, "mcp-%d-%d-%d-%d" % fp)
+            return None
+        if workspace[0]:
+            if workspace[1] and self._workspace_connection_valid(conn):
+                return ("hermes-client", "workspace-%d-%d" % workspace[1])
+            return None
+        if self._runner_connection_valid(conn):
+            with self._launch_ready:
+                runner = self._registered_runner_fingerprint
+                client = self._registered_client_fingerprint
+                name = self._registered_client_name
+            if name == "codex" and runner and client:
+                return ("codex-app-server",
+                        "runner-%d-%d-%d-%d" %
+                        (runner[0], runner[1], client[0], client[1]))
+        return None
+
     def _release_pinned_connection(self, conn):
-        """Revoke dynamic roots if trusted transport dies before its client."""
+        """Revoke only roots owned by a dead trusted transport."""
         client_fingerprint = None
+        authority = self._workspace_authority(conn)
         with self._admission_lock:
             if self._mcp_conn is conn:
                 if self._mcp_fingerprint is not None:
@@ -444,26 +491,34 @@ class ControlServer(object):
         if client_fingerprint is None:
             return
         if self.transport_revoke_grace <= 0:
-            self._revoke_roots_if_client_live(client_fingerprint)
+            self._revoke_roots_if_client_live(client_fingerprint, authority)
             return
         threading.Thread(
             target=self._revoke_roots_after_grace,
-            args=(client_fingerprint,), daemon=True).start()
+            args=(client_fingerprint, authority), daemon=True).start()
 
-    def _revoke_roots_after_grace(self, client_fingerprint):
+    def _revoke_roots_after_grace(self, client_fingerprint, authority):
         if self._stop.wait(self.transport_revoke_grace):
             return
-        self._revoke_roots_if_client_live(client_fingerprint)
+        self._revoke_roots_if_client_live(client_fingerprint, authority)
 
-    def _revoke_roots_if_client_live(self, client_fingerprint):
+    def _revoke_roots_if_client_live(self, client_fingerprint, authority):
         client = _proc_identity(client_fingerprint[0])
         if not client or client["start_time"] != client_fingerprint[1]:
             # Normal client/PID-1 teardown has already ended agent authority;
             # preserve the last valid roots for immediate finalization.
             return
         try:
-            self.handler({"op": WORKSPACE_CONFIRM_OP, "paths": [],
-                          "source": "trusted-transport-closed"})
+            if authority is None:
+                self.handler({"op": WORKSPACE_CONFIRM_OP, "paths": [],
+                              "source": "trusted-transport-closed"})
+            else:
+                self.handler({
+                    "op": WORKSPACE_AUTHORITY_REVOKE_OP,
+                    "source": authority[0],
+                    "authority_instance": authority[1],
+                    "reason": "trusted-transport-closed",
+                })
         except Exception:
             # Connection teardown must not kill the control server. A later
             # trusted replacement/reset still fails closed.
@@ -487,7 +542,7 @@ class ControlServer(object):
                     _send_line(conn, resp)
                     return
                 if req.get("op") == "mcp-admit":
-                    resp = self._admit_mcp(conn)
+                    resp = self._admit_mcp(conn, req.get("client"))
                     _send_line(conn, resp)
                     if not resp.get("ok"):
                         return
@@ -498,6 +553,17 @@ class ControlServer(object):
                     if not resp.get("ok"):
                         return
                     continue
+                if req.get("op") == WORKSPACE_SESSION_REPLACE_OP:
+                    authority = self._workspace_authority(conn)
+                    if authority is None:
+                        _send_line(conn, {"ok": False,
+                                          "error": "workspace session replacement requires a live pinned official client"})
+                        if self._mcp_conn is conn or self._workspace_conn is conn:
+                            continue
+                        return
+                    req = dict(req)
+                    req["source"] = authority[0]
+                    req["authority_instance"] = authority[1]
                 if req.get("op") == WORKSPACE_CONFIRM_OP:
                     trusted_workspace = (
                         (self._mcp_connection_valid(conn) and
@@ -683,6 +749,16 @@ class MCPControlClient(ControlClient):
     def confirm_workspace_roots(self, paths):
         return self._request({"op": "turn-confirm-workspace-roots",
                               "paths": list(paths)})
+
+    def replace_workspace_session(self, logical_session_id, generation, paths,
+                                  state="active"):
+        return self._request({
+            "op": WORKSPACE_SESSION_REPLACE_OP,
+            "logical_session_id": str(logical_session_id),
+            "generation": generation,
+            "paths": list(paths),
+            "state": str(state),
+        })
 
     def workspace_proposal_status(self):
         return self._request({"op": "turn-workspace-proposal-status"})

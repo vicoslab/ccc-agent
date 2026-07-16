@@ -128,7 +128,10 @@ class Session(object):
     def __init__(self, session_id, owner, agent_kind, agent_command,
                  workspace, policy, protected_roots, state="created",
                  created_at=None, finished_at=None, exit_status=None,
-                 completion="process-exit", events=None, repair_attempts=0):
+                 completion="process-exit", events=None, repair_attempts=0,
+                 workspace_state_version=2,
+                 authenticated_workspace_sessions=None,
+                 session_delta_routes=None):
         self.session_id = session_id
         self.owner = owner
         self.agent_kind = agent_kind
@@ -143,6 +146,13 @@ class Session(object):
         self.completion = completion
         self.events = list(events or [])
         self.repair_attempts = repair_attempts
+        self.workspace_state_version = int(workspace_state_version)
+        if self.workspace_state_version != 2:
+            raise ValueError("unsupported workspace state version %r" %
+                             workspace_state_version)
+        self.authenticated_workspace_sessions = dict(
+            authenticated_workspace_sessions or {})
+        self.session_delta_routes = dict(session_delta_routes or {})
 
     def transition(self, new_state):
         if new_state not in STATES:
@@ -182,6 +192,9 @@ class Session(object):
             "completion": self.completion,
             "events": self.events,
             "repair_attempts": self.repair_attempts,
+            "workspace_state_version": self.workspace_state_version,
+            "authenticated_workspace_sessions": self.authenticated_workspace_sessions,
+            "session_delta_routes": self.session_delta_routes,
         }
 
     @classmethod
@@ -203,6 +216,10 @@ class Session(object):
             completion=data.get("completion", "process-exit"),
             events=data.get("events"),
             repair_attempts=data.get("repair_attempts", 0),
+            workspace_state_version=data.get("workspace_state_version", 2),
+            authenticated_workspace_sessions=data.get(
+                "authenticated_workspace_sessions"),
+            session_delta_routes=data.get("session_delta_routes"),
         )
 
 
