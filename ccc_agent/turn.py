@@ -46,6 +46,7 @@ from .control import (VERDICT_COMMITTED, VERDICT_DISCARDED, VERDICT_HELD,
 from .paths import is_within, normalize
 from .policy import PolicyConfig, classify, filter_ignored
 from .previous_commits import DECISION_COMMITTED, TURN_PATH_DECISIONS
+from .workspace import WorkspaceAdmissionPolicy
 
 
 DECISION_KEPT = "kept"
@@ -66,11 +67,19 @@ class TurnController(object):
     """Stateful per-session handler; thread-safe (the control server may call
     from a connection thread)."""
 
-    def __init__(self, session, store, backend, alias_map):
+    def __init__(self, session, store, backend, alias_map,
+                 workspace_admission_policy=None):
         self.session = session
         self.store = store
         self.backend = backend
         self.alias_map = alias_map
+        self.workspace_admission_policy = (
+            workspace_admission_policy or WorkspaceAdmissionPolicy(
+                session.protected_roots, alias_map,
+                workspace_admission_roots=session.policy.get(
+                    "workspace_admission_roots"),
+                allow_protected_root_workspace=session.policy.get(
+                    "allow_protected_root_workspace", False)))
         self._lock = threading.Lock()
         self._pending = {}       # approval_token -> frozenset(visible paths)
 
@@ -120,9 +129,9 @@ class TurnController(object):
 
     def _canonical_key(self, path):
         """Canonical comparison key for absolute visible paths/scopes."""
-        return self.alias_map.canonicalize(normalize(str(path)))
+        return self.workspace_admission_policy.canonical_key(path)
 
-    def _validate_workspace(self, path):
+    def _validate_workspace(self, path, require_existing=False):
         """Return (visible path, canonical path) for a safe workspace scope.
 
         A turn workspace is only a commit/review policy scope. It must live in
@@ -130,14 +139,9 @@ class TurnController(object):
         either be meaningless or accidentally bless writes that BranchFS is not
         supervising.
         """
-        visible_path = normalize(str(path or ""))
-        canonical = self.alias_map.canonicalize(visible_path)
-        for root in self.session.protected_roots.values():
-            root_visible = self.alias_map.canonicalize(root.visible)
-            if is_within(canonical, root_visible):
-                return visible_path, canonical
-        raise ValueError("workspace %s is not under a protected root" %
-                         visible_path)
+        admitted = self.workspace_admission_policy.admit(
+            path, require_existing=require_existing)
+        return admitted["visible_path"], admitted["canonical_path"]
 
     def _unique_paths_by_canonical(self, paths):
         result = []
@@ -442,12 +446,16 @@ class TurnController(object):
     def confirm_workspace_roots(self, paths):
         """Synchronize roots reported by the process-pinned official MCP client."""
         with self._lock:
-            confirmed = self._unique_paths_by_canonical(paths or ())
-            if len(confirmed) != len(set(paths or ())):
-                # _unique_paths_by_canonical silently drops invalid legacy state;
-                # authoritative client input must instead fail closed.
-                for path in paths or ():
-                    self._validate_workspace(path)
+            confirmed = []
+            seen = set()
+            # Authoritative replacement is transactional: admit every root
+            # before mutating any persisted/effective policy state.
+            for path in paths or ():
+                visible, canonical = self._validate_workspace(
+                    path, require_existing=True)
+                if canonical not in seen:
+                    confirmed.append(visible)
+                    seen.add(canonical)
 
             old_roots = self._unique_paths_by_canonical(
                 self.session.policy.get(MCP_WORKSPACE_ROOTS, ()))

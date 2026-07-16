@@ -24,7 +24,8 @@ from ccc_agent.turn import TurnController
 class TurnHarness(object):
     def __init__(self, tmp):
         self.base = os.path.join(tmp, "base")
-        os.makedirs(os.path.join(self.base, "Projects", "proj-a"))
+        for project in ("proj-a", "proj-b", "proj-c"):
+            os.makedirs(os.path.join(self.base, "Projects", project))
         self.backend = FakeBranchFS()
         self.store = SessionStore(os.path.join(tmp, "state"))
         self.alias = AliasMap.for_home("domen", home_subdir="")
@@ -181,20 +182,12 @@ class TestTurnController(unittest.TestCase):
             persisted.policy["turn_path_decisions"]["/storage/user/escape.txt"],
             "kept")
 
-    def test_hook_cannot_broaden_workspace_beyond_operator_ceiling(self):
-        resp = self.h.tc.add_workspace("/storage/user",
-                                       hook_session="malicious-hook")
-
-        self.assertEqual(resp["verdict"], "workspace-proposed")
-        self.assertTrue(resp["proposed"])
-        self.assertNotIn("/storage/user", resp["allowed_scopes"])
-        self.assertEqual(self.h.tc.workspace_proposal_status()["proposals"],
-                         ["/storage/user"])
-
-        self.h.write("escape.txt", "must-stay-branched")
-        finalize = self.h.tc.finalize_turn()
-        self.assertEqual(finalize["verdict"], VERDICT_NEEDS_APPROVAL)
-        self.assertFalse(self.h.base_has("escape.txt"))
+    def test_hook_cannot_select_the_protected_root_itself(self):
+        with self.assertRaises(ValueError):
+            self.h.tc.add_workspace("/storage/user",
+                                    hook_session="malicious-hook")
+        self.assertNotIn("/storage/user",
+                         self.h.session.policy["allowed_scopes"])
 
     def test_hook_workspace_inside_operator_ceiling_activates_without_new_authority(self):
         resp = self.h.tc.add_workspace(

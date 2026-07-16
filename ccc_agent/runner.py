@@ -40,6 +40,7 @@ from .previous_commits import split_previously_committed_changes
 from .session import (ProtectedRoot, Session, is_remote_bridge,
                       remote_bridge_agent_kind)
 from .turn import TurnController
+from .workspace import WorkspaceAdmissionPolicy
 
 ENV_SESSION = "CCC_AGENT_SESSION"
 ENV_STATE_DIR = "CCC_AGENT_STATE_DIR"
@@ -861,6 +862,16 @@ def _mcp_client_hardening(config):
                  else os.getuid())
     _expected, supported = _mcp_admission_config(config)
     return path if supported and _secure_hardening_library(path, agent_uid) else None
+
+
+def _workspace_admission_policy(session, config):
+    """Build the one admission policy used by trusted runtime root updates."""
+    return WorkspaceAdmissionPolicy(
+        session.protected_roots, config.alias_map,
+        workspace_admission_roots=getattr(
+            config, "workspace_admission_roots", None),
+        allow_protected_root_workspace=getattr(
+            config, "allow_protected_root_workspace", False))
 
 
 def _add_runtime_state_ignores(session, config, ignore, relpaths):
@@ -1905,8 +1916,10 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
             hook_token = binascii.hexlify(os.urandom(16)).decode("ascii")
             host_sock = config.store.control_socket(session.session_id)
-            turn_ctl = TurnController(session, config.store, config.backend,
-                                      config.alias_map)
+            turn_ctl = TurnController(
+                session, config.store, config.backend, config.alias_map,
+                workspace_admission_policy=_workspace_admission_policy(
+                    session, config))
             turn_ctl.reset_agent_workspaces()
             expected_clients, _mcp_supported = _mcp_admission_config(config)
             control_server = ControlServer(
@@ -2061,8 +2074,10 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             token = binascii.hexlify(os.urandom(16)).decode("ascii")
             hook_token = binascii.hexlify(os.urandom(16)).decode("ascii")
             host_sock = config.store.control_socket(session.session_id)
-            turn_ctl = TurnController(session, config.store, config.backend,
-                                      config.alias_map)
+            turn_ctl = TurnController(
+                session, config.store, config.backend, config.alias_map,
+                workspace_admission_policy=_workspace_admission_policy(
+                    session, config))
             turn_ctl.reset_agent_workspaces()
             expected_clients, _mcp_supported = _mcp_admission_config(config)
             control_server = ControlServer(
