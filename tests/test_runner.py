@@ -19,6 +19,7 @@ from unittest import mock
 
 from ccc_agent import runner as runner_mod
 from ccc_agent import setup as setup_mod
+runner_module = runner_mod
 from ccc_agent.branchfs import FakeBranchFS, StatusReport, StatusWarning
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import (BWRAP_AGENT_RUNNER, BWRAP_AGENT_RUNNER_ARG0,
@@ -749,7 +750,8 @@ os.execvpe(command[0], command, env)
 
         config = self._bwrap_config(
             [launcher, "app-server"], agent_kind="codex-remote",
-            server_mode=True, per_turn=True, session_delta_routing=True)
+            server_mode=True, per_turn=True, session_delta_routing=True,
+            bwrap_proc_mode="fresh")
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
             session = run_session(config)
 
@@ -798,7 +800,7 @@ os.execvpe(command[0], command, env)
         config = self._bwrap_config(
             ["bash", "-c", "codex app-server"],
             agent_kind="codex-remote", server_mode=True, per_turn=True,
-            session_delta_routing=True)
+            session_delta_routing=True, bwrap_proc_mode="fresh")
         with mock.patch.object(subprocess, "run", side_effect=fake_run):
             session = run_session(config, env={
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -813,6 +815,42 @@ os.execvpe(command[0], command, env)
                        os.path.join(os.path.dirname(runner_mod.__file__),
                                     "assets", "scripts", "ccc-bwrap-route"),
                        os.path.realpath(vendor_bwrap)), triples)
+
+    def test_bound_proc_keeps_route_unavailable_and_uses_outer_adapter(self):
+        runtime_bin = os.path.join(self._tmp.name, "bound-route-runtime")
+        os.makedirs(runtime_bin)
+        codex = os.path.join(runtime_bin, "codex")
+        bwrap = os.path.join(runtime_bin, "bwrap")
+        for path in (codex, bwrap):
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = self._bwrap_config(
+            [codex, "app-server"], agent_kind="codex", per_turn=True,
+            session_delta_routing=True, bwrap_proc_mode="bind")
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(config, env={
+                "PATH": runtime_bin,
+                "CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin,
+            })
+
+        self.assertFalse(session.policy["route_interposer_available"])
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        adapter = os.path.realpath(os.path.join(
+            os.path.dirname(runner_mod.__file__), "assets", "codex", "bwrap"))
+        self.assertIn(("--ro-bind", adapter, os.path.realpath(bwrap)), triples)
+        route_wrapper = os.path.realpath(os.path.join(
+            os.path.dirname(runner_mod.__file__), "assets", "scripts",
+            "ccc-bwrap-route"))
+        self.assertNotIn(("--ro-bind", route_wrapper,
+                          os.path.realpath(bwrap)), triples)
 
     def test_adaptive_requires_bwrap(self):
         with self.assertRaisesRegex(ValueError, "requires bwrap"):
@@ -1173,6 +1211,114 @@ raise SystemExit(proc.returncode)
                         env={"CCC_AGENT_SHIM_UNDERLYING_PATH": path})
 
         self.assertEqual(seen["env"].get("PATH"), path)
+
+    def test_bwrap_masks_nested_codex_bwrap_targets_with_adapter(self):
+        seen = {}
+        first_bin = os.path.join(self.h.tmp, "codex-bin")
+        second_bin = os.path.join(self.h.tmp, "system-bin")
+        os.makedirs(first_bin)
+        os.makedirs(second_bin)
+        targets = [os.path.join(first_bin, "bwrap"),
+                   os.path.join(second_bin, "bwrap")]
+        for target in targets:
+            with open(target, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        path = os.pathsep.join((first_bin, second_bin))
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["codex"], agent_kind="codex"),
+                        env={"CCC_AGENT_SHIM_UNDERLYING_PATH": path})
+
+        adapter = os.path.realpath(os.path.join(
+            os.path.dirname(runner_module.__file__), "assets", "codex", "bwrap"))
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        for target in targets:
+            self.assertIn(("--ro-bind", adapter, os.path.realpath(target)),
+                          triples)
+        self.assertIn(("--ro-bind", adapter,
+                       "/tmp/ccc-agent/codex-external-sandbox"), triples)
+
+    def test_bwrap_keeps_native_codex_sandbox_with_fresh_proc(self):
+        seen = {}
+        runtime_bin = os.path.join(self.h.tmp, "fresh-proc-bin")
+        os.makedirs(runtime_bin)
+        target = os.path.join(runtime_bin, "bwrap")
+        with open(target, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(
+                ["codex"], agent_kind="codex", bwrap_proc_mode="fresh"),
+                env={"CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin})
+
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        self.assertFalse(any(
+            triple[0] == "--ro-bind" and
+            triple[2] == os.path.realpath(target)
+            for triple in triples))
+
+    def test_bwrap_masks_nested_bwrap_for_remote_codex_label(self):
+        seen = {}
+        runtime_bin = os.path.join(self.h.tmp, "remote-codex-bin")
+        os.makedirs(runtime_bin)
+        target = os.path.join(runtime_bin, "bwrap")
+        with open(target, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(
+                ["bash", "-c", "codex app-server"],
+                agent_kind="codex-remote", server_mode=True, per_turn=False),
+                env={"CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin})
+
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        self.assertTrue(any(
+            triple[0] == "--ro-bind" and
+            triple[1].endswith(os.path.join("assets", "codex", "bwrap")) and
+            triple[2] == os.path.realpath(target)
+            for triple in triples))
+
+    def test_bwrap_does_not_mask_bwrap_for_generic_agent(self):
+        seen = {}
+        runtime_bin = os.path.join(self.h.tmp, "generic-bin")
+        os.makedirs(runtime_bin)
+        target = os.path.join(runtime_bin, "bwrap")
+        with open(target, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["my-agent"]),
+                        env={"CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin})
+
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        self.assertFalse(any(
+            triple[0] == "--ro-bind" and
+            triple[2] == os.path.realpath(target)
+            for triple in triples))
 
     def test_bwrap_preserves_invoking_login_shell(self):
         seen = {}

@@ -1,6 +1,7 @@
 """Tests for the shell scaffolding: launch shim and hook adapters. All run
 unprivileged (syntax and behavior checks only)."""
 
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -16,6 +17,7 @@ ASSETS = os.path.join(AGENT_DIR, "ccc_agent", "assets")
 PLUGINS = os.path.join(ASSETS, "plugins")
 SHIM_SH = os.path.join(ASSETS, "shims", "ccc-agent-shim.sh")
 SSH_ROUTER_SH = os.path.join(ASSETS, "shims", "ccc-agent-ssh-shell-router.sh")
+CODEX_BWRAP_ADAPTER = os.path.join(ASSETS, "codex", "bwrap")
 SOFTSANDBOX_SH = os.path.join(ASSETS, "scripts", "softsandbox.sh")
 HOOKS = [os.path.join(ASSETS, "hooks", name)
          for name in ("claude-stop-hook.sh", "codex-stop-hook.sh",
@@ -45,6 +47,99 @@ class TestShellSyntax(unittest.TestCase):
                                   stderr=subprocess.PIPE, text=True)
             self.assertEqual(proc.returncode, 0,
                              "%s: %s" % (script, proc.stderr))
+
+
+class TestCodexBwrapAdapter(unittest.TestCase):
+    def test_adapter_is_packaged_and_executable(self):
+        self.assertTrue(os.path.isfile(CODEX_BWRAP_ADAPTER))
+        self.assertTrue(os.access(CODEX_BWRAP_ADAPTER, os.X_OK))
+
+    def test_adapter_advertises_codex_required_bwrap_capabilities(self):
+        proc = subprocess.run([CODEX_BWRAP_ADAPTER, "--help"],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--perms", proc.stdout)
+        self.assertIn("--argv0", proc.stdout)
+
+    def test_adapter_refuses_execution_outside_ccc_agent(self):
+        env = dict(os.environ)
+        env.pop("CCC_AGENT_SESSION", None)
+        proc = subprocess.run(
+            [CODEX_BWRAP_ADAPTER, "--", "/bin/true"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("outside a CCC-agent session", proc.stderr)
+
+    def test_adapter_handles_codex_no_separator_userns_probe(self):
+        env = dict(os.environ)
+        env["CCC_AGENT_SESSION"] = "agent-test"
+        proc = subprocess.run([
+            CODEX_BWRAP_ADAPTER,
+            "--unshare-user", "--ro-bind", "/", "/", "/bin/true",
+        ], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_adapter_rejects_other_no_separator_commands(self):
+        env = dict(os.environ)
+        env["CCC_AGENT_SESSION"] = "agent-test"
+        proc = subprocess.run([
+            CODEX_BWRAP_ADAPTER,
+            "--unshare-user", "--ro-bind", "/", "/", "/bin/echo",
+        ], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5)
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("missing command separator", proc.stderr)
+
+    def test_adapter_relaxes_seccomp_only_for_namespaced_inner_stage(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "ccc_agent_codex_bwrap_adapter_test", CODEX_BWRAP_ADAPTER)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            self.fail("could not load Codex bwrap adapter")
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+
+        profile = {"type": "managed", "network": "restricted"}
+        payload = {
+            "command": [
+                "/path/to/codex",
+                "--permission-profile", json.dumps(profile),
+                "--apply-seccomp-then-exec", "--", "/bin/true",
+            ],
+            "argv0": "codex-linux-sandbox",
+        }
+        module.allow_unix_sockets_in_isolated_network(payload)
+        profile_index = payload["command"].index("--permission-profile") + 1
+        updated = json.loads(payload["command"][profile_index])
+        self.assertEqual(updated["network"], "enabled")
+
+        preflight = {"command": ["/bin/true"], "argv0": None}
+        module.allow_unix_sockets_in_isolated_network(preflight)
+        self.assertEqual(preflight["command"], ["/bin/true"])
+
+    def test_adapter_preserves_cwd_environment_and_argv0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env.update({"CCC_AGENT_SESSION": "agent-test", "DROP_ME": "old"})
+            command = (
+                "printf '%s|%s|%s|%s' \"$0\" \"$PWD\" "
+                "\"${KEEP_ME:-missing}\" \"${DROP_ME-unset}\""
+            )
+            proc = subprocess.run([
+                CODEX_BWRAP_ADAPTER,
+                "--chdir", tmp,
+                "--unsetenv", "DROP_ME",
+                "--setenv", "KEEP_ME", "kept",
+                "--argv0", "codex-inner",
+                "--", "/bin/sh", "-c", command,
+            ], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=5)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout,
+                         "codex-inner|%s|kept|unset" % tmp)
 
 
 class TestPluginAssets(unittest.TestCase):
