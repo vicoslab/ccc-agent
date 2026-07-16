@@ -61,6 +61,7 @@ ENV_CONFIRM_LAUNCH_WORKSPACE = "CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE"
 ENV_CLIENT_PRELOAD = "CCC_AGENT_CLIENT_PRELOAD"
 ENV_ROUTE_VENDOR = "CCC_AGENT_ROUTE_VENDOR"
 ENV_REAL_BWRAP = "CCC_AGENT_REAL_BWRAP"
+ENV_BWRAP_BOUND_PROC = "CCC_AGENT_BWRAP_BOUND_PROC"
 
 # Values from an enclosing/stale ccc-agent session must never become authority in
 # a new session.  Remove them before assigning this launch's fresh identity and
@@ -73,7 +74,7 @@ TRANSIENT_INTERNAL_ENV = (
     ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
     ENV_HARDEN_CLIENT, ENV_MCP_REGISTER_CLIENT,
     ENV_CONFIRM_LAUNCH_WORKSPACE, ENV_CLIENT_PRELOAD,
-    ENV_ROUTE_VENDOR, ENV_REAL_BWRAP,
+    ENV_ROUTE_VENDOR, ENV_REAL_BWRAP, ENV_BWRAP_BOUND_PROC,
 )
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -1191,14 +1192,59 @@ def _vendor_bwrap_paths(config, env=None):
             "codex" not in config.session_delta_routing_vendors):
         return []
     candidates = []
+    seen_launchers = set()
+
+    def add_candidate(path):
+        if path:
+            candidates.append(path)
+
+    def add_launcher_chain(path):
+        if not path:
+            return
+        current = os.path.abspath(path)
+        visited = set()
+        while current not in visited:
+            if current in seen_launchers:
+                return
+            visited.add(current)
+            seen_launchers.add(current)
+            add_candidate(os.path.join(os.path.dirname(current), "bwrap"))
+            if not os.path.islink(current):
+                break
+            target = os.readlink(current)
+            if not os.path.isabs(target):
+                target = os.path.join(os.path.dirname(current), target)
+            current = os.path.normpath(target)
+        try:
+            if os.path.getsize(current) > 16384:
+                return
+            with open(current, errors="replace") as fh:
+                text = fh.read()
+        except (OSError, UnicodeError):
+            return
+        if not text.startswith("#!"):
+            return
+        match = _SIMPLE_EXEC_RE.search(text)
+        if match:
+            target = next((value for value in match.groups() if value), None)
+            if target and os.path.isabs(target):
+                add_launcher_chain(target)
+
+    path = (source_env.get(ENV_SHIM_UNDERLYING_PATH) or
+            source_env.get("PATH") or BWRAP_DEFAULT_PATH)
+    for directory in path.split(os.pathsep):
+        directory = directory or os.getcwd()
+        add_candidate(os.path.join(directory, "bwrap"))
+        codex = os.path.join(directory, "codex")
+        if os.path.exists(codex) and os.access(codex, os.X_OK):
+            add_launcher_chain(codex)
+
     launcher = _resolved_vendor_launcher(config, env=source_env)
-    if launcher:
-        candidates.append(os.path.join(os.path.dirname(launcher), "bwrap"))
-    path_bwrap = shutil.which(
-        "bwrap", path=(source_env.get(ENV_SHIM_UNDERLYING_PATH) or
-                       source_env.get("PATH") or BWRAP_DEFAULT_PATH))
-    if path_bwrap:
-        candidates.append(path_bwrap)
+    add_launcher_chain(launcher)
+    add_launcher_chain(os.path.join(
+        "/home", config.owner, ".local", "bin", "codex"))
+    add_launcher_chain(source_env.get("CCC_AGENT_REAL_CMD"))
+
     result = []
     for candidate in candidates:
         candidate = os.path.realpath(candidate)
@@ -1401,6 +1447,8 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
             argv += ["--ro-bind", wrapper, candidate]
         argv += ["--setenv", ENV_ROUTE_VENDOR, "codex",
                  "--setenv", ENV_REAL_BWRAP, real_bwrap]
+        if config.bwrap_proc_mode != "fresh":
+            argv += ["--setenv", ENV_BWRAP_BOUND_PROC, "1"]
 
     _expected_mcp, direct_mcp_client = _mcp_admission_config(config)
     if direct_mcp_client:

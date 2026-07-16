@@ -774,6 +774,46 @@ os.execvpe(command[0], command, env)
         self.assertFalse(os.path.exists(os.path.dirname(
             session.policy["sandbox_route_root"])))
 
+    def test_remote_codex_routing_follows_launcher_wrapper_to_runtime_bwrap(self):
+        launcher_bin = os.path.join(self._tmp.name, "remote-launcher")
+        runtime_bin = os.path.join(self._tmp.name, "remote-runtime")
+        os.makedirs(launcher_bin)
+        os.makedirs(runtime_bin)
+        real_codex = os.path.join(runtime_bin, "codex")
+        vendor_bwrap = os.path.join(runtime_bin, "bwrap")
+        launcher = os.path.join(launcher_bin, "codex")
+        for path in (real_codex, vendor_bwrap):
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+        with open(launcher, "w") as fh:
+            fh.write('#!/bin/sh\nexec "%s" "$@"\n' % real_codex)
+        os.chmod(launcher, 0o755)
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = self._bwrap_config(
+            ["bash", "-c", "codex app-server"],
+            agent_kind="codex-remote", server_mode=True, per_turn=True,
+            session_delta_routing=True)
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(config, env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "CCC_AGENT_SHIM_UNDERLYING_PATH": launcher_bin,
+            })
+
+        self.assertIn(os.path.realpath(vendor_bwrap),
+                      session.policy["route_interposer_bwrap_paths"])
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        self.assertIn(("--ro-bind",
+                       os.path.join(os.path.dirname(runner_mod.__file__),
+                                    "assets", "scripts", "ccc-bwrap-route"),
+                       os.path.realpath(vendor_bwrap)), triples)
+
     def test_adaptive_requires_bwrap(self):
         with self.assertRaisesRegex(ValueError, "requires bwrap"):
             self.h.config(["true"], lifecycle="adaptive")

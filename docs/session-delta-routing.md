@@ -95,9 +95,13 @@ When routing is enabled, the outer launcher:
 The adapter recognizes only documented logical-session environment hints (for
 Codex, `CODEX_THREAD_ID`), sends a bounded read-only lookup, validates the
 response shape and route-source prefix, appends route binds last before the
-bwrap command separator, and `exec`s the real bwrap. Missing hints, unknown
-routes, probes, malformed argv, lookup timeouts, and protocol errors delegate
-to the real bwrap unchanged.
+bwrap command separator, and `exec`s the real bwrap. When the outer sandbox must
+bind an existing procfs, the adapter removes only nested `--unshare-pid` and
+`/proc` remount options to avoid a parent-namespace procfs/PID mismatch; mount,
+user, IPC, UTS, cgroup, seccomp, and network sandbox options remain intact. A
+fresh outer procfs needs no rewrite. Missing hints, unknown routes, probes,
+malformed argv, lookup timeouts, and protocol errors delegate to the real bwrap
+unchanged.
 
 Route lookup is tokenless but not anonymous: `SO_PEERCRED`, exact registered
 client PID/start-time, ancestry, launch boundary, vendor match, and the expected

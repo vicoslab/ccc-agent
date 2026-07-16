@@ -70,6 +70,25 @@ class TestBwrapRouteArgv(unittest.TestCase):
             self.assertFalse(applied)
             self.assertEqual(routed, list(argv))
 
+    def test_bound_proc_rewrite_preserves_mount_user_and_network_sandbox(self):
+        argv = [
+            "--unshare-user", "--unshare-pid", "--unshare-net",
+            "--ro-bind", "/", "/", "--proc", "/proc",
+            "--chdir", "/storage/user/Projects/a", "--", "/bin/true",
+        ]
+        rewritten, changed = bwrap_route.adapt_bound_proc(argv)
+        self.assertTrue(changed)
+        self.assertNotIn("--unshare-pid", rewritten)
+        self.assertNotIn("--proc", rewritten)
+        self.assertIn("--unshare-user", rewritten)
+        self.assertIn("--unshare-net", rewritten)
+        self.assertIn("--ro-bind", rewritten)
+        self.assertEqual(rewritten[-2:], ["--", "/bin/true"])
+
+    def test_bound_proc_unknown_aggregate_delegates_unchanged(self):
+        argv = ["--unshare-all", "--", "/bin/true"]
+        self.assertEqual(bwrap_route.adapt_bound_proc(argv), (argv, False))
+
 
 class TestRouteSocketClient(unittest.TestCase):
     def setUp(self):
@@ -126,6 +145,19 @@ class TestRouteSocketClient(unittest.TestCase):
 
 
 class TestWrapperMain(unittest.TestCase):
+    def test_bound_proc_mode_rewrites_only_pid_and_proc_options(self):
+        with mock.patch.object(bwrap_route.os, "execv", side_effect=SystemExit) as execv:
+            with self.assertRaises(SystemExit):
+                bwrap_route.main([
+                    "--unshare-user", "--unshare-pid", "--proc", "/proc",
+                    "--", "/bin/true",
+                ], environ={"CCC_AGENT_BWRAP_BOUND_PROC": "1"},
+                    real_bwrap="/run/ccc-agent/real-bwrap")
+        called = execv.call_args.args[1]
+        self.assertNotIn("--unshare-pid", called)
+        self.assertNotIn("--proc", called)
+        self.assertIn("--unshare-user", called)
+
     def test_missing_hint_execs_real_bwrap_unchanged(self):
         with mock.patch.object(bwrap_route.os, "execv", side_effect=SystemExit) as execv:
             with self.assertRaises(SystemExit):
