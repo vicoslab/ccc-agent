@@ -1172,6 +1172,26 @@ class TestSshShellRouter(unittest.TestCase):
         )
         self.assert_routed(command, "codex")
 
+    def test_routes_codex_desktop_app_server_bootstrap_as_adaptive(self):
+        command = (
+            "sh -c 'CODEX_REMOTE_PAYLOAD=\"$1\"; export CODEX_REMOTE_PAYLOAD; "
+            "exec \"$SHELL\" -l -i -c '\"'\"'exec /bin/sh -c \"$CODEX_REMOTE_PAYLOAD\"'\"'\"'' "
+            "sh 'printf '\"'\"'%b'\"'\"' '\"'\"'\\001\\002\\003\\004\\005\\006\\007\\010'\"'\"'; "
+            "PATH=\"${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH\"; export PATH; "
+            "umask 077; mkdir -p -- \"${CODEX_HOME:-$HOME/.codex}/app-server-control\" && "
+            "nohup codex -c features.code_mode_host=true app-server --listen unix:// "
+            ">\"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server.log\" 2>&1 &'"
+        )
+        self.assert_routed(command, "codex")
+
+    def test_codex_global_config_preserves_direct_exec_classification(self):
+        self.assert_routed(
+            "codex -c model_reasoning_effort=high exec task",
+            "codex", lifecycle="foreground")
+        self.assert_routed(
+            "codex --config=model_reasoning_effort=high exec task",
+            "codex", lifecycle="foreground")
+
     def test_does_not_route_mentions_that_are_not_executables(self):
         for command in (
                 "grep claude ~/.claude/remote/run/log",
