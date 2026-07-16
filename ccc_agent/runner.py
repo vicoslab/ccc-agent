@@ -62,6 +62,8 @@ TRANSIENT_INTERNAL_ENV = (
     ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
 )
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CODEX_BWRAP_ADAPTER = os.path.join(os.path.dirname(__file__), "assets",
+                                   "codex", "bwrap")
 
 # Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox.
 # The host-side socket lives under the state dir, outside the sandbox.  Keep the
@@ -72,6 +74,7 @@ SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 SANDBOX_LIFECYCLE_SOCK = "/tmp/ccc-agent/lifecycle.sock"
 SANDBOX_ADAPTIVE_RUNNER = "/tmp/ccc-agent/adaptive_pid1.py"
 SANDBOX_SESSION_ENV = "/tmp/ccc-agent/session-env.json"
+SANDBOX_CODEX_BWRAP_MARKER = "/tmp/ccc-agent/codex-external-sandbox"
 
 # Run the sandbox command under a tiny PID-1 lifecycle wrapper.  Without this,
 # bubblewrap's default PID-1 reaper keeps the namespace alive until every helper
@@ -637,7 +640,7 @@ def _canonical_protected_path(path, session, config):
 def _is_agent_kind(config, name):
     """Best-effort detection of a contained invocation for one agent kind."""
     token = name.lower()
-    if _agent_token(config.agent_kind) == token:
+    if _plugin_token_for_agent_kind(config.agent_kind) == token:
         return True
     return token in _inferred_agent_plugin_names(config)
 
@@ -650,6 +653,44 @@ def _is_claude_agent(config):
 def _is_codex_agent(config):
     """Best-effort detection of a contained Codex invocation."""
     return _is_agent_kind(config, "codex")
+
+
+def _codex_bwrap_adapter_binds(config, process_env):
+    """Return contained-only bwrap masks for Codex's nested Linux sandbox.
+
+    With ``bwrap_proc_mode=bind`` (or ``ro``), CCC unshares the outer PID
+    namespace but exposes a procfs mounted for the parent container namespace.
+    Nested bubblewrap then looks up its namespace PID in the wrong procfs and
+    can block forever. A fresh procfs does not have that mismatch and keeps
+    Codex's native nested sandbox unchanged.
+
+    Codex may prefer a Conda/runtime-local bwrap over /usr/bin/bwrap, so mask
+    every executable candidate in its actual launch PATH. Resolve symlinks to
+    bind over the path Codex ultimately opens inside the BranchFS view.
+    """
+    if not _is_codex_agent(config) or config.bwrap_proc_mode == "fresh":
+        return []
+
+    adapter = os.path.realpath(CODEX_BWRAP_ADAPTER)
+    if not os.path.isfile(adapter) or not os.access(adapter, os.X_OK):
+        raise RuntimeError("Codex bwrap adapter is missing or not executable: %s"
+                           % adapter)
+
+    path = (process_env or {}).get("PATH") or BWRAP_DEFAULT_PATH
+    binds = []
+    seen = set()
+    for directory in path.split(os.pathsep):
+        if not directory:
+            directory = os.getcwd()
+        candidate = os.path.join(directory, "bwrap")
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        target = os.path.realpath(candidate)
+        if target == adapter or target in seen:
+            continue
+        seen.add(target)
+        binds.append((adapter, target))
+    return binds
 
 
 def _add_runtime_state_ignores(session, config, ignore, relpaths):
@@ -869,7 +910,7 @@ def _bwrap_gid(config):
 
 
 def _bwrap_command(session, config, control=None, lifecycle_socket=None,
-                   session_env_path=None):
+                   session_env_path=None, process_env=None):
     """Build a bubblewrap command that confines the agent rootlessly.
 
     This needs no container CAP_SYS_ADMIN and no privileged helper: bwrap
@@ -978,6 +1019,20 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
         if bind is not None:
             src, dest = bind
             argv += ["--ro-bind", src, dest]
+
+    # Codex's own Linux sandbox uses nested bubblewrap. When CCC must bind an
+    # older procfs into its PID namespace, replace only Codex-visible bwrap
+    # candidates with the trusted external-sandbox adapter. The outer CCC
+    # bwrap executable has already launched and is unaffected by these binds.
+    codex_bwrap_binds = _codex_bwrap_adapter_binds(config, process_env)
+    for src, dest in codex_bwrap_binds:
+        argv += ["--ro-bind", src, dest]
+    if codex_bwrap_binds:
+        # Codex strips CCC_AGENT_SESSION from its dedicated filesystem helper.
+        # Bind the same trusted adapter inode at a stable marker path so that
+        # helper can still prove it is inside the launcher-owned namespace.
+        argv += ["--ro-bind", codex_bwrap_binds[0][0],
+                 SANDBOX_CODEX_BWRAP_MARKER]
 
     # Optional read-only credential overlays.  Do not use this for whole
     # ~/.codex/~/.claude/~/.hermes trees in normal deployments; direct
@@ -1698,7 +1753,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         argv = _bwrap_command(
             session, config, control=control,
             lifecycle_socket=lifecycle_path,
-            session_env_path=session_env_path)
+            session_env_path=session_env_path, process_env=bwrap_env)
         session.add_event("bwrap-launch", argv[0])
         config.store.save(session)
         proc = subprocess.Popen(argv, env=bwrap_env, stdin=subprocess.PIPE,
@@ -1854,7 +1909,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             bwrap_env = _bwrap_process_env(run_env, config, session)
             argv = _bwrap_command(
                 session, config, control=control,
-                session_env_path=session_env_path)
+                session_env_path=session_env_path, process_env=bwrap_env)
             session.add_event("bwrap-launch", argv[0])
             session.add_event("container-run-access",
                               "enabled" if config.container_run_access

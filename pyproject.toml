@@ -32,6 +32,7 @@ version = { attr = "ccc_agent.__version__" }
 [tool.setuptools.package-data]
 "ccc_agent" = [
     "assets/hooks/*.sh",
+    "assets/codex/bwrap",
     "assets/shims/*.sh",
     "assets/scripts/*.sh",
     "assets/completions/bash/ccc-agent",
