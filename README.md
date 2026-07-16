@@ -199,6 +199,7 @@ Start with [docs/README.md](docs/README.md):
 - [Design decisions](docs/design-decisions.md)
 - [Dependencies](docs/dependencies.md)
 - [Development](docs/development.md)
+- [User-facing acceptance testing](docs/user-facing-acceptance-testing.md)
 
 ## Important limits
 

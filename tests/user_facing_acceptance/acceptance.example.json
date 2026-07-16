@@ -1,0 +1,109 @@
+{
+  "ccc_agent": "/usr/local/bin/ccc-agent",
+  "ccc_agent_config": "/etc/ccc-agent/config.json",
+  "test_root": "/storage/user/ccc-agent-acceptance",
+  "artifacts_dir": "/var/tmp/ccc-agent-acceptance-results",
+  "timeout_seconds": 1200,
+  "poll_seconds": 0.5,
+  "agents": {
+    "codex": {
+      "transports": {
+        "local-cli": {
+          "driver": "tmux",
+          "command": [
+            "{ccc_agent}", "run", "--config", "{ccc_agent_config}",
+            "--workspace", "{workspace}", "--agent", "codex", "--",
+            "codex", "--dangerously-bypass-approvals-and-sandbox"
+          ],
+          "expected_agent_kind": "codex",
+          "final_review_action": "abort",
+          "startup_seconds": 8,
+          "exit_text": "/exit"
+        },
+        "ssh-cli": {
+          "driver": "tmux",
+          "command": [
+            "ssh", "-tt", "REPLACE_WITH_SSH_TARGET",
+            "cd {workspace_shell} && codex --dangerously-bypass-approvals-and-sandbox"
+          ],
+          "expected_agent_kind": "codex-remote",
+          "startup_seconds": 10,
+          "exit_text": "/exit"
+        },
+        "remote-server": {
+          "driver": "external",
+          "command": [
+            "REPLACE_WITH_CODEX_DESKTOP_PROTOCOL_DRIVER", "{scenario_file}"
+          ],
+          "expected_agent_kind": "codex-remote"
+        }
+      }
+    },
+    "claude": {
+      "transports": {
+        "local-cli": {
+          "driver": "tmux",
+          "command": [
+            "{ccc_agent}", "run", "--config", "{ccc_agent_config}",
+            "--workspace", "{workspace}", "--agent", "claude", "--",
+            "claude", "--dangerously-skip-permissions"
+          ],
+          "expected_agent_kind": "claude",
+          "final_review_action": "abort",
+          "startup_seconds": 8,
+          "exit_text": "/exit"
+        },
+        "ssh-cli": {
+          "driver": "tmux",
+          "command": [
+            "ssh", "-tt", "REPLACE_WITH_SSH_TARGET",
+            "cd {workspace_shell} && claude --dangerously-skip-permissions"
+          ],
+          "expected_agent_kind": "claude-remote",
+          "startup_seconds": 10,
+          "exit_text": "/exit"
+        },
+        "remote-server": {
+          "driver": "external",
+          "command": [
+            "REPLACE_WITH_CLAUDE_DESKTOP_REMOTE_DRIVER", "{scenario_file}"
+          ],
+          "expected_agent_kind": "claude-remote"
+        }
+      }
+    },
+    "hermes": {
+      "transports": {
+        "local-cli": {
+          "driver": "tmux",
+          "command": [
+            "{ccc_agent}", "run", "--config", "{ccc_agent_config}",
+            "--workspace", "{workspace}", "--agent", "hermes", "--",
+            "hermes", "--yolo"
+          ],
+          "expected_agent_kind": "hermes",
+          "final_review_action": "abort",
+          "startup_seconds": 8,
+          "exit_text": "/exit"
+        },
+        "ssh-cli": {
+          "driver": "tmux",
+          "command": [
+            "ssh", "-tt", "REPLACE_WITH_SSH_TARGET",
+            "cd {workspace_shell} && hermes --yolo"
+          ],
+          "expected_agent_kind": "hermes-remote",
+          "startup_seconds": 10,
+          "exit_text": "/exit"
+        },
+        "remote-server": {
+          "driver": "external",
+          "command": [
+            "REPLACE_WITH_HERMES_GATEWAY_API_DRIVER", "{scenario_file}"
+          ],
+          "expected_agent_kind": "hermes-remote"
+        }
+      }
+    }
+  }
+}
