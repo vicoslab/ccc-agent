@@ -1479,6 +1479,24 @@ time.sleep(0.18)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertEqual(self._wrapped_agent_command(argv), command)
 
+    def test_bwrap_mounts_codex_plugin_for_remote_serve_shell(self):
+        src = self._make_plugin("codex-ccc-containment")
+        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
+        plugins = {"codex": {"src": src, "sandbox_path": sandbox,
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"]}}
+        command = ["/bin/bash", "-c", "codex app-server"]
+
+        for agent_kind in ("codex-remote", "codex-remote-bridge"):
+            with self.subTest(agent_kind=agent_kind):
+                argv = self._capture_argv(command, agent_kind, plugins)
+                triples = [(argv[k], argv[k + 1], argv[k + 2])
+                           for k in range(len(argv) - 2)]
+
+                self.assertIn(("--ro-bind", src, sandbox), triples)
+                self.assertNotIn(
+                    "--dangerously-bypass-approvals-and-sandbox", argv)
+                self.assertEqual(self._wrapped_agent_command(argv), command)
+
     def test_bwrap_shared_agent_state_dirs_are_rw_binds_by_default(self):
         paths, binds = self._agent_state_binds()
         src = self._make_plugin("codex-ccc-containment")

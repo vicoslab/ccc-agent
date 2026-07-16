@@ -444,6 +444,15 @@ def _plugin_key_for_token(config, token):
     return None
 
 
+def _plugin_token_for_agent_kind(value):
+    """Map durable remote session labels back to their configured agent key."""
+    token = _agent_token(value)
+    for suffix in ("-remote-bridge", "-remote"):
+        if token.endswith(suffix) and len(token) > len(suffix):
+            return token[:-len(suffix)]
+    return token
+
+
 def _inferred_agent_plugin_names(config):
     """Agent plugin candidates inferred from the executable path only."""
     names = set()
@@ -501,7 +510,7 @@ def _matched_agent_plugin(config):
             return None  # missing trusted asset: degrade to session-end review
         return spec
 
-    explicit_kind = _agent_token(config.agent_kind)
+    explicit_kind = _plugin_token_for_agent_kind(config.agent_kind)
     if explicit_kind and explicit_kind != "command":
         explicit_agent = _plugin_key_for_token(config, explicit_kind)
         if explicit_agent:
