@@ -61,6 +61,10 @@ annotated example.
 | `bwrap_setenv` | Extra environment variables passed into the clear-env sandbox. |
 | `roots` | Protected BranchFS roots. |
 | `policy` | Default policy applied to runs unless overridden by CLI flags. |
+| `workspace_admission_roots` | Maximum operator-selected domain for trusted dynamic workspace roots. Paths are CCC-canonicalized and must be under protected storage. Defaults to the protected visible roots for compatibility. |
+| `allow_protected_root_workspace` | Permit a dynamic workspace to equal its admission/protected root. Default `false`; ordinary dynamic roots must be strict descendants. |
+| `session_delta_routing` | Enable optional per-logical-session delta routing. Default `false`. The outer BranchFS+bwrap boundary is unchanged. |
+| `session_delta_routing_vendors` | Explicit routing vendor allowlist. Defaults to `["codex"]`; it has no effect while routing is disabled. |
 
 ## Protected roots
 
@@ -78,6 +82,35 @@ Each root describes one BranchFS base/store/view relationship:
 If two visible paths alias the same real data, protect them with one root and
 bind aliases from the same branch. Do not create independent BranchFS roots for
 the same underlying bytes.
+
+## Dynamic workspace admission
+
+Authenticated MCP, Codex, or Hermes workspace metadata is additionally bounded
+by an operator ceiling:
+
+```json
+{
+  "workspace_admission_roots": [
+    "/storage/user/Projects",
+    "/storage/group/approved-projects"
+  ],
+  "allow_protected_root_workspace": false,
+  "session_delta_routing": false,
+  "session_delta_routing_vendors": ["codex"]
+}
+```
+
+Every authoritative dynamic root must be an existing non-symlinked directory,
+must remain under a protected BranchFS root after `/home/$USER` alias
+canonicalization, and must be a strict descendant of an admission root. Selecting
+an admission root or protected root itself requires the explicit broad-root
+switch. Empty trusted replacement sets remain valid and revoke only the relevant
+logical session's dynamic roots.
+
+An explicit `ccc-agent run --workspace` remains an operator launch decision, but
+it is normalized, checked beneath protected storage, and identity-revalidated
+before the branch session is created. Dynamic admission ceilings do not weaken or
+replace the outer BranchFS+bwrap containment boundary.
 
 ## Agent runtime state
 

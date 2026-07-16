@@ -210,6 +210,41 @@ class TestMainRun(unittest.TestCase):
             self.h.base, self.h.workspace_rel, "artifact.txt")))
         self.assertEqual(len(self.h.sessions()), 1)
 
+    def test_run_loads_workspace_admission_and_delta_routing_config(self):
+        with open(self.h.config_path) as fh:
+            data = json.load(fh)
+        data.update({
+            "workspace_admission_roots": ["/storage/user/Projects"],
+            "allow_protected_root_workspace": True,
+            "session_delta_routing": True,
+            "session_delta_routing_vendors": ["codex", "hermes"],
+        })
+        with open(self.h.config_path, "w") as fh:
+            json.dump(data, fh)
+        seen = []
+
+        def fake_run_session(config, env=None, before_finalize=None):
+            seen.append(config)
+            return SimpleNamespace(
+                session_id="agent-config", workspace=config.workspace,
+                protected_roots={}, state="auto-committed", events=[],
+                exit_status=0, agent_kind=config.agent_kind, policy=config.policy)
+
+        with mock.patch("ccc_agent.cli.run_session", side_effect=fake_run_session):
+            code = main_run([
+                "--config", self.h.config_path,
+                "--workspace", "/storage/user/Projects/proj-a",
+                "--", "true",
+            ], env={})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen[0].workspace_admission_roots,
+                         ["/storage/user/Projects"])
+        self.assertTrue(seen[0].allow_protected_root_workspace)
+        self.assertTrue(seen[0].session_delta_routing)
+        self.assertEqual(seen[0].session_delta_routing_vendors,
+                         ("codex", "hermes"))
+
     def test_auto_commit_finish_line_summarizes_no_changes(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

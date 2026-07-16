@@ -342,13 +342,54 @@ class RunnerConfig(object):
                  adaptive_bootstrap_seconds=10.0,
                  adaptive_stability_seconds=0.2,
                  adaptive_detach_seconds=2.0,
-                 mcp_client_hardening_library=None):
+                 mcp_client_hardening_library=None,
+                 workspace_admission_roots=None,
+                 allow_protected_root_workspace=False,
+                 session_delta_routing=False,
+                 session_delta_routing_vendors=("codex",),
+                 require_existing_workspace=True):
         self.store = store              # SessionStore
         self.backend = backend          # BranchfsCli or FakeBranchFS
         self.alias_map = alias_map
         self.owner = owner
         self.agent_kind = agent_kind
         self.agent_command = list(agent_command)
+        self.roots = list(roots)
+        self._operator_workspace_policy = WorkspaceAdmissionPolicy(
+            self.roots, alias_map,
+            workspace_admission_roots=[root.visible for root in self.roots],
+            allow_protected_root_workspace=True)
+        if not isinstance(allow_protected_root_workspace, bool):
+            raise ValueError(
+                "allow_protected_root_workspace must be true or false")
+        self.workspace_admission_policy = WorkspaceAdmissionPolicy(
+            self.roots, alias_map,
+            workspace_admission_roots=workspace_admission_roots,
+            allow_protected_root_workspace=allow_protected_root_workspace)
+        self.workspace_admission_roots = list(
+            self.workspace_admission_policy.workspace_admission_roots)
+        self.allow_protected_root_workspace = allow_protected_root_workspace
+        if not isinstance(session_delta_routing, bool):
+            raise ValueError("session_delta_routing must be true or false")
+        self.session_delta_routing = session_delta_routing
+        if isinstance(session_delta_routing_vendors, str):
+            raise ValueError("session_delta_routing_vendors must be an array")
+        vendors = []
+        for vendor in session_delta_routing_vendors or ():
+            vendor = str(vendor).strip().lower()
+            if vendor not in ("codex", "claude", "hermes"):
+                raise ValueError("unsupported session delta routing vendor %r" %
+                                 vendor)
+            if vendor not in vendors:
+                vendors.append(vendor)
+        self.session_delta_routing_vendors = tuple(vendors)
+        self._launch_workspace_admission = None
+        if workspace:
+            self._launch_workspace_admission = (
+                self._operator_workspace_policy.admit(
+                    workspace,
+                    require_existing=bool(require_existing_workspace)))
+            workspace = self._launch_workspace_admission["visible_path"]
         self.workspace = workspace
         # A server may need to start in the SSH launch directory before an
         # inner agent SessionStart hook identifies its real workspace. Keep
@@ -357,10 +398,13 @@ class RunnerConfig(object):
         if not self.launch_cwd:
             raise ValueError("launch_cwd is required when workspace is unset")
         self.policy = dict(policy)
+        self.policy["workspace_admission_roots"] = list(
+            self.workspace_admission_roots)
+        self.policy["allow_protected_root_workspace"] = (
+            self.allow_protected_root_workspace)
         if "allowed_scopes" not in self.policy:
             self.policy["allowed_scopes"] = ([workspace] if workspace else [])
         PolicyConfig.from_dict(self.policy)  # validate early
-        self.roots = list(roots)
         self.completion = completion
         if confinement not in CONFINEMENT_MODES:
             raise ValueError("unknown confinement %r (expected one of %s)"
@@ -2165,6 +2209,11 @@ def run_session(config, env=None, before_finalize=None):
             config.store.save(session)
             subprocess.call(config.agent_command, env=env)
             return session
+
+    if (config._launch_workspace_admission is not None and
+            config._launch_workspace_admission.get("identity") is not None):
+        config._operator_workspace_policy.revalidate(
+            config._launch_workspace_admission)
 
     session = config.store.create(
         owner=config.owner,

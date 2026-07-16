@@ -71,6 +71,36 @@ class TestRunSession(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_workspace_admission_and_delta_routing_defaults_are_conservative(self):
+        config = self.h.config(["true"])
+
+        self.assertEqual(config.workspace_admission_roots,
+                         ["/storage/user"])
+        self.assertFalse(config.allow_protected_root_workspace)
+        self.assertFalse(config.session_delta_routing)
+        self.assertEqual(config.session_delta_routing_vendors, ("codex",))
+        self.assertEqual(config.policy["workspace_admission_roots"],
+                         ["/storage/user"])
+
+    def test_workspace_admission_configuration_is_validated_and_persisted(self):
+        config = self.h.config(
+            ["true"],
+            workspace_admission_roots=["/home/domen/Projects"],
+            allow_protected_root_workspace=True,
+            session_delta_routing=True,
+            session_delta_routing_vendors=["codex", "hermes", "codex"])
+
+        self.assertEqual(config.workspace_admission_roots,
+                         ["/storage/user/Projects"])
+        self.assertTrue(config.allow_protected_root_workspace)
+        self.assertTrue(config.session_delta_routing)
+        self.assertEqual(config.session_delta_routing_vendors,
+                         ("codex", "hermes"))
+        self.assertTrue(config.policy["allow_protected_root_workspace"])
+
+        with self.assertRaises(ValueError):
+            self.h.config(["true"], workspace_admission_roots=["/tmp"])
+
     def running_session(self, session_id="agent-resume", command=None,
                         mode="workspace-auto"):
         spec = RootSpec(name="storage_user", base=self.h.base,

@@ -1043,6 +1043,13 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
         bwrap_setenv=config.get("bwrap_setenv"),
         bwrap_unsetenv=config.get("bwrap_unsetenv", ()),
         mcp_client_hardening_library=config.get("mcp_client_hardening_library"),
+        workspace_admission_roots=config.get("workspace_admission_roots"),
+        allow_protected_root_workspace=config.get(
+            "allow_protected_root_workspace", False),
+        session_delta_routing=config.get("session_delta_routing", False),
+        session_delta_routing_vendors=config.get(
+            "session_delta_routing_vendors", ("codex",)),
+        require_existing_workspace=bool(args.workspace),
         container_run_access=_container_run_access(config, args.full_isolation),
         cred_mounts=config.get("cred_mounts", ()),
         cred_mask=config.get("cred_mask", ()),
@@ -1289,6 +1296,12 @@ def main_resume(argv=None, env=None, prog="ccc-agent resume"):
         bwrap_setenv=config.get("bwrap_setenv"),
         bwrap_unsetenv=config.get("bwrap_unsetenv", ()),
         mcp_client_hardening_library=config.get("mcp_client_hardening_library"),
+        workspace_admission_roots=config.get("workspace_admission_roots"),
+        allow_protected_root_workspace=config.get(
+            "allow_protected_root_workspace", False),
+        session_delta_routing=config.get("session_delta_routing", False),
+        session_delta_routing_vendors=config.get(
+            "session_delta_routing_vendors", ("codex",)),
         container_run_access=_container_run_access(config, args.full_isolation),
         cred_mounts=config.get("cred_mounts", ()),
         cred_mask=config.get("cred_mask", ()),
