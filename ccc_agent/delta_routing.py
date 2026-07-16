@@ -10,6 +10,7 @@ small, versioned, JSON-serializable models that can be persisted by a supervisor
 without importing a vendor SDK or a non-stdlib serialization package.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -17,32 +18,32 @@ import time
 import uuid
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ROUTE_STATES = (
-    "created",
+    "provisioning",
     "active",
+    "quiescing",
     "frozen",
-    "committing",
-    "committed",
-    "aborting",
+    "merged",
+    "pending-review",
     "aborted",
     "failed",
 )
-TERMINAL_ROUTE_STATES = ("committed", "aborted", "failed")
+TERMINAL_ROUTE_STATES = ("merged", "aborted", "failed")
 
 _ROUTE_TRANSITIONS = {
-    "created": ("active", "aborting", "failed"),
-    "active": ("frozen", "aborting", "failed"),
-    # A frozen route can be explicitly reopened when review asks for more work.
-    "frozen": ("active", "committing", "aborting", "failed"),
-    "committing": ("committed", "failed"),
-    "aborting": ("aborted", "failed"),
-    "committed": (),
+    "provisioning": ("active", "aborted", "failed"),
+    "active": ("quiescing", "failed"),
+    "quiescing": ("active", "frozen", "failed"),
+    "frozen": ("active", "merged", "pending-review", "aborted", "failed"),
+    "pending-review": ("active", "merged", "aborted", "failed"),
+    "merged": (),
     "aborted": (),
     "failed": (),
 }
 
 _OPAQUE_ID_RE = re.compile(r"^route-[0-9a-f]{32}$")
+_SESSION_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class RouteStateError(ValueError):
@@ -75,6 +76,36 @@ def _validate_route_id(route_id):
     if not _OPAQUE_ID_RE.match(route_id):
         raise ValueError("route_id must be an opaque route-<32 lowercase hex> id")
     return route_id
+
+
+def digest_logical_session(vendor_session_id):
+    raw = _required_string(vendor_session_id, "vendor_session_id")
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _validate_session_digest(digest):
+    digest = _required_string(digest, "logical_session_digest")
+    if not _SESSION_DIGEST_RE.match(digest):
+        raise ValueError("logical_session_digest must be sha256:<64 lowercase hex>")
+    return digest
+
+
+def _coverage_record(coverage=None):
+    coverage = dict(coverage or {})
+    normalized = {
+        "routed_bwrap_calls": int(coverage.get("routed_bwrap_calls", 0)),
+        "bypassed_or_unattributed_calls": int(
+            coverage.get("bypassed_or_unattributed_calls", 0)),
+        "last_warning": coverage.get("last_warning"),
+        "capability": str(coverage.get("capability", "unknown")),
+    }
+    if (normalized["routed_bwrap_calls"] < 0 or
+            normalized["bypassed_or_unattributed_calls"] < 0):
+        raise ValueError("route coverage counters cannot be negative")
+    if (normalized["last_warning"] is not None and
+            not isinstance(normalized["last_warning"], str)):
+        raise ValueError("route coverage last_warning must be a string or null")
+    return normalized
 
 
 def _copy_json_records(records, label):
@@ -168,20 +199,20 @@ class NestedRoot(object):
 
 
 class DeltaRoute(object):
-    """Versioned mapping from one vendor session to nested protected roots."""
+    """Versioned mapping from one logical vendor session to nested roots."""
 
-    def __init__(self, route_id, provider, vendor_session_id,
-                 parent_session_id, roots, state="created", created_at=None,
-                 updated_at=None, events=None):
+    def __init__(self, route_id, provider, parent_session_id, roots,
+                 vendor_session_id=None, logical_session_digest=None,
+                 state="provisioning", created_at=None, updated_at=None,
+                 events=None, coverage=None):
         self.route_id = _validate_route_id(route_id)
         self.provider = _required_string(provider, "provider")
-        self.vendor_session_id = _required_string(
-            vendor_session_id, "vendor_session_id")
+        if logical_session_digest is None:
+            logical_session_digest = digest_logical_session(vendor_session_id)
+        self.logical_session_digest = _validate_session_digest(
+            logical_session_digest)
         self.parent_session_id = _required_string(
             parent_session_id, "parent_session_id")
-        if (len(self.vendor_session_id) >= 8 and
-                self.vendor_session_id in self.route_id):
-            raise ValueError("route_id must not contain the raw vendor session id")
         if state not in ROUTE_STATES:
             raise ValueError("unknown route state %r" % (state,))
         if not isinstance(roots, dict):
@@ -202,6 +233,7 @@ class DeltaRoute(object):
         self.created_at = created_at or utc_now()
         self.updated_at = updated_at or self.created_at
         self.events = _copy_json_records(events, "route events")
+        self.coverage = _coverage_record(coverage)
 
     @classmethod
     def create(cls, provider, vendor_session_id, parent_session_id,
@@ -240,12 +272,36 @@ class DeltaRoute(object):
         # Validate/copy detail before retaining it as durable metadata.
         self.events.append(_copy_json_records([event], "route event")[0])
 
+    def record_coverage(self, outcome, warning=None, capability=None):
+        """Record sanitized routing coverage without retaining command data."""
+        if outcome == "routed":
+            self.coverage["routed_bwrap_calls"] += 1
+        elif outcome in ("bypassed", "unattributed"):
+            self.coverage["bypassed_or_unattributed_calls"] += 1
+        else:
+            raise ValueError("unknown routing coverage outcome %r" % outcome)
+        if warning is not None:
+            self.coverage["last_warning"] = _required_string(
+                warning, "routing warning")
+        if capability is not None:
+            self.coverage["capability"] = _required_string(
+                capability, "routing capability")
+        self.updated_at = utc_now()
+
+    def set_capability(self, capability, warning=None):
+        capability = _required_string(capability, "routing capability")
+        self.coverage["capability"] = capability
+        if warning is not None:
+            self.coverage["last_warning"] = _required_string(
+                warning, "routing warning")
+        self.updated_at = utc_now()
+
     def to_dict(self):
         return {
             "schema_version": SCHEMA_VERSION,
             "route_id": self.route_id,
             "provider": self.provider,
-            "vendor_session_id": self.vendor_session_id,
+            "logical_session_digest": self.logical_session_digest,
             "parent_session_id": self.parent_session_id,
             "state": self.state,
             "created_at": self.created_at,
@@ -253,6 +309,7 @@ class DeltaRoute(object):
             "roots": {name: root.to_dict()
                       for name, root in sorted(self.roots.items())},
             "events": _copy_json_records(self.events, "route events"),
+            "coverage": _coverage_record(self.coverage),
         }
 
     @classmethod
@@ -269,7 +326,7 @@ class DeltaRoute(object):
             return cls(
                 route_id=data["route_id"],
                 provider=data["provider"],
-                vendor_session_id=data["vendor_session_id"],
+                logical_session_digest=data["logical_session_digest"],
                 parent_session_id=data["parent_session_id"],
                 roots={name: NestedRoot.from_dict(root)
                        for name, root in roots_data.items()},
@@ -277,6 +334,7 @@ class DeltaRoute(object):
                 created_at=data["created_at"],
                 updated_at=data["updated_at"],
                 events=data.get("events", ()),
+                coverage=data.get("coverage"),
             )
         except KeyError as exc:
             raise ValueError("delta route record is missing %s" % exc.args[0])

@@ -44,7 +44,8 @@ class TestDeltaRoute(unittest.TestCase):
 
         self.assertTrue(route.route_id.startswith("route-"))
         self.assertNotIn(vendor_id, route.route_id)
-        self.assertEqual(route.vendor_session_id, vendor_id)
+        self.assertNotIn(vendor_id, json.dumps(route.to_dict()))
+        self.assertTrue(route.logical_session_digest.startswith("sha256:"))
         nested = route.roots["storage_user"]
         self.assertNotIn(vendor_id, nested.branch)
         self.assertEqual(nested.parent_branch, self.outer.branch)
@@ -83,9 +84,33 @@ class TestDeltaRoute(unittest.TestCase):
         encoded = json.loads(json.dumps(route.to_dict()))
         restored = DeltaRoute.from_dict(encoded)
 
-        self.assertEqual(encoded["schema_version"], 1)
+        self.assertEqual(encoded["schema_version"], 2)
         self.assertEqual(restored.to_dict(), encoded)
         self.assertIsInstance(restored.roots["storage_user"], NestedRoot)
+        self.assertNotIn("vendor_session_id", encoded)
+        self.assertNotIn("session/raw-77", json.dumps(encoded))
+        self.assertTrue(encoded["logical_session_digest"].startswith("sha256:"))
+
+    def test_route_persists_coverage_without_command_or_environment_data(self):
+        route = DeltaRoute.create(
+            provider="codex",
+            vendor_session_id="thread-77",
+            parent_session_id="agent-outer",
+            parent_roots={"storage_user": self.outer},
+            mount_dir=os.path.join(self.tmp.name, "nested-mounts"),
+        )
+
+        route.record_coverage("routed")
+        route.record_coverage("bypassed", warning="full-write-bypass")
+
+        self.assertEqual(route.coverage, {
+            "routed_bwrap_calls": 1,
+            "bypassed_or_unattributed_calls": 1,
+            "last_warning": "full-write-bypass",
+            "capability": "unknown",
+        })
+        self.assertNotIn("command", json.dumps(route.to_dict()))
+        self.assertNotIn("environment", json.dumps(route.to_dict()))
 
     def test_explicit_state_transitions_reject_skips_and_terminal_reopen(self):
         route = DeltaRoute(
@@ -99,30 +124,46 @@ class TestDeltaRoute(unittest.TestCase):
         )
 
         with self.assertRaises(RouteStateError):
-            route.transition("committed")
+            route.transition("merged")
         route.transition("active", at="2026-07-16T10:01:00Z")
-        route.transition("frozen", at="2026-07-16T10:02:00Z")
-        route.transition("committing", at="2026-07-16T10:03:00Z")
-        route.transition("committed", at="2026-07-16T10:04:00Z")
+        route.transition("quiescing", at="2026-07-16T10:02:00Z")
+        route.transition("frozen", at="2026-07-16T10:03:00Z")
+        route.transition("merged", at="2026-07-16T10:04:00Z")
         self.assertEqual(route.updated_at, "2026-07-16T10:04:00Z")
         with self.assertRaises(RouteStateError):
             route.transition("active")
 
+    def test_conflicted_frozen_route_can_be_held_for_review(self):
+        route = DeltaRoute(
+            route_id="route-0123456789abcdef0123456789abcdef",
+            provider="codex",
+            vendor_session_id="raw-id",
+            parent_session_id="agent-outer",
+            roots={},
+        )
+        route.transition("active")
+        route.transition("quiescing")
+        route.transition("frozen")
+        route.transition("pending-review", detail={"conflicts": ["a.txt"]})
+
+        self.assertEqual(route.state, "pending-review")
+        self.assertEqual(route.events[-1]["detail"], {"conflicts": ["a.txt"]})
+
     def test_deserialization_rejects_unknown_schema_or_state(self):
         payload = {
-            "schema_version": 2,
+            "schema_version": 99,
             "route_id": "route-0123456789abcdef0123456789abcdef",
             "provider": "codex",
-            "vendor_session_id": "raw-id",
+            "logical_session_digest": "sha256:" + "0" * 64,
             "parent_session_id": "agent-outer",
-            "state": "created",
+            "state": "provisioning",
             "created_at": "2026-07-16T10:00:00Z",
             "updated_at": "2026-07-16T10:00:00Z",
             "roots": {},
         }
         with self.assertRaises(ValueError):
             DeltaRoute.from_dict(payload)
-        payload["schema_version"] = 1
+        payload["schema_version"] = 2
         payload["state"] = "mystery"
         with self.assertRaises(ValueError):
             DeltaRoute.from_dict(payload)
