@@ -245,6 +245,27 @@ raise SystemExit(proc.returncode)
         command = stop_groups[0]["hooks"][0]["command"]
         self.assertEqual(command, "${PLUGIN_ROOT}/hooks/ccc-stop-hook.sh")
 
+    def test_codex_config_trusts_every_bundled_lifecycle_hook(self):
+        # Captured from Codex 0.143.0 hooks/list for the packaged 0.2.0 plugin.
+        # A hook can be discovered and enabled while still not executable in a
+        # protocol-clean remote session unless its exact definition is trusted.
+        expected = {
+            "ccc@ccc-agent:hooks/hooks.json:session_start:0:0":
+                "sha256:755b1b9d145a87b94a388f7566c56064acd92ad81dc9b221de795d5604e2625a",
+            "ccc@ccc-agent:hooks/hooks.json:subagent_start:0:0":
+                "sha256:110513c459ef92d4852bdf801e6be8c2fae9def56da9496775b408701d08a609",
+            "ccc@ccc-agent:hooks/hooks.json:subagent_stop:0:0":
+                "sha256:bf2126876905c70422c93361befd22ae53bbfa868b653587a10ba146af01554f",
+            "ccc@ccc-agent:hooks/hooks.json:stop:0:0":
+                "sha256:72d22a4a83b82ca16b8a5bcc60f519bc6b75773cc17f103e9acb18a028dc6998",
+        }
+
+        self.assertEqual(dict(setup_mod.CODEX_HOOK_TRUSTED_HASHES), expected)
+        block = setup_mod.codex_plugin_config_block()
+        for key, trusted_hash in expected.items():
+            self.assertIn('hooks.state."%s".trusted_hash = "%s"'
+                          % (key, trusted_hash), block)
+
     def test_system_config_keeps_agent_state_writable_by_default(self):
         cfg = setup_mod.build_config(
             mode="system",

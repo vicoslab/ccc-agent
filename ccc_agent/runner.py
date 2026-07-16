@@ -1506,7 +1506,7 @@ def _bwrap_process_env(run_env, config, session):
     for name in config.bwrap_unsetenv:
         sandbox_env.pop(name, None)
 
-    workdir = normalize(session.workspace)
+    workdir = normalize(config.launch_cwd)
     home = "/home/%s" % config.owner
     sandbox_env.update({
         ENV_SESSION: session.session_id,

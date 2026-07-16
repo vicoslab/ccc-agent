@@ -262,6 +262,12 @@ CODEX_PLUGIN_ID = "%s@%s" % (CODEX_PLUGIN_NAME, CODEX_PLUGIN_MARKETPLACE)
 # bundled codex-ccc-containment hooks so contained runs do not stop for an
 # interactive hook-trust prompt.
 CODEX_HOOK_TRUSTED_HASHES = (
+    ("ccc@ccc-agent:hooks/hooks.json:session_start:0:0",
+     "sha256:755b1b9d145a87b94a388f7566c56064acd92ad81dc9b221de795d5604e2625a"),
+    ("ccc@ccc-agent:hooks/hooks.json:subagent_start:0:0",
+     "sha256:110513c459ef92d4852bdf801e6be8c2fae9def56da9496775b408701d08a609"),
+    ("ccc@ccc-agent:hooks/hooks.json:subagent_stop:0:0",
+     "sha256:bf2126876905c70422c93361befd22ae53bbfa868b653587a10ba146af01554f"),
     ("ccc@ccc-agent:hooks/hooks.json:stop:0:0",
      "sha256:72d22a4a83b82ca16b8a5bcc60f519bc6b75773cc17f103e9acb18a028dc6998"),
 )
