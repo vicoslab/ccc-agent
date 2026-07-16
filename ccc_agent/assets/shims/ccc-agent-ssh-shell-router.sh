@@ -117,6 +117,21 @@ def token_agent(token):
     return None
 
 
+def codex_subcommand(tokens, executable_index):
+    """Return a Codex subcommand after global config overrides, if present."""
+    i = executable_index + 1
+    while i < len(tokens) and tokens[i] not in SEPARATORS:
+        token = tokens[i]
+        if token in ("-c", "--config"):
+            i += 2
+            continue
+        if token.startswith("--config="):
+            i += 1
+            continue
+        return token.lower()
+    return ""
+
+
 def shell_tokens(command_string):
     lexer = shlex.shlex(command_string, posix=True, punctuation_chars=";&|")
     lexer.whitespace_split = True
@@ -163,7 +178,7 @@ def inspect_at(tokens, start, depth):
         if saw_claude_remote_env:
             return "claude", "server"
         next_token = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
-        if agent == "codex" and next_token == "app-server":
+        if agent == "codex" and codex_subcommand(tokens, i) == "app-server":
             return agent, "server"
         if agent == "hermes" and next_token in ("gateway", "serve", "server"):
             return agent, "server"

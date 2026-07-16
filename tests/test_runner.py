@@ -17,6 +17,7 @@ import time
 import unittest
 from unittest import mock
 
+import ccc_agent.runner as runner_module
 from ccc_agent.branchfs import FakeBranchFS, StatusReport, StatusWarning
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import (BWRAP_AGENT_RUNNER, BWRAP_AGENT_RUNNER_ARG0,
@@ -877,6 +878,97 @@ time.sleep(0.18)
                 root = session.protected_roots["storage_user"]
                 self.assertEqual(self.h.backend.status(root), [])
 
+    def test_adaptive_remote_bridge_closes_control_before_bundle_removal(self):
+        self.h.backend = FakeBranchFS()
+        config = self.h.config(
+            [sys.executable, "-c", "import time; time.sleep(0.08)"],
+            agent_kind="codex-remote", server_mode=True,
+            confinement="bwrap", bwrap_bin=self._fake_bwrap(),
+            lifecycle="adaptive", adaptive_bootstrap_seconds=0.02,
+            adaptive_stability_seconds=0.01,
+            adaptive_detach_seconds=0.05, per_turn=True)
+
+        real_remove = self.h.store.remove
+
+        def remove_after_control_teardown(session_id):
+            control_dir = self.h.store.control_dir(session_id)
+            if os.path.isdir(control_dir) and os.listdir(control_dir):
+                raise OSError("control runtime still active")
+            return real_remove(session_id)
+
+        with mock.patch.object(
+                self.h.store, "remove", side_effect=remove_after_control_teardown):
+            session = run_session(config)
+
+        self.assertEqual(session.agent_kind, "codex-remote-bridge")
+        self.assertEqual(session.state, "aborted")
+        self.assertFalse(any(
+            e["event"] == "error" and "bundle cleanup failed" in e.get("detail", "")
+            for e in session.events))
+        self.assertEqual(self.h.store.list(), [])
+        self.assertFalse(os.path.exists(
+            self.h.store.bundle_dir(session.session_id)))
+
+    def test_adaptive_remote_bridge_reports_unexpected_cleanup_failure(self):
+        self.h.backend = FakeBranchFS()
+        config = self.h.config(
+            [sys.executable, "-c", "import time; time.sleep(0.08)"],
+            agent_kind="codex-remote", server_mode=True,
+            confinement="bwrap", bwrap_bin=self._fake_bwrap(),
+            lifecycle="adaptive", adaptive_bootstrap_seconds=0.02,
+            adaptive_stability_seconds=0.01,
+            adaptive_detach_seconds=0.05, per_turn=True)
+
+        with mock.patch.object(
+                self.h.store, "remove",
+                side_effect=RuntimeError("unexpected remove failure")):
+            session = run_session(config)
+
+        self.assertEqual(session.state, "aborted")
+        self.assertTrue(any(
+            e["event"] == "error" and
+            "unexpected remove failure" in e.get("detail", "")
+            for e in session.events))
+
+    def test_bwrap_server_without_workspace_uses_launch_cwd_for_pwd(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = RunnerConfig(
+            store=self.h.store,
+            backend=self.h.backend,
+            alias_map=AliasMap.for_home("domen", home_subdir=""),
+            owner="domen",
+            agent_kind="codex-remote",
+            agent_command=["codex", "app-server"],
+            workspace=None,
+            launch_cwd="/home/domen/Projects/proj-a",
+            policy={"mode": "workspace-auto", "allowed_scopes": [],
+                    "workspace_scopes": []},
+            roots=[RootSpec(name="storage_user", base=self.h.base,
+                            store=os.path.join(self.h.tmp, "stores",
+                                               "storage_user"),
+                            visible="/storage/user", home_subdir="")],
+            confinement="bwrap",
+            bwrap_bin="/opt/ccc-agent/bin/bwrap",
+            per_turn=False,
+            server_mode=True,
+        )
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(config, env={})
+
+        self.assertEqual(session.state, "auto-committed")
+        self.assertEqual(seen["env"]["PWD"], config.launch_cwd)
+        chdir = seen["argv"].index("--chdir")
+        self.assertEqual(seen["argv"][chdir + 1], config.launch_cwd)
+        self.assertIsNone(session.workspace)
+        self.assertEqual(session.policy["allowed_scopes"], [])
+
     def test_bwrap_needs_no_script_or_uid(self):
         # Unlike chroot, bwrap is rootless: it must not require uid/gid/script.
         cfg = self.h.config(["true"], confinement="bwrap")
@@ -927,6 +1019,124 @@ time.sleep(0.18)
                         env={"CCC_AGENT_SHIM_UNDERLYING_PATH": path})
 
         self.assertEqual(seen["env"].get("PATH"), path)
+
+    def test_bwrap_masks_nested_codex_bwrap_targets_with_adapter(self):
+        seen = {}
+        first_bin = os.path.join(self.h.tmp, "codex-bin")
+        second_bin = os.path.join(self.h.tmp, "system-bin")
+        os.makedirs(first_bin)
+        os.makedirs(second_bin)
+        targets = [os.path.join(first_bin, "bwrap"),
+                   os.path.join(second_bin, "bwrap")]
+        for target in targets:
+            with open(target, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        path = os.pathsep.join((first_bin, second_bin))
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["codex"], agent_kind="codex"),
+                        env={"CCC_AGENT_SHIM_UNDERLYING_PATH": path})
+
+        adapter = os.path.realpath(os.path.join(
+            os.path.dirname(runner_module.__file__), "assets", "codex", "bwrap"))
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        for target in targets:
+            self.assertIn(("--ro-bind", adapter, os.path.realpath(target)),
+                          triples)
+        self.assertIn(("--ro-bind", adapter,
+                       "/tmp/ccc-agent/codex-external-sandbox"), triples)
+
+    def test_bwrap_keeps_native_codex_sandbox_with_fresh_proc(self):
+        seen = {}
+        runtime_bin = os.path.join(self.h.tmp, "fresh-proc-bin")
+        os.makedirs(runtime_bin)
+        target = os.path.join(runtime_bin, "bwrap")
+        with open(target, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(
+                ["codex"], agent_kind="codex", bwrap_proc_mode="fresh"),
+                env={"CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin})
+
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        self.assertFalse(any(
+            triple[0] == "--ro-bind" and
+            triple[2] == os.path.realpath(target)
+            for triple in triples))
+
+    def test_bwrap_masks_nested_bwrap_for_remote_codex_label(self):
+        seen = {}
+        launcher_bin = os.path.join(self.h.tmp, "remote-launcher-bin")
+        runtime_bin = os.path.join(self.h.tmp, "remote-codex-runtime-bin")
+        os.makedirs(launcher_bin)
+        os.makedirs(runtime_bin)
+        runtime_codex = os.path.join(runtime_bin, "codex")
+        with open(runtime_codex, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(runtime_codex, 0o755)
+        launcher_codex = os.path.join(launcher_bin, "codex")
+        with open(launcher_codex, "w") as fh:
+            fh.write('#!/bin/sh\nexec %s "$@"\n' % runtime_codex)
+        os.chmod(launcher_codex, 0o755)
+        target = os.path.join(runtime_bin, "bwrap")
+        with open(target, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(
+                ["bash", "-c", "codex app-server"],
+                agent_kind="codex-remote", server_mode=True, per_turn=False),
+                env={"CCC_AGENT_SHIM_UNDERLYING_PATH": launcher_bin})
+
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        self.assertTrue(any(
+            triple[0] == "--ro-bind" and
+            triple[1].endswith(os.path.join("assets", "codex", "bwrap")) and
+            triple[2] == os.path.realpath(target)
+            for triple in triples))
+
+    def test_bwrap_does_not_mask_bwrap_for_generic_agent(self):
+        seen = {}
+        runtime_bin = os.path.join(self.h.tmp, "generic-bin")
+        os.makedirs(runtime_bin)
+        target = os.path.join(runtime_bin, "bwrap")
+        with open(target, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(target, 0o755)
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run_session(self._bwrap_config(["my-agent"]),
+                        env={"CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin})
+
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        self.assertFalse(any(
+            triple[0] == "--ro-bind" and
+            triple[2] == os.path.realpath(target)
+            for triple in triples))
 
     def test_bwrap_preserves_invoking_login_shell(self):
         seen = {}
@@ -1439,6 +1649,24 @@ time.sleep(0.18)
         self.assertIn(("--ro-bind", src, sandbox), triples)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertEqual(self._wrapped_agent_command(argv), command)
+
+    def test_bwrap_mounts_codex_plugin_for_remote_serve_shell(self):
+        src = self._make_plugin("codex-ccc-containment")
+        sandbox = "/home/domen/.codex/plugins/cache/ccc-agent/ccc/0.2.0"
+        plugins = {"codex": {"src": src, "sandbox_path": sandbox,
+                             "ensure_dirs": ["/home/domen/.codex/plugins/cache/ccc-agent/ccc"]}}
+        command = ["/bin/bash", "-c", "codex app-server"]
+
+        for agent_kind in ("codex-remote", "codex-remote-bridge"):
+            with self.subTest(agent_kind=agent_kind):
+                argv = self._capture_argv(command, agent_kind, plugins)
+                triples = [(argv[k], argv[k + 1], argv[k + 2])
+                           for k in range(len(argv) - 2)]
+
+                self.assertIn(("--ro-bind", src, sandbox), triples)
+                self.assertNotIn(
+                    "--dangerously-bypass-approvals-and-sandbox", argv)
+                self.assertEqual(self._wrapped_agent_command(argv), command)
 
     def test_bwrap_shared_agent_state_dirs_are_rw_binds_by_default(self):
         paths, binds = self._agent_state_binds()

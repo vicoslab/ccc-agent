@@ -1,6 +1,7 @@
 """Tests for the shell scaffolding: launch shim and hook adapters. All run
 unprivileged (syntax and behavior checks only)."""
 
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -17,6 +18,7 @@ ASSETS = os.path.join(AGENT_DIR, "ccc_agent", "assets")
 PLUGINS = os.path.join(ASSETS, "plugins")
 SHIM_SH = os.path.join(ASSETS, "shims", "ccc-agent-shim.sh")
 SSH_ROUTER_SH = os.path.join(ASSETS, "shims", "ccc-agent-ssh-shell-router.sh")
+CODEX_BWRAP_ADAPTER = os.path.join(ASSETS, "codex", "bwrap")
 SOFTSANDBOX_SH = os.path.join(ASSETS, "scripts", "softsandbox.sh")
 HOOKS = [os.path.join(ASSETS, "hooks", name)
          for name in ("claude-stop-hook.sh", "codex-stop-hook.sh",
@@ -46,6 +48,99 @@ class TestShellSyntax(unittest.TestCase):
                                   stderr=subprocess.PIPE, text=True)
             self.assertEqual(proc.returncode, 0,
                              "%s: %s" % (script, proc.stderr))
+
+
+class TestCodexBwrapAdapter(unittest.TestCase):
+    def test_adapter_is_packaged_and_executable(self):
+        self.assertTrue(os.path.isfile(CODEX_BWRAP_ADAPTER))
+        self.assertTrue(os.access(CODEX_BWRAP_ADAPTER, os.X_OK))
+
+    def test_adapter_advertises_codex_required_bwrap_capabilities(self):
+        proc = subprocess.run([CODEX_BWRAP_ADAPTER, "--help"],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--perms", proc.stdout)
+        self.assertIn("--argv0", proc.stdout)
+
+    def test_adapter_refuses_execution_outside_ccc_agent(self):
+        env = dict(os.environ)
+        env.pop("CCC_AGENT_SESSION", None)
+        proc = subprocess.run(
+            [CODEX_BWRAP_ADAPTER, "--", "/bin/true"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("outside a CCC-agent session", proc.stderr)
+
+    def test_adapter_handles_codex_no_separator_userns_probe(self):
+        env = dict(os.environ)
+        env["CCC_AGENT_SESSION"] = "agent-test"
+        proc = subprocess.run([
+            CODEX_BWRAP_ADAPTER,
+            "--unshare-user", "--ro-bind", "/", "/", "/bin/true",
+        ], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_adapter_rejects_other_no_separator_commands(self):
+        env = dict(os.environ)
+        env["CCC_AGENT_SESSION"] = "agent-test"
+        proc = subprocess.run([
+            CODEX_BWRAP_ADAPTER,
+            "--unshare-user", "--ro-bind", "/", "/", "/bin/echo",
+        ], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5)
+        self.assertEqual(proc.returncode, 125)
+        self.assertIn("missing command separator", proc.stderr)
+
+    def test_adapter_relaxes_seccomp_only_for_namespaced_inner_stage(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "ccc_agent_codex_bwrap_adapter_test", CODEX_BWRAP_ADAPTER)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            self.fail("could not load Codex bwrap adapter")
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+
+        profile = {"type": "managed", "network": "restricted"}
+        payload = {
+            "command": [
+                "/path/to/codex",
+                "--permission-profile", json.dumps(profile),
+                "--apply-seccomp-then-exec", "--", "/bin/true",
+            ],
+            "argv0": "codex-linux-sandbox",
+        }
+        module.allow_unix_sockets_in_isolated_network(payload)
+        profile_index = payload["command"].index("--permission-profile") + 1
+        updated = json.loads(payload["command"][profile_index])
+        self.assertEqual(updated["network"], "enabled")
+
+        preflight = {"command": ["/bin/true"], "argv0": None}
+        module.allow_unix_sockets_in_isolated_network(preflight)
+        self.assertEqual(preflight["command"], ["/bin/true"])
+
+    def test_adapter_preserves_cwd_environment_and_argv0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env.update({"CCC_AGENT_SESSION": "agent-test", "DROP_ME": "old"})
+            command = (
+                "printf '%s|%s|%s|%s' \"$0\" \"$PWD\" "
+                "\"${KEEP_ME:-missing}\" \"${DROP_ME-unset}\""
+            )
+            proc = subprocess.run([
+                CODEX_BWRAP_ADAPTER,
+                "--chdir", tmp,
+                "--unsetenv", "DROP_ME",
+                "--setenv", "KEEP_ME", "kept",
+                "--argv0", "codex-inner",
+                "--", "/bin/sh", "-c", command,
+            ], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=5)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout,
+                         "codex-inner|%s|kept|unset" % tmp)
 
 
 class TestPluginAssets(unittest.TestCase):
@@ -340,6 +435,41 @@ class TestPluginAssets(unittest.TestCase):
             self.assertIn("turn-finalize --default-keep", call_log)
             self.assertIn("turn-review-kept", call_log)
 
+    def test_codex_stop_hook_restores_stripped_remote_session_from_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            handoff = os.path.join(tmp, "session-env.json")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            with open(handoff, "w") as fh:
+                json.dump({
+                    "CCC_AGENT_SESSION": "agent-remote-codex",
+                    "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                    "CCC_AGENT_CONTROL_TOKEN": "control-token",
+                    "CCC_AGENT_HOOK_TOKEN": "hook-token",
+                    "CCC_AGENT_HOOK_SESSION": "agent-remote-codex",
+                    "CCC_AGENT_CLI": ctl,
+                }, fh)
+
+            proc = subprocess.run(
+                ["sh", PLUGIN_STOP_HOOKS[1]],
+                env={"PATH": "/usr/bin:/bin",
+                     "CCC_AGENT_SESSION_ENV_FILE": handoff,
+                     "CCC_AGENT_TEST_CALLS": calls,
+                     "TMPDIR": tmp},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "")
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn("turn-finalize --default-keep", call_log)
+            self.assertIn("turn-review-kept", call_log)
+
     def test_codex_workspace_hook_adds_and_removes_silently(self):
         with tempfile.TemporaryDirectory() as tmp:
             calls = os.path.join(tmp, "calls")
@@ -390,6 +520,84 @@ class TestPluginAssets(unittest.TestCase):
             self.assertIn("turn-add-workspace --agent-session codex-inner-1 /storage/user/Projects/proj-a", call_log)
             self.assertIn("turn-add-workspace --agent-session codex-parent/sub-1 /storage/user/Projects/proj-b", call_log)
             self.assertIn("turn-remove-workspace --agent-session codex-parent/sub-1 /storage/user/Projects/proj-b", call_log)
+
+    def test_codex_workspace_hook_restores_stripped_remote_session_from_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            handoff = os.path.join(tmp, "session-env.json")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "echo \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            with open(handoff, "w") as fh:
+                json.dump({
+                    "CCC_AGENT_SESSION": "agent-outer-codex",
+                    "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                    "CCC_AGENT_CONTROL_TOKEN": "control-token",
+                    "CCC_AGENT_HOOK_TOKEN": "hook-token",
+                    "CCC_AGENT_HOOK_SESSION": "agent-outer-codex",
+                    "CCC_AGENT_CLI": ctl,
+                }, fh)
+
+            proc = subprocess.run(
+                ["sh", CODEX_WORKSPACE_HOOK],
+                env={"PATH": "/usr/bin:/bin",
+                     "CCC_AGENT_SESSION_ENV_FILE": handoff,
+                     "CCC_AGENT_TEST_CALLS": calls},
+                input=json.dumps({"hook_event_name": "SessionStart",
+                                  "session_id": "codex-inner-remote",
+                                  "cwd": "/storage/user/Projects/proj-a"}),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "")
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn(
+                "turn-add-workspace --agent-session codex-inner-remote "
+                "/storage/user/Projects/proj-a", call_log)
+
+    def test_codex_session_handoff_cannot_inject_commands_or_variable_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            ctl = os.path.join(tmp, "ccc-agent")
+            handoff = os.path.join(tmp, "session-env.json")
+            marker = os.path.join(tmp, "must-not-exist")
+            with open(ctl, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "test -z \"${UNRELATED_INJECTED_NAME:-}\" || "
+                         "touch \"$CCC_AGENT_TEST_MARKER\"\n"
+                         "printf '%s\\n' \"$*\" >> \"$CCC_AGENT_TEST_CALLS\"\n"
+                         "exit 0\n")
+            os.chmod(ctl, 0o755)
+            session_value = "agent-x; touch %s" % marker
+            with open(handoff, "w") as fh:
+                json.dump({
+                    "CCC_AGENT_SESSION": session_value,
+                    "CCC_AGENT_CONTROL_SOCK": os.path.join(tmp, "sock"),
+                    "CCC_AGENT_CONTROL_TOKEN": "control-token",
+                    "CCC_AGENT_HOOK_TOKEN": "hook-token",
+                    "CCC_AGENT_CLI": ctl,
+                    "UNRELATED_INJECTED_NAME": "bad",
+                }, fh)
+
+            proc = subprocess.run(
+                ["sh", CODEX_WORKSPACE_HOOK],
+                env={"PATH": "/usr/bin:/bin",
+                     "CCC_AGENT_SESSION_ENV_FILE": handoff,
+                     "CCC_AGENT_TEST_CALLS": calls,
+                     "CCC_AGENT_TEST_MARKER": marker},
+                input=json.dumps({"hook_event_name": "SessionStart",
+                                  "cwd": "/storage/user/Projects/proj-a"}),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(os.path.exists(marker))
+            with open(calls) as fh:
+                call_log = fh.read()
+            self.assertIn("--agent-session %s " % session_value, call_log)
 
     def test_codex_workspace_hook_degrades_safe_outside_contained_session(self):
         proc = subprocess.run(
@@ -1058,6 +1266,26 @@ class TestSshShellRouter(unittest.TestCase):
             "sh 'PATH=\"${CODEX_INSTALL_PATH:-$HOME/.local/bin}:$PATH\"; export PATH; codex app-server proxy'"
         )
         self.assert_routed(command, "codex")
+
+    def test_routes_codex_desktop_app_server_bootstrap_as_adaptive(self):
+        command = (
+            "sh -c 'CODEX_REMOTE_PAYLOAD=\"$1\"; export CODEX_REMOTE_PAYLOAD; "
+            "exec \"$SHELL\" -l -i -c '\"'\"'exec /bin/sh -c \"$CODEX_REMOTE_PAYLOAD\"'\"'\"'' "
+            "sh 'printf '\"'\"'%b'\"'\"' '\"'\"'\\001\\002\\003\\004\\005\\006\\007\\010'\"'\"'; "
+            "PATH=\"${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH\"; export PATH; "
+            "umask 077; mkdir -p -- \"${CODEX_HOME:-$HOME/.codex}/app-server-control\" && "
+            "nohup codex -c features.code_mode_host=true app-server --listen unix:// "
+            ">\"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server.log\" 2>&1 &'"
+        )
+        self.assert_routed(command, "codex")
+
+    def test_codex_global_config_preserves_direct_exec_classification(self):
+        self.assert_routed(
+            "codex -c model_reasoning_effort=high exec task",
+            "codex", lifecycle="foreground")
+        self.assert_routed(
+            "codex --config=model_reasoning_effort=high exec task",
+            "codex", lifecycle="foreground")
 
     def test_does_not_route_mentions_that_are_not_executables(self):
         for command in (

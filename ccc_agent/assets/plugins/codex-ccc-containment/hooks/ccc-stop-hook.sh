@@ -12,6 +12,14 @@
 # keep those paths.
 set -eu
 
+# Codex app-server may rebuild the environment before running hooks. Restore
+# only the launcher-owned, allowlisted CCC values from the mounted handoff.
+CCC_HOOK_DIR=$(dirname "$0")
+if [ -r "$CCC_HOOK_DIR/ccc-session-env.sh" ]; then
+    . "$CCC_HOOK_DIR/ccc-session-env.sh"
+fi
+unset CCC_HOOK_DIR
+
 CTL="${CCC_AGENT_CLI:-ccc-agent}"
 
 # Not a contained session (e.g. a human-run agent outside ccc-agent run): the

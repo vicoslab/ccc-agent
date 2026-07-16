@@ -35,7 +35,7 @@ from .paths import is_within, normalize
 from .policy import (ABORT, AUTO_COMMIT, NO_CHANGES, PENDING_REVIEW,
                      PolicyConfig, PolicyDecision, evaluate, split_ignored)
 from .previous_commits import split_previously_committed_changes
-from .session import (ProtectedRoot, Session, is_remote_bridge,
+from .session import (TERMINAL_STATES, ProtectedRoot, Session, is_remote_bridge,
                       remote_bridge_agent_kind)
 from .turn import TurnController
 
@@ -62,6 +62,8 @@ TRANSIENT_INTERNAL_ENV = (
     ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
 )
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CODEX_BWRAP_ADAPTER = os.path.join(os.path.dirname(__file__), "assets",
+                                   "codex", "bwrap")
 
 # Where the per-turn control socket is bind-mounted INSIDE the bwrap sandbox.
 # The host-side socket lives under the state dir, outside the sandbox.  Keep the
@@ -72,6 +74,7 @@ SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 SANDBOX_LIFECYCLE_SOCK = "/tmp/ccc-agent/lifecycle.sock"
 SANDBOX_ADAPTIVE_RUNNER = "/tmp/ccc-agent/adaptive_pid1.py"
 SANDBOX_SESSION_ENV = "/tmp/ccc-agent/session-env.json"
+SANDBOX_CODEX_BWRAP_MARKER = "/tmp/ccc-agent/codex-external-sandbox"
 
 # Run the sandbox command under a tiny PID-1 lifecycle wrapper.  Without this,
 # bubblewrap's default PID-1 reaper keeps the namespace alive until every helper
@@ -444,6 +447,15 @@ def _plugin_key_for_token(config, token):
     return None
 
 
+def _plugin_token_for_agent_kind(value):
+    """Map durable remote session labels back to their configured agent key."""
+    token = _agent_token(value)
+    for suffix in ("-remote-bridge", "-remote"):
+        if token.endswith(suffix) and len(token) > len(suffix):
+            return token[:-len(suffix)]
+    return token
+
+
 def _inferred_agent_plugin_names(config):
     """Agent plugin candidates inferred from the executable path only."""
     names = set()
@@ -501,7 +513,7 @@ def _matched_agent_plugin(config):
             return None  # missing trusted asset: degrade to session-end review
         return spec
 
-    explicit_kind = _agent_token(config.agent_kind)
+    explicit_kind = _plugin_token_for_agent_kind(config.agent_kind)
     if explicit_kind and explicit_kind != "command":
         explicit_agent = _plugin_key_for_token(config, explicit_kind)
         if explicit_agent:
@@ -628,7 +640,7 @@ def _canonical_protected_path(path, session, config):
 def _is_agent_kind(config, name):
     """Best-effort detection of a contained invocation for one agent kind."""
     token = name.lower()
-    if _agent_token(config.agent_kind) == token:
+    if _plugin_token_for_agent_kind(config.agent_kind) == token:
         return True
     return token in _inferred_agent_plugin_names(config)
 
@@ -641,6 +653,99 @@ def _is_claude_agent(config):
 def _is_codex_agent(config):
     """Best-effort detection of a contained Codex invocation."""
     return _is_agent_kind(config, "codex")
+
+
+def _codex_bwrap_adapter_binds(config, process_env):
+    """Return contained-only bwrap masks for Codex's nested Linux sandbox.
+
+    With ``bwrap_proc_mode=bind`` (or ``ro``), CCC unshares the outer PID
+    namespace but exposes a procfs mounted for the parent container namespace.
+    Nested bubblewrap then looks up its namespace PID in the wrong procfs and
+    can block forever. A fresh procfs does not have that mismatch and keeps
+    Codex's native nested sandbox unchanged.
+
+    Codex may prefer a Conda/runtime-local bwrap over /usr/bin/bwrap, so mask
+    every executable candidate in its actual launch PATH. Resolve symlinks to
+    bind over the path Codex ultimately opens inside the BranchFS view.
+    """
+    if not _is_codex_agent(config) or config.bwrap_proc_mode == "fresh":
+        return []
+
+    adapter = os.path.realpath(CODEX_BWRAP_ADAPTER)
+    if not os.path.isfile(adapter) or not os.access(adapter, os.X_OK):
+        raise RuntimeError("Codex bwrap adapter is missing or not executable: %s"
+                           % adapter)
+
+    path = (process_env or {}).get("PATH") or BWRAP_DEFAULT_PATH
+    binds = []
+    seen = set()
+
+    def add_bwrap(candidate):
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            return
+        target = os.path.realpath(candidate)
+        if target == adapter or target in seen:
+            return
+        seen.add(target)
+        binds.append((adapter, target))
+
+    launcher_seen = set()
+
+    def add_codex_link_chain(candidate):
+        """Include bwrap siblings from launcher links and tiny wrappers.
+
+        Remote Codex starts through ~/.local/bin/codex, while tool shells can
+        rebuild PATH around the Conda target referenced by that launcher. Follow
+        symlinks and small shell-wrapper absolute Codex paths; realpath alone
+        skips both the intermediate Conda bin dir and regular wrapper targets.
+        """
+        current = os.path.abspath(candidate)
+        visited = set()
+        while current not in visited:
+            if current in launcher_seen:
+                return
+            launcher_seen.add(current)
+            visited.add(current)
+            add_bwrap(os.path.join(os.path.dirname(current), "bwrap"))
+            if not os.path.islink(current):
+                break
+            target = os.readlink(current)
+            if not os.path.isabs(target):
+                target = os.path.join(os.path.dirname(current), target)
+            current = os.path.normpath(target)
+
+        try:
+            size = os.path.getsize(current)
+            if size > 4096:
+                return
+            with open(current, errors="replace") as fh:
+                launcher = fh.read()
+        except (OSError, UnicodeError):
+            return
+        if not launcher.startswith("#!"):
+            return
+        for token in launcher.replace('"', " ").replace("'", " ").split():
+            token = token.strip("();")
+            if os.path.isabs(token) and os.path.basename(token) == "codex":
+                if token not in visited:
+                    add_codex_link_chain(token)
+
+    for directory in path.split(os.pathsep):
+        if not directory:
+            directory = os.getcwd()
+        add_bwrap(os.path.join(directory, "bwrap"))
+        codex = os.path.join(directory, "codex")
+        if os.path.exists(codex) and os.access(codex, os.X_OK):
+            add_codex_link_chain(codex)
+
+    remote_launcher = os.path.join("/home", config.owner, ".local", "bin", "codex")
+    if os.path.exists(remote_launcher) and os.access(remote_launcher, os.X_OK):
+        add_codex_link_chain(remote_launcher)
+
+    real_command = (process_env or {}).get("CCC_AGENT_REAL_CMD")
+    if real_command and (os.path.exists(real_command) or os.path.islink(real_command)):
+        add_codex_link_chain(real_command)
+    return binds
 
 
 def _add_runtime_state_ignores(session, config, ignore, relpaths):
@@ -860,7 +965,7 @@ def _bwrap_gid(config):
 
 
 def _bwrap_command(session, config, control=None, lifecycle_socket=None,
-                   session_env_path=None):
+                   session_env_path=None, process_env=None):
     """Build a bubblewrap command that confines the agent rootlessly.
 
     This needs no container CAP_SYS_ADMIN and no privileged helper: bwrap
@@ -969,6 +1074,20 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
         if bind is not None:
             src, dest = bind
             argv += ["--ro-bind", src, dest]
+
+    # Codex's own Linux sandbox uses nested bubblewrap. When CCC must bind an
+    # older procfs into its PID namespace, replace only Codex-visible bwrap
+    # candidates with the trusted external-sandbox adapter. The outer CCC
+    # bwrap executable has already launched and is unaffected by these binds.
+    codex_bwrap_binds = _codex_bwrap_adapter_binds(config, process_env)
+    for src, dest in codex_bwrap_binds:
+        argv += ["--ro-bind", src, dest]
+    if codex_bwrap_binds:
+        # Codex strips CCC_AGENT_SESSION from its dedicated filesystem helper.
+        # Bind the same trusted adapter inode at a stable marker path so that
+        # helper can still prove it is inside the launcher-owned namespace.
+        argv += ["--ro-bind", codex_bwrap_binds[0][0],
+                 SANDBOX_CODEX_BWRAP_MARKER]
 
     # Optional read-only credential overlays.  Do not use this for whole
     # ~/.codex/~/.claude/~/.hermes trees in normal deployments; direct
@@ -1084,7 +1203,7 @@ def _bwrap_process_env(run_env, config, session):
     for name in config.bwrap_unsetenv:
         sandbox_env.pop(name, None)
 
-    workdir = normalize(session.workspace)
+    workdir = normalize(config.launch_cwd)
     home = "/home/%s" % config.owner
     sandbox_env.update({
         ENV_SESSION: session.session_id,
@@ -1643,6 +1762,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
     control_server = None
     listener = None
     session_env_path = None
+    discard_remote_bridge = False
     lifecycle_path = os.path.join(config.store.control_dir(session.session_id),
                                   "lifecycle.sock")
     try:
@@ -1688,7 +1808,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         argv = _bwrap_command(
             session, config, control=control,
             lifecycle_socket=lifecycle_path,
-            session_env_path=session_env_path)
+            session_env_path=session_env_path, process_env=bwrap_env)
         session.add_event("bwrap-launch", argv[0])
         config.store.save(session)
         proc = subprocess.Popen(argv, env=bwrap_env, stdin=subprocess.PIPE,
@@ -1701,7 +1821,10 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         session.add_event("agent-exit", str(returncode))
 
         if is_remote_bridge(session):
-            _discard_remote_bridge_session(session, config.store, config.backend)
+            # Bundle removal must wait until the control server and handoff files
+            # are closed in ``finally``; otherwise SessionStore.remove races a
+            # concurrently changing non-empty control directory.
+            discard_remote_bridge = True
         else:
             session.transition("finalizing")
             config.store.save(session)
@@ -1725,6 +1848,24 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             pass
         _unmount_all(session, config.backend)
         _remove_session_env_handoff(session_env_path)
+
+    if discard_remote_bridge:
+        try:
+            _discard_remote_bridge_session(session, config.store, config.backend)
+        except Exception as exc:
+            # Teardown has already completed, so always deliver a terminal status
+            # even if unexpected metadata I/O fails during bundle removal.
+            session.add_event(
+                "error", "unexpected remote bridge cleanup failure: %s" % exc)
+            if session.state not in TERMINAL_STATES:
+                try:
+                    session.transition("failed")
+                except ValueError:
+                    pass
+            try:
+                config.store.save(session)
+            except Exception:
+                pass
 
     _adaptive_status(status_fd, "finished", session=session.to_dict())
     try:
@@ -1823,7 +1964,7 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
             bwrap_env = _bwrap_process_env(run_env, config, session)
             argv = _bwrap_command(
                 session, config, control=control,
-                session_env_path=session_env_path)
+                session_env_path=session_env_path, process_env=bwrap_env)
             session.add_event("bwrap-launch", argv[0])
             session.add_event("container-run-access",
                               "enabled" if config.container_run_access

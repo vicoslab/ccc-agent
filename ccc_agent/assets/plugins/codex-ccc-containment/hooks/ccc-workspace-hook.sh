@@ -9,6 +9,14 @@
 # Keep stdout empty: Codex command-hook stdout may be parsed as hook output.
 set -eu
 
+# Codex app-server may rebuild the environment before running hooks. Restore
+# only the launcher-owned, allowlisted CCC values from the mounted handoff.
+CCC_HOOK_DIR=$(dirname "$0")
+if [ -r "$CCC_HOOK_DIR/ccc-session-env.sh" ]; then
+    . "$CCC_HOOK_DIR/ccc-session-env.sh"
+fi
+unset CCC_HOOK_DIR
+
 # Not a contained ccc-agent run, or no supervisor control channel: inert.
 if [ -z "${CCC_AGENT_SESSION:-}" ] || [ -z "${CCC_AGENT_CONTROL_SOCK:-}" ]; then
     exit 0

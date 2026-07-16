@@ -1,0 +1,201 @@
+#!/usr/bin/python3
+"""Run Codex sandbox commands inside CCC's existing outer sandbox.
+
+CCC normally binds the container's existing /proc into an unshared PID namespace
+because Docker/AppArmor rejects a fresh procfs mount. A nested bubblewrap then
+looks up its namespace PID in a procfs for the parent namespace and can wait
+forever. The trusted launcher mounts this adapter over Codex's bwrap candidates
+only inside affected Codex sessions.
+
+The BranchFS + outer bubblewrap namespace remains the filesystem containment
+boundary. This adapter preserves the nested command's cwd, environment edits,
+argv[0], and requested network isolation, but deliberately omits a second
+mount/PID namespace.
+"""
+
+import json
+import os
+import sys
+
+EXEC_STAGE_ENV = "CCC_AGENT_CODEX_BWRAP_EXEC"
+SESSION_MARKER = "/tmp/ccc-agent/codex-external-sandbox"
+EXIT_USAGE = 125
+
+
+def fail(message):
+    print("ccc-agent Codex bwrap adapter: " + message, file=sys.stderr)
+    raise SystemExit(EXIT_USAGE)
+
+
+def require_values(options, index, count, option):
+    if index + count >= len(options):
+        fail("%s requires %d value(s)" % (option, count))
+    return options[index + 1:index + count + 1]
+
+
+def validate_payload(payload):
+    if not isinstance(payload, dict):
+        fail("invalid exec-stage payload")
+    command = payload.get("command")
+    if (not isinstance(command, list) or not command or
+            not all(isinstance(value, str) and value for value in command)):
+        fail("invalid command in exec-stage payload")
+    argv0 = payload.get("argv0")
+    if argv0 is not None and (not isinstance(argv0, str) or not argv0):
+        fail("invalid argv0 in exec-stage payload")
+    return command, argv0
+
+
+def allow_unix_sockets_in_isolated_network(payload):
+    """Let AF_UNIX work when the adapter already owns network isolation.
+
+    Codex's restricted network seccomp policy blocks the CCC control socket as
+    well as IP sockets. Native bwrap isolation relies on a private network
+    namespace, so switch only the inner seccomp profile to network-enabled when
+    this adapter is about to create that namespace. IP remains isolated by the
+    namespace while launcher-owned Unix sockets stay usable.
+    """
+    command, _argv0 = validate_payload(payload)
+    if "--apply-seccomp-then-exec" not in command:
+        return
+    try:
+        profile_index = command.index("--permission-profile") + 1
+        profile = json.loads(command[profile_index])
+    except (ValueError, IndexError, TypeError) as exc:
+        fail("cannot decode Codex permission profile: %s" % exc)
+    if not isinstance(profile, dict):
+        fail("Codex permission profile is not an object")
+    if profile.get("network") == "restricted":
+        profile["network"] = "enabled"
+        command = list(command)
+        command[profile_index] = json.dumps(profile, separators=(",", ":"))
+        payload["command"] = command
+
+
+def exec_payload(payload, env):
+    command, argv0 = validate_payload(payload)
+    try:
+        os.execvpe(command[0], [argv0 or command[0]] + command[1:], env)
+    except OSError as exc:
+        fail("cannot execute %s: %s" % (command[0], exc))
+
+
+def run_exec_stage():
+    raw = os.environ.pop(EXEC_STAGE_ENV, None)
+    if raw is None:
+        fail("missing exec-stage payload")
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        fail("invalid exec-stage payload: %s" % exc)
+    exec_payload(payload, dict(os.environ))
+
+
+def print_help():
+    # Codex probes system bwrap with --help and requires --perms. Advertising
+    # --argv0 makes it preserve the helper's dispatch argv[0], which we apply
+    # below with os.execvpe.
+    print("Usage: bwrap [OPTIONS...] [--] COMMAND [ARGUMENTS...]")
+    print("    --perms OCTAL")
+    print("    --argv0 VALUE")
+
+
+def inside_ccc_agent():
+    if os.environ.get("CCC_AGENT_SESSION"):
+        return True
+    try:
+        return os.path.samefile(SESSION_MARKER, os.path.realpath(__file__))
+    except OSError:
+        return False
+
+
+def parse_request(arguments):
+    try:
+        separator = arguments.index("--")
+        options = arguments[:separator]
+        command = arguments[separator + 1:]
+    except ValueError:
+        # Codex's system-bwrap user-namespace capability probe omits `--` and
+        # always ends in true. Accept only that exact probe shape; real sandbox
+        # commands and future unknown invocations must use the explicit split.
+        if (arguments and arguments[-1] in ("/bin/true", "/usr/bin/true") and
+                "--unshare-user" in arguments and "--ro-bind" in arguments):
+            options = arguments[:-1]
+            command = arguments[-1:]
+        else:
+            fail("missing command separator --")
+    if not command:
+        fail("missing command after --")
+
+    env = dict(os.environ)
+    argv0 = None
+    cwd = None
+    network_isolated = "--unshare-net" in options
+    index = 0
+    while index < len(options):
+        option = options[index]
+        if option == "--chdir":
+            cwd = require_values(options, index, 1, option)[0]
+            index += 2
+        elif option == "--setenv":
+            name, value = require_values(options, index, 2, option)
+            env[name] = value
+            index += 3
+        elif option == "--unsetenv":
+            name = require_values(options, index, 1, option)[0]
+            env.pop(name, None)
+            index += 2
+        elif option == "--argv0":
+            argv0 = require_values(options, index, 1, option)[0]
+            index += 2
+        elif option == "--clearenv":
+            # Codex 0.143 does not emit this. Refuse rather than silently keep
+            # variables that a future Codex explicitly asked bwrap to remove.
+            fail("unsupported --clearenv")
+        else:
+            index += 1
+
+    return {"command": command, "argv0": argv0}, env, cwd, network_isolated
+
+
+def main():
+    if sys.argv[1:] == ["--ccc-exec-stage"]:
+        if not inside_ccc_agent():
+            fail("refusing exec stage outside a CCC-agent session")
+        run_exec_stage()
+    if sys.argv[1:] == ["--help"]:
+        print_help()
+        return 0
+    if not inside_ccc_agent():
+        fail("refusing to bypass bubblewrap outside a CCC-agent session")
+
+    payload, env, cwd, network_isolated = parse_request(sys.argv[1:])
+    if cwd:
+        try:
+            os.chdir(cwd)
+        except OSError as exc:
+            fail("cannot chdir to %s: %s" % (cwd, exc))
+
+    if network_isolated:
+        allow_unix_sockets_in_isolated_network(payload)
+        env[EXEC_STAGE_ENV] = json.dumps(payload, separators=(",", ":"))
+        os.execve(
+            "/usr/bin/unshare",
+            [
+                "unshare",
+                "--user",
+                "--map-root-user",
+                "--net",
+                "--",
+                sys.executable,
+                os.path.realpath(__file__),
+                "--ccc-exec-stage",
+            ],
+            env,
+        )
+    exec_payload(payload, env)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
