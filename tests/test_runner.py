@@ -877,6 +877,45 @@ time.sleep(0.18)
                 root = session.protected_roots["storage_user"]
                 self.assertEqual(self.h.backend.status(root), [])
 
+    def test_bwrap_server_without_workspace_uses_launch_cwd_for_pwd(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["env"] = dict(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = RunnerConfig(
+            store=self.h.store,
+            backend=self.h.backend,
+            alias_map=AliasMap.for_home("domen", home_subdir=""),
+            owner="domen",
+            agent_kind="codex-remote",
+            agent_command=["codex", "app-server"],
+            workspace=None,
+            launch_cwd="/home/domen/Projects/proj-a",
+            policy={"mode": "workspace-auto", "allowed_scopes": [],
+                    "workspace_scopes": []},
+            roots=[RootSpec(name="storage_user", base=self.h.base,
+                            store=os.path.join(self.h.tmp, "stores",
+                                               "storage_user"),
+                            visible="/storage/user", home_subdir="")],
+            confinement="bwrap",
+            bwrap_bin="/opt/ccc-agent/bin/bwrap",
+            per_turn=False,
+            server_mode=True,
+        )
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(config, env={})
+
+        self.assertEqual(session.state, "auto-committed")
+        self.assertEqual(seen["env"]["PWD"], config.launch_cwd)
+        chdir = seen["argv"].index("--chdir")
+        self.assertEqual(seen["argv"][chdir + 1], config.launch_cwd)
+        self.assertIsNone(session.workspace)
+        self.assertEqual(session.policy["allowed_scopes"], [])
+
     def test_bwrap_needs_no_script_or_uid(self):
         # Unlike chroot, bwrap is rootless: it must not require uid/gid/script.
         cfg = self.h.config(["true"], confinement="bwrap")
