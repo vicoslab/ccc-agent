@@ -969,10 +969,75 @@ def _codex_bwrap_adapter_binds(config, process_env, session=None):
         raise RuntimeError("Codex bwrap adapter is missing or not executable: %s"
                            % adapter)
 
+    path = (process_env or {}).get("PATH") or BWRAP_DEFAULT_PATH
     binds = []
-    for target in _vendor_bwrap_paths(config, env=process_env):
-        if target != adapter:
-            binds.append((adapter, target))
+    seen = set()
+
+    def add_bwrap(candidate):
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            return
+        target = os.path.realpath(candidate)
+        if target == adapter or target in seen:
+            return
+        seen.add(target)
+        binds.append((adapter, target))
+
+    launcher_seen = set()
+
+    def add_codex_link_chain(candidate):
+        """Include bwrap siblings from launcher links and tiny wrappers.
+
+        Remote Codex starts through ~/.local/bin/codex, while tool shells can
+        rebuild PATH around the Conda target referenced by that launcher. Follow
+        symlinks and small shell-wrapper absolute Codex paths; realpath alone
+        skips both the intermediate Conda bin dir and regular wrapper targets.
+        """
+        current = os.path.abspath(candidate)
+        visited = set()
+        while current not in visited:
+            if current in launcher_seen:
+                return
+            launcher_seen.add(current)
+            visited.add(current)
+            add_bwrap(os.path.join(os.path.dirname(current), "bwrap"))
+            if not os.path.islink(current):
+                break
+            target = os.readlink(current)
+            if not os.path.isabs(target):
+                target = os.path.join(os.path.dirname(current), target)
+            current = os.path.normpath(target)
+
+        try:
+            size = os.path.getsize(current)
+            if size > 4096:
+                return
+            with open(current, errors="replace") as fh:
+                launcher = fh.read()
+        except (OSError, UnicodeError):
+            return
+        if not launcher.startswith("#!"):
+            return
+        for token in launcher.replace('"', " ").replace("'", " ").split():
+            token = token.strip("();")
+            if os.path.isabs(token) and os.path.basename(token) == "codex":
+                if token not in visited:
+                    add_codex_link_chain(token)
+
+    for directory in path.split(os.pathsep):
+        if not directory:
+            directory = os.getcwd()
+        add_bwrap(os.path.join(directory, "bwrap"))
+        codex = os.path.join(directory, "codex")
+        if os.path.exists(codex) and os.access(codex, os.X_OK):
+            add_codex_link_chain(codex)
+
+    remote_launcher = os.path.join("/home", config.owner, ".local", "bin", "codex")
+    if os.path.exists(remote_launcher) and os.access(remote_launcher, os.X_OK):
+        add_codex_link_chain(remote_launcher)
+
+    real_command = (process_env or {}).get("CCC_AGENT_REAL_CMD")
+    if real_command and (os.path.exists(real_command) or os.path.islink(real_command)):
+        add_codex_link_chain(real_command)
     return binds
 
 

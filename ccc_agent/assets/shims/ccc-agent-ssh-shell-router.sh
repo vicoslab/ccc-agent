@@ -151,9 +151,9 @@ def detect_command(command_string, depth=0):
         if tokens[i] in SEPARATORS:
             i += 1
             continue
-        agent = inspect_at(tokens, i, depth)
-        if agent:
-            return agent
+        detected = inspect_at(tokens, i, depth)
+        if detected:
+            return detected
         # Advance to next shell command segment.
         while i < len(tokens) and tokens[i] not in SEPARATORS:
             i += 1
@@ -313,6 +313,6 @@ if [ -z "${CCC_AGENT_SHIM_UNDERLYING_PATH:-}" ]; then
     export CCC_AGENT_SHIM_UNDERLYING_PATH
 fi
 if [ "${invocation_class}" = "direct" ]; then
-    exec "${launcher}" run --serve "${agent}" --lifecycle foreground -- "${shell}" -c "${original_command}"
+    exec "${launcher}" serve "${agent}" --lifecycle foreground -- "${shell}" -c "${original_command}"
 fi
-exec "${launcher}" run --serve "${agent}" --lifecycle adaptive -- "${shell}" -c "${original_command}"
+exec "${launcher}" serve "${agent}" -- "${shell}" -c "${original_command}"

@@ -45,6 +45,9 @@ development/validation procedures.
 
 - [Development](development.md) — repository layout, test commands, static checks,
   runtime/FUSE validation, packaging checks, and contribution rules.
+- [User-facing acceptance testing](user-facing-acceptance-testing.md) — opt-in
+  real Codex/Claude/Hermes CLI, SSH, plugin, review, and desktop/server protocol
+  certification, including the deployment-agent fallback procedure.
 
 ## Documentation model
 

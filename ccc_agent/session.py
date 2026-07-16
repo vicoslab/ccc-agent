@@ -32,7 +32,7 @@ REMOTE_BRIDGE_SUFFIX = "-remote-bridge"
 
 
 def remote_agent_kind(agent_kind):
-    """Return the durable ``--serve`` label for an agent kind."""
+    """Return the durable ``ccc-agent serve`` label for an agent kind."""
     agent_kind = str(agent_kind)
     if agent_kind.endswith(REMOTE_BRIDGE_SUFFIX):
         return agent_kind[:-len("-bridge")]

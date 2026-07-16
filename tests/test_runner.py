@@ -1323,8 +1323,18 @@ raise SystemExit(proc.returncode)
 
     def test_bwrap_masks_nested_bwrap_for_remote_codex_label(self):
         seen = {}
-        runtime_bin = os.path.join(self.h.tmp, "remote-codex-bin")
+        launcher_bin = os.path.join(self.h.tmp, "remote-launcher-bin")
+        runtime_bin = os.path.join(self.h.tmp, "remote-codex-runtime-bin")
+        os.makedirs(launcher_bin)
         os.makedirs(runtime_bin)
+        runtime_codex = os.path.join(runtime_bin, "codex")
+        with open(runtime_codex, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(runtime_codex, 0o755)
+        launcher_codex = os.path.join(launcher_bin, "codex")
+        with open(launcher_codex, "w") as fh:
+            fh.write('#!/bin/sh\nexec %s "$@"\n' % runtime_codex)
+        os.chmod(launcher_codex, 0o755)
         target = os.path.join(runtime_bin, "bwrap")
         with open(target, "w") as fh:
             fh.write("#!/bin/sh\nexit 0\n")
@@ -1338,7 +1348,7 @@ raise SystemExit(proc.returncode)
             run_session(self._bwrap_config(
                 ["bash", "-c", "codex app-server"],
                 agent_kind="codex-remote", server_mode=True, per_turn=False),
-                env={"CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin})
+                env={"CCC_AGENT_SHIM_UNDERLYING_PATH": launcher_bin})
 
         triples = [tuple(seen["argv"][index:index + 3])
                    for index in range(len(seen["argv"]) - 2)]
