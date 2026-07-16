@@ -83,6 +83,33 @@ chain, exact checks, spoofing analysis, failure behavior, assumptions, and
 implementation map; [Agent integration](agent-integration.md#mcp-process-and-transport-admission)
 covers the user-facing integration.
 
+### Authenticated live workspace scopes
+
+Workspace scope is commit authority: a newly allowed root can make later changes
+auto-committable even without an explicit MCP commit call. Shell lifecycle hooks
+therefore do not authenticate additions. A hook path already beneath the static
+operator ceiling may refine that scope; any broader/new hook path is recorded as
+a proposal and leaves `allowed_scopes` unchanged. Hook removal can clean its own
+proposal or narrow a hook-owned sub-scope, but cannot remove static or
+authenticated roots.
+
+Dynamic roots come from complete replacement sets reported by authenticated
+client channels:
+
+- Claude uses MCP `roots/list` on the pinned hardened MCP connection;
+- direct Codex app-server launches are observed by the trusted foreground or
+  adaptive PID-1 JSONL proxy and applied only after matching successful server
+  responses; and
+- Hermes uses a persistent channel from the exact hardened initial process,
+  accepting framework workspace fields or the authoritative leading WebUI tag
+  only when `platform` is `api_server` (current Hermes) or `webui`.
+
+Trusted PID 1 hardens itself after exact-client registration. Every replacement
+revalidates the relevant runner/client/MCP connection and descriptor isolation,
+then validates all paths under protected BranchFS roots. Missing or spoofable
+signals narrow authority and leave changes for review. See the complete
+[trusted workspace-scope protocol](trusted-workspace-scope-protocol.md).
+
 ## Sandbox layout in `bwrap` mode
 
 `confinement: "bwrap"` is the real execution boundary. It uses rootless

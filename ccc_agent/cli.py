@@ -1072,15 +1072,14 @@ def main_run(argv=None, env=None, prog="ccc-agent run"):
             args.adaptive_detach_seconds
             if args.adaptive_detach_seconds is not None else
             config.get("adaptive_detach_seconds", 2.0)))
-    before_finalize = None
+    def server_before_finalize(session):
+        return _default_keep_before_finish(store, backend, alias_map, session)
+
     if server_mode:
-        before_finalize = lambda session: _default_keep_before_finish(
-            store, backend, alias_map, session)
-    if before_finalize is None:
-        session = run_session(runner_config, env=env)
-    else:
         session = run_session(runner_config, env=env,
-                              before_finalize=before_finalize)
+                              before_finalize=server_before_finalize)
+    else:
+        session = run_session(runner_config, env=env)
 
     if not server_mode:
         sys.stderr.write("ccc-agent: session %s finished: %s\n"
@@ -1417,6 +1416,11 @@ def _ctl_socket(args, env):
         _write_kept_review_prompt(resp, sys.stderr,
                                   details=getattr(args, "details", False))
         return 2
+    if verdict == "workspace-proposed":
+        workspace = resp.get("workspace") or "(unknown)"
+        sys.stdout.write("workspace proposed: %s\n" % workspace)
+        sys.stdout.write("not active commit scope; awaiting authenticated client roots\n")
+        return 0
     if verdict == VERDICT_WORKSPACE_UPDATED:
         _write_workspace_update(resp, sys.stdout)
         return 0
@@ -1662,10 +1666,10 @@ _CTL_COMMAND_HELP = {
                          "non-workspace paths"),
     "turn-review-kept": ("inside-session plugin op: ask about remembered "
                          "kept non-workspace paths"),
-    "turn-add-workspace": ("hook-only plugin op: add a session-owned dynamic "
-                           "workspace scope for turn commits"),
-    "turn-remove-workspace": ("hook-only plugin op: remove a session-owned "
-                              "dynamic workspace scope from turn commits"),
+    "turn-add-workspace": ("hook-only plugin op: propose a session workspace; "
+                           "activates automatically only inside the operator ceiling"),
+    "turn-remove-workspace": ("hook-only plugin op: remove its own proposal or "
+                              "narrow its hook-owned sub-scope"),
 }
 
 

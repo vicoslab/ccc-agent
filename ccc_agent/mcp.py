@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from urllib.parse import unquote, urlparse
 
 from .control import (ControlError, MCPControlClient,
                       peer_credentials as peer_credentials)
@@ -76,6 +77,9 @@ class MCPServer(object):
         self._elicitation_id = 0
         self.destructive_authorized = False
         self.authorization_reason = "MCP admission has not completed"
+        self._roots_id = 0
+        self._pending_roots_id = None
+        self._roots_refresh_pending = False
 
     def _write(self, message):
         self.writer.write(json.dumps(message, separators=(",", ":")) + "\n")
@@ -160,6 +164,69 @@ class MCPServer(object):
                              ", ".join(unknown))
         return sorted(set(requested))
 
+    def _supports_roots(self):
+        return isinstance(self.capabilities.get("roots"), dict)
+
+    def _request_roots(self):
+        if not self.destructive_authorized or not self._supports_roots():
+            return
+        if self._pending_roots_id is not None:
+            self._roots_refresh_pending = True
+            return
+        self._roots_id += 1
+        self._pending_roots_id = "ccc-roots-%d" % self._roots_id
+        self._write({"jsonrpc": "2.0", "id": self._pending_roots_id,
+                     "method": "roots/list", "params": {}})
+
+    def _roots_changed(self):
+        if not self.destructive_authorized or not self._supports_roots():
+            return
+        # The previous set is stale as soon as the trusted client announces a
+        # change. Revoke it before waiting for a replacement round trip.
+        self.control.confirm_workspace_roots([])
+        self._request_roots()
+
+    @staticmethod
+    def _root_paths(response):
+        result = response.get("result")
+        roots = result.get("roots") if isinstance(result, dict) else None
+        if not isinstance(roots, list):
+            raise ValueError("roots/list result must contain a roots array")
+        paths = []
+        for root in roots:
+            uri = root.get("uri") if isinstance(root, dict) else None
+            if not isinstance(uri, str):
+                continue
+            parsed = urlparse(uri)
+            if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+                continue
+            path = unquote(parsed.path)
+            if path.startswith("/"):
+                paths.append(path)
+        return sorted(set(paths))
+
+    def _handle_roots_response(self, response):
+        if response.get("id") != self._pending_roots_id:
+            return False
+        self._pending_roots_id = None
+        refresh = self._roots_refresh_pending
+        self._roots_refresh_pending = False
+        try:
+            if refresh:
+                # A change notification made this response stale while it was
+                # in flight; only the follow-up list may restore roots.
+                return True
+            if "error" not in response:
+                try:
+                    paths = self._root_paths(response)
+                except ValueError:
+                    return True
+                self.control.confirm_workspace_roots(paths)
+            return True
+        finally:
+            if refresh:
+                self._request_roots()
+
     def _call_tool(self, name, arguments):
         if name == "ccc_status":
             status = self.control.kept_status()
@@ -240,6 +307,10 @@ class MCPServer(object):
             })
             return
         if method == "notifications/initialized":
+            self._request_roots()
+            return
+        if method == "notifications/roots/list_changed":
+            self._roots_changed()
             return
         if not self.initialized:
             self._error(req_id, -32002, "server is not initialized")
@@ -278,6 +349,10 @@ class MCPServer(object):
                     self._error(None, -32700, "parse error")
                     continue
                 try:
+                    if (self._pending_roots_id is not None and
+                            "method" not in request and
+                            self._handle_roots_response(request)):
+                        continue
                     self.dispatch(request)
                 except ControlError as exc:
                     if request.get("id") is not None:

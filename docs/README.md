@@ -30,6 +30,10 @@ development/validation procedures.
   registration, process/connection pinning, transport hardening, human
   elicitation, supervisor commit signaling, spoofing defenses, and fail-closed
   behavior.
+- [Trusted workspace-scope protocol](trusted-workspace-scope-protocol.md) — why
+  workspace scope is commit authority, hook proposal limits, Claude MCP Roots,
+  Codex app-server observation, Hermes in-process signaling, replacement and
+  cleanup rules, and spoofing defenses.
 - [Design decisions](design-decisions.md) — why BranchFS, why rootless bwrap, why
   process-exit finalization remains authoritative, why hooks are best-effort, and
   other selected tradeoffs.

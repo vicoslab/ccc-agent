@@ -44,6 +44,10 @@ class FakeControl(object):
         self.calls.append(("abort",))
         return {"verdict": "abort-requested", "apply": "process-exit"}
 
+    def confirm_workspace_roots(self, paths):
+        self.calls.append(("confirm-workspace-roots", list(paths)))
+        return {"verdict": "workspace-updated", "confirmed": list(paths)}
+
     def close(self):
         pass
 
@@ -200,6 +204,140 @@ class TestMCPProtocol(unittest.TestCase):
         self.assertEqual(result["verdict"], "abort-requested")
         self.assertEqual(result["apply"], "process-exit")
 
+    def test_pinned_client_roots_confirm_workspace_without_human_prompt(self):
+        roots_response = json.dumps({
+            "jsonrpc": "2.0", "id": "ccc-roots-1",
+            "result": {"roots": [
+                {"uri": "file:///storage/user/Projects/new-project",
+                 "name": "new-project"},
+            ]},
+        }) + "\n"
+        output, control = self.run_server([
+            self.initialize({"roots": {"listChanged": True}}),
+            json.dumps({"jsonrpc": "2.0",
+                        "method": "notifications/initialized"}) + "\n",
+            roots_response,
+        ])
+
+        self.assertEqual(output[1]["method"], "roots/list")
+        self.assertEqual(output[1]["id"], "ccc-roots-1")
+        self.assertEqual(control.calls[-1],
+                         ("confirm-workspace-roots", [
+                             "/storage/user/Projects/new-project"]))
+        self.assertFalse(any(item.get("method") == "elicitation/create"
+                             for item in output))
+
+    def test_roots_change_notification_requeries_authoritative_client(self):
+        first = json.dumps({
+            "jsonrpc": "2.0", "id": "ccc-roots-1",
+            "result": {"roots": [{"uri": "file:///storage/user/Projects/a"}]},
+        }) + "\n"
+        second = json.dumps({
+            "jsonrpc": "2.0", "id": "ccc-roots-2",
+            "result": {"roots": [{"uri": "file:///storage/user/Projects/b"}]},
+        }) + "\n"
+        output, control = self.run_server([
+            self.initialize({"roots": {"listChanged": True}}),
+            json.dumps({"jsonrpc": "2.0",
+                        "method": "notifications/initialized"}) + "\n",
+            first,
+            json.dumps({"jsonrpc": "2.0",
+                        "method": "notifications/roots/list_changed"}) + "\n",
+            second,
+        ])
+
+        requests = [item for item in output if item.get("method") == "roots/list"]
+        self.assertEqual([item["id"] for item in requests],
+                         ["ccc-roots-1", "ccc-roots-2"])
+        confirmations = [call for call in control.calls
+                         if call[0] == "confirm-workspace-roots"]
+        self.assertEqual(confirmations, [
+            ("confirm-workspace-roots", ["/storage/user/Projects/a"]),
+            ("confirm-workspace-roots", []),
+            ("confirm-workspace-roots", ["/storage/user/Projects/b"]),
+        ])
+
+    def test_roots_change_while_request_pending_forces_followup_refresh(self):
+        first = json.dumps({
+            "jsonrpc": "2.0", "id": "ccc-roots-1",
+            "result": {"roots": [{"uri": "file:///storage/user/Projects/a"}]},
+        }) + "\n"
+        second = json.dumps({
+            "jsonrpc": "2.0", "id": "ccc-roots-2",
+            "result": {"roots": [{"uri": "file:///storage/user/Projects/b"}]},
+        }) + "\n"
+        changed = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/roots/list_changed",
+        }) + "\n"
+        output, control = self.run_server([
+            self.initialize({"roots": {"listChanged": True}}),
+            json.dumps({"jsonrpc": "2.0",
+                        "method": "notifications/initialized"}) + "\n",
+            changed,
+            first,
+            second,
+        ])
+
+        requests = [item for item in output if item.get("method") == "roots/list"]
+        self.assertEqual([item["id"] for item in requests],
+                         ["ccc-roots-1", "ccc-roots-2"])
+        confirmations = [call for call in control.calls
+                         if call[0] == "confirm-workspace-roots"]
+        self.assertEqual(confirmations, [
+            ("confirm-workspace-roots", []),
+            ("confirm-workspace-roots", ["/storage/user/Projects/b"]),
+        ])
+
+    def test_roots_reject_non_file_and_remote_file_uris(self):
+        roots_response = json.dumps({
+            "jsonrpc": "2.0", "id": "ccc-roots-1",
+            "result": {"roots": [
+                {"uri": "https://example.test/project"},
+                {"uri": "file://remote/storage/user/Projects/x"},
+                {"uri": "file:///storage/user/Projects/good%20name"},
+            ]},
+        }) + "\n"
+        _output, control = self.run_server([
+            self.initialize({"roots": {"listChanged": False}}),
+            json.dumps({"jsonrpc": "2.0",
+                        "method": "notifications/initialized"}) + "\n",
+            roots_response,
+        ])
+
+        self.assertEqual(control.calls[-1],
+                         ("confirm-workspace-roots", [
+                             "/storage/user/Projects/good name"]))
+
+    def test_unhardened_client_does_not_confirm_roots(self):
+        output, control = self.run_server([
+            self.initialize({"roots": {"listChanged": True}}),
+            json.dumps({"jsonrpc": "2.0",
+                        "method": "notifications/initialized"}) + "\n",
+        ], destructive_authorized=False)
+
+        self.assertEqual(len(output), 1)
+        self.assertFalse(any(call[0] == "confirm-workspace-roots"
+                             for call in control.calls))
+
+    def test_malformed_roots_response_is_ignored_without_killing_server(self):
+        malformed = json.dumps({
+            "jsonrpc": "2.0", "id": "ccc-roots-1",
+            "result": {"roots": "not-an-array"},
+        }) + "\n"
+        output, control = self.run_server([
+            self.initialize({"roots": {"listChanged": True}}),
+            json.dumps({"jsonrpc": "2.0",
+                        "method": "notifications/initialized"}) + "\n",
+            malformed,
+            rpc(9, "ping", {}),
+        ])
+
+        self.assertEqual(output[-1], {"jsonrpc": "2.0", "id": 9,
+                                      "result": {}})
+        self.assertFalse(any(call[0] == "confirm-workspace-roots"
+                             for call in control.calls))
+
 
 class TestMCPControlAdmission(unittest.TestCase):
     def test_so_peercred_is_used_and_ordinary_mutation_is_rejected(self):
@@ -209,7 +347,8 @@ class TestMCPControlAdmission(unittest.TestCase):
             server = ControlServer(path, lambda req: calls.append(req) or
                                    {"verdict": "ok"}, "token",
                                    expected_clients=("python",),
-                                   require_launch_boundary=False)
+                                   require_launch_boundary=False,
+                                   transport_revoke_grace=0)
             server.start()
             self.addCleanup(server.stop)
             client = MCPControlClient(path, "token")
@@ -219,6 +358,9 @@ class TestMCPControlAdmission(unittest.TestCase):
                 self.assertFalse(admitted["destructive_authorized"])
                 with self.assertRaisesRegex(Exception, "hardened client transport"):
                     client.resolve_turn("commit", ["/x"])
+                with self.assertRaisesRegex(Exception, "pinned hardened client"):
+                    client.confirm_workspace_roots(
+                        ["/storage/user/Projects/new"])
                 response = client.kept_status()
                 self.assertEqual(response["verdict"], "ok")
             finally:
@@ -233,7 +375,33 @@ class TestMCPControlAdmission(unittest.TestCase):
             raw.close()
             self.assertFalse(reply["ok"])
             self.assertIn("MCP", reply["error"])
-            self.assertEqual([req["op"] for req in calls], ["turn-kept-status"])
+            self.assertEqual([req["op"] for req in calls], [
+                "turn-kept-status", "turn-confirm-workspace-roots"])
+            self.assertEqual(calls[-1]["paths"], [])
+
+    def test_raw_control_token_cannot_confirm_workspace_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "control.sock")
+            calls = []
+            server = ControlServer(path, lambda req: calls.append(req) or
+                                   {"verdict": "workspace-updated"}, "token")
+            server.start()
+            self.addCleanup(server.stop)
+            raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                raw.connect(path)
+                raw.sendall((json.dumps({
+                    "version": 1, "token": "token",
+                    "op": "turn-confirm-workspace-roots",
+                    "paths": ["/storage/user"],
+                }) + "\n").encode())
+                reply = json.loads(raw.makefile("r").readline())
+            finally:
+                raw.close()
+
+        self.assertFalse(reply["ok"])
+        self.assertIn("pinned hardened client", reply["error"])
+        self.assertEqual(calls, [])
 
     def test_hardened_parent_and_mcp_child_receive_destructive_capability(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,6 +503,110 @@ raise SystemExit(proc.returncode)
 
         self.assertTrue(response["registered"])
         self.assertEqual(server._registered_client_fingerprint, (20, 2))
+        self.assertEqual(server._registered_runner_fingerprint, (50, 6))
+
+    def test_only_hardened_registered_client_can_open_workspace_channel(self):
+        server = ControlServer("/unused", lambda req: {}, "token",
+                               expected_clients=("hermes",),
+                               require_launch_boundary=False)
+        server._registered_client_fingerprint = (20, 2)
+        identities = {
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["hermes"], "exe": "/usr/bin/hermes"},
+            30: {"pid": 30, "ppid": 20, "start_time": 3,
+                 "argv": ["python"], "exe": "/usr/bin/python"},
+        }
+        with mock.patch.object(control_mod, "_proc_identity",
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  return_value=True):
+            self.assertEqual(server._eligible_workspace_peer(20), (20, 2))
+            self.assertIsNone(server._eligible_workspace_peer(30))
+        with mock.patch.object(control_mod, "_proc_identity",
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  return_value=False):
+            self.assertIsNone(server._eligible_workspace_peer(20))
+
+    def test_lost_pinned_transport_revokes_roots_only_while_client_is_live(self):
+        calls = []
+        server = ControlServer("/unused", lambda req: calls.append(req) or {},
+                               "token", transport_revoke_grace=0)
+        mcp_conn = object()
+        server._mcp_conn = mcp_conn
+        server._mcp_fingerprint = (20, 2, 10, 1)
+        with mock.patch.object(control_mod, "_proc_identity",
+                               return_value={"pid": 10, "start_time": 1}):
+            server._release_pinned_connection(mcp_conn)
+
+        self.assertIsNone(server._mcp_conn)
+        self.assertEqual(calls, [{
+            "op": "turn-confirm-workspace-roots", "paths": [],
+            "source": "trusted-transport-closed",
+        }])
+
+        calls[:] = []
+        workspace_conn = object()
+        server._workspace_conn = workspace_conn
+        server._workspace_fingerprint = (30, 3)
+        with mock.patch.object(control_mod, "_proc_identity", return_value=None):
+            server._release_pinned_connection(workspace_conn)
+        self.assertEqual(calls, [])
+
+    def test_privileged_connections_revalidate_live_launch_boundary(self):
+        server = ControlServer("/unused", lambda req: {}, "token")
+        server._launch_pid = 100
+        server._launch_start_time = 1
+        server._launch_supported = True
+        conn = object()
+        server._mcp_conn = conn
+        server._mcp_fingerprint = (30, 3, 20, 2)
+        identities = {
+            30: {"pid": 30, "ppid": 20, "start_time": 3},
+            20: {"pid": 20, "ppid": 50, "start_time": 2},
+            100: {"pid": 100, "ppid": 1, "start_time": 1},
+        }
+        with mock.patch.object(control_mod, "_proc_identity",
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  return_value=True), \
+                mock.patch.object(control_mod, "_is_descendant",
+                                  return_value=True):
+            self.assertTrue(server._mcp_connection_valid(conn))
+        identities[100]["start_time"] = 99
+        with mock.patch.object(control_mod, "_proc_identity",
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  return_value=True), \
+                mock.patch.object(control_mod, "_is_descendant",
+                                  return_value=True):
+            self.assertFalse(server._mcp_connection_valid(conn))
+
+    def test_trusted_runner_workspace_channel_requires_hidden_runner_and_client(self):
+        server = ControlServer("/unused", lambda req: {}, "token",
+                               require_launch_boundary=False)
+        server._registered_runner_fingerprint = (50, 6)
+        server._registered_client_fingerprint = (20, 2)
+        identities = {
+            50: {"pid": 50, "ppid": 100, "start_time": 6,
+                 "argv": ["ccc-agent-runner"], "exe": "/usr/bin/python"},
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["codex"], "exe": "/usr/bin/codex"},
+        }
+        with mock.patch.object(control_mod, "peer_credentials",
+                               return_value=(50, os.geteuid(), os.getegid())), \
+                mock.patch.object(control_mod, "_proc_identity",
+                                  side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  side_effect=lambda pid: pid == 50):
+            self.assertFalse(server._runner_connection_valid(object()))
+        with mock.patch.object(control_mod, "peer_credentials",
+                               return_value=(50, os.geteuid(), os.getegid())), \
+                mock.patch.object(control_mod, "_proc_identity",
+                                  side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  return_value=True):
+            self.assertTrue(server._runner_connection_valid(object()))
 
     def test_process_lineage_without_hidden_proc_fds_is_read_only(self):
         server = ControlServer("/unused", lambda req: {}, "token",

@@ -16,10 +16,121 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 
+PR_SET_DUMPABLE = 4
 PR_SET_CHILD_SUBREAPER = 36
+
+
+def _control_request(payload):
+    path = os.environ.get("CCC_AGENT_CONTROL_SOCK")
+    token = os.environ.get("CCC_AGENT_CONTROL_TOKEN")
+    if not path or not token:
+        raise RuntimeError("missing CCC control registration environment")
+    request = dict(payload, token=token)
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(5.0)
+        conn.connect(path)
+        data = (json.dumps(request, separators=(",", ":")) + "\n").encode()
+        conn.sendall(data)
+        response = b""
+        while b"\n" not in response and len(response) <= 65536:
+            block = conn.recv(4096)
+            if not block:
+                break
+            response += block
+        result = json.loads(response.split(b"\n", 1)[0].decode())
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "control request rejected")
+        return result
+    finally:
+        conn.close()
+
+
+def _register_initial_client(pid):
+    if os.environ.get("CCC_AGENT_MCP_REGISTER_CLIENT") != "1":
+        return False
+    _control_request({"op": "mcp-register-client", "pid": int(pid)})
+    return True
+
+
+def _harden_runner_transport():
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def _confirm_runner_workspace(paths):
+    if isinstance(paths, str):
+        paths = [paths]
+    if (not isinstance(paths, list) or
+            any(not isinstance(path, str) or not os.path.isabs(path)
+                for path in paths)):
+        raise ValueError("workspace roots must be absolute paths")
+    return _control_request({"op": "turn-confirm-workspace-roots",
+                             "paths": paths})
+
+
+def _client_environment():
+    preload = os.environ.pop("CCC_AGENT_CLIENT_PRELOAD", None)
+    if not preload:
+        return None
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = preload
+    env["CCC_AGENT_HARDEN_CLIENT"] = "1"
+    return env
+
+
+def _is_codex_app_server(command):
+    return bool(command and os.path.basename(command[0]) == "codex" and
+                "app-server" in command[1:])
+
+
+class _CodexOutputObserver(object):
+    def __init__(self, monitor, confirm):
+        self.monitor = monitor
+        self.confirm = confirm
+        self.buffer = bytearray()
+
+    def feed(self, name, data):
+        if name != "stdout":
+            return
+        self.buffer.extend(data)
+        while b"\n" in self.buffer:
+            line, _, remainder = self.buffer.partition(b"\n")
+            self.buffer[:] = remainder
+            if not line:
+                continue
+            try:
+                roots = self.monitor.observe_server(json.loads(line))
+                if roots is not None:
+                    self.confirm(roots)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                sys.stderr.write(
+                    "ccc-agent adaptive runner: Codex workspace observation "
+                    "failed: %s\n" % exc)
+
+
+def _forward_codex_input(child_stdin, monitor):
+    try:
+        for line in sys.stdin.buffer:
+            try:
+                monitor.observe_client(json.loads(line))
+            except (TypeError, ValueError):
+                pass
+            child_stdin.write(line)
+            child_stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        try:
+            child_stdin.close()
+        except OSError:
+            pass
 
 
 def _float_env(name, default):
@@ -96,7 +207,7 @@ def _write_all(fd, data):
         view = view[written:]
 
 
-def _read_streams(selector, eof, timeout):
+def _read_streams(selector, eof, timeout, observer=None):
     for key, _mask in selector.select(timeout):
         name, output_fd = key.data
         try:
@@ -104,6 +215,8 @@ def _read_streams(selector, eof, timeout):
         except BlockingIOError:
             continue
         if data:
+            if observer is not None:
+                observer.feed(name, data)
             _write_all(output_fd, data)
             continue
         eof[name] = True
@@ -181,12 +294,12 @@ def _terminate_descendants(grace=0.1):
         time.sleep(0.005)
 
 
-def _drain_ready(selector, eof):
+def _drain_ready(selector, eof, observer=None):
     # Drain bytes already available without waiting on descendants that retain a
     # stream. This preserves normal command output before namespace teardown.
     while selector.get_map():
         before = len(selector.get_map())
-        _read_streams(selector, eof, 0)
+        _read_streams(selector, eof, 0, observer=observer)
         if len(selector.get_map()) == before:
             break
 
@@ -203,18 +316,47 @@ def run(command, channel, bootstrap, stability, detach):
     _set_signal(signal.SIGHUP, request_stop)
     _enable_subreaper_for_tests_and_non_pid1_runs()
 
+    is_codex_app_server = _is_codex_app_server(command)
+    client_env = _client_environment()
     try:
         child = subprocess.Popen(
             command,
-            stdin=None,
+            stdin=subprocess.PIPE if is_codex_app_server else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             preexec_fn=_restore_child_signals,
+            env=client_env,
         )
     except OSError as exc:
         channel.send("failed", status=(127 if exc.errno == errno.ENOENT else 126),
                      detail=str(exc))
         return 127 if exc.errno == errno.ENOENT else 126
+
+    trusted_runner = False
+    try:
+        if _register_initial_client(child.pid):
+            _harden_runner_transport()
+            trusted_runner = True
+            if os.environ.get("CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE") == "1":
+                _confirm_runner_workspace(os.getcwd())
+    except Exception as exc:
+        sys.stderr.write(
+            "ccc-agent adaptive runner: initial client/workspace registration "
+            "unavailable: %s\n" % exc)
+
+    observer = None
+    if is_codex_app_server:
+        from codex_workspace import CodexWorkspaceMonitor
+        launch_cwd = (os.getcwd() if
+                      os.environ.get("CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE") == "1"
+                      else None)
+        monitor = CodexWorkspaceMonitor(launch_cwd)
+        confirm = (_confirm_runner_workspace if trusted_runner else
+                   (lambda _paths: None))
+        observer = _CodexOutputObserver(monitor, confirm)
+        input_thread = threading.Thread(
+            target=_forward_codex_input, args=(child.stdin, monitor), daemon=True)
+        input_thread.start()
 
     selector = selectors.DefaultSelector()
     eof = {"stdout": False, "stderr": False}
@@ -235,7 +377,7 @@ def run(command, channel, bootstrap, stability, detach):
 
     while True:
         now = time.monotonic()
-        _read_streams(selector, eof, 0.01)
+        _read_streams(selector, eof, 0.01, observer=observer)
 
         if stop_signal[0] is not None:
             channel.send("stopping", signal=stop_signal[0])
@@ -254,13 +396,13 @@ def run(command, channel, bootstrap, stability, detach):
             continue
 
         if foreground_locked:
-            _drain_ready(selector, eof)
+            _drain_ready(selector, eof, observer=observer)
             _terminate_descendants()
             channel.send("foreground-exited", status=child_status)
             return child_status
 
         if child_status != 0:
-            _drain_ready(selector, eof)
+            _drain_ready(selector, eof, observer=observer)
             _terminate_descendants()
             channel.send("failed", status=child_status)
             return child_status
@@ -271,7 +413,7 @@ def run(command, channel, bootstrap, stability, detach):
             # long timeout before reporting ordinary one-shot completion.
             drain_deadline = time.monotonic() + 0.2
             while selector.get_map() and time.monotonic() < drain_deadline:
-                _read_streams(selector, eof, 0.01)
+                _read_streams(selector, eof, 0.01, observer=observer)
             channel.send("service-exited" if handoff else "one-shot", status=0)
             return 0
 

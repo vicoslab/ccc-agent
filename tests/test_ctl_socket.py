@@ -111,6 +111,24 @@ class TestCtlSocket(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertIn("hook-only", err)
 
+    def test_hook_workspace_outside_ceiling_is_reported_as_untrusted_proposal(self):
+        self._serve(self._record({
+            "verdict": "workspace-proposed", "action": "propose",
+            "workspace": "/storage/user", "workspaces": [],
+            "allowed_scopes": [], "proposed": True,
+        }), hook_token="hook-tok")
+        env = self._env()
+        env["CCC_AGENT_HOOK_TOKEN"] = "hook-tok"
+
+        code, out, _err = self._run([
+            "turn-add-workspace", "--agent-session", "forged-session",
+            "/storage/user",
+        ], env)
+
+        self.assertEqual(code, 0)
+        self.assertIn("workspace proposed", out)
+        self.assertIn("not active commit scope", out)
+
     def test_no_socket_degrades_to_zero(self):
         # outside a contained session (no control env): never block the stop
         code, _out, err = self._run(["turn-finalize"], {})

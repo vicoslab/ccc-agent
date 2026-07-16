@@ -1,8 +1,9 @@
 """Authenticated per-turn control channel between hooks/MCP and supervisor.
 
-Lifecycle hooks retain their existing short-lived requests.  Mutating agent
-requests (turn-approve/turn-resolve) are accepted only on the one persistent MCP
-connection admitted with Linux SO_PEERCRED and process ancestry checks.
+Lifecycle hooks retain short-lived finalize and workspace proposal/cleanup
+requests. Mutating agent decisions and authenticated workspace replacements are
+accepted only on process-pinned channels admitted with Linux `SO_PEERCRED`, live
+launch ancestry, exact process identities, and descriptor-isolation checks.
 """
 
 import json
@@ -25,6 +26,7 @@ VERDICT_WORKSPACE_UPDATED = "workspace-updated"
 WORKSPACE_HOOK_OPS = frozenset(("turn-add-workspace", "turn-remove-workspace"))
 MCP_ONLY_OPS = frozenset(("turn-approve", "turn-resolve",
                           "turn-request-abort"))
+WORKSPACE_CONFIRM_OP = "turn-confirm-workspace-roots"
 
 
 class ControlError(Exception):
@@ -158,7 +160,7 @@ class ControlServer(object):
 
     def __init__(self, socket_path, handler, token, hook_token=None,
                  expected_clients=(), require_launch_boundary=True,
-                 enforce_mcp_admission=True):
+                 enforce_mcp_admission=True, transport_revoke_grace=0.25):
         self.socket_path = socket_path
         self.handler = handler
         self.token = token
@@ -167,6 +169,7 @@ class ControlServer(object):
                                       for name in expected_clients if name)
         self.require_launch_boundary = bool(require_launch_boundary)
         self.enforce_mcp_admission = bool(enforce_mcp_admission)
+        self.transport_revoke_grace = max(0.0, float(transport_revoke_grace))
         self._sock = None
         self._thread = None
         self._stop = threading.Event()
@@ -175,9 +178,12 @@ class ControlServer(object):
         self._launch_supported = False
         self._launch_ready = threading.Condition()
         self._registered_client_fingerprint = None
+        self._registered_runner_fingerprint = None
         self._mcp_fingerprint = None
         self._mcp_conn = None
         self._mcp_destructive_authorized = False
+        self._workspace_fingerprint = None
+        self._workspace_conn = None
         self._admission_lock = threading.Lock()
 
     def start(self):
@@ -256,6 +262,8 @@ class ControlServer(object):
                     self._registered_client_fingerprint != fingerprint):
                 return {"ok": False, "error": "initial client is already registered"}
             self._registered_client_fingerprint = fingerprint
+            self._registered_runner_fingerprint = (
+                runner["pid"], runner["start_time"])
             self._launch_ready.notify_all()
         return {"ok": True, "registered": True}
 
@@ -274,7 +282,8 @@ class ControlServer(object):
                 return None
             client = _proc_identity(registered[0])
             if (client is None or client["start_time"] != registered[1] or
-                    peer["ppid"] != client["pid"]):
+                    peer["ppid"] != client["pid"] or
+                    not self._launch_boundary_valid(client["pid"])):
                 return None
         else:
             parent = _proc_identity(peer["ppid"])
@@ -294,6 +303,87 @@ class ControlServer(object):
             "authorization_reason": (None if hardened else
                                      "trusted client/MCP descriptor access is not hidden"),
         }
+
+    def _launch_boundary_valid(self, descendant_pid):
+        if not self.require_launch_boundary:
+            return True
+        with self._launch_ready:
+            launch_pid = self._launch_pid
+            launch_start = self._launch_start_time
+            launch_supported = self._launch_supported
+        if not launch_supported or launch_pid is None or launch_start is None:
+            return False
+        launch = _proc_identity(launch_pid)
+        return bool(launch and launch["start_time"] == launch_start and
+                    _is_descendant(descendant_pid, launch_pid))
+
+    def _runner_connection_valid(self, conn):
+        try:
+            pid, uid, _gid = peer_credentials(conn)
+        except ControlError:
+            return False
+        with self._launch_ready:
+            runner_fingerprint = self._registered_runner_fingerprint
+            client_fingerprint = self._registered_client_fingerprint
+        runner = _proc_identity(pid)
+        client = (_proc_identity(client_fingerprint[0])
+                  if client_fingerprint else None)
+        return bool(
+            uid == os.geteuid() and runner_fingerprint and client_fingerprint and
+            runner and client and pid == runner_fingerprint[0] and
+            runner["start_time"] == runner_fingerprint[1] and
+            client["start_time"] == client_fingerprint[1] and
+            client["ppid"] == runner["pid"] and
+            self._launch_boundary_valid(runner["pid"]) and
+            _proc_fds_hidden(runner["pid"]) and
+            _proc_fds_hidden(client["pid"]))
+
+    def _eligible_workspace_peer(self, peer_pid):
+        peer = _proc_identity(peer_pid)
+        with self._launch_ready:
+            registered = self._registered_client_fingerprint
+        if peer is None or registered is None:
+            return None
+        if peer["pid"] != registered[0] or peer["start_time"] != registered[1]:
+            return None
+        if not self._launch_boundary_valid(peer["pid"]):
+            return None
+        if not _proc_fds_hidden(peer["pid"]):
+            return None
+        return (peer["pid"], peer["start_time"])
+
+    def _admit_workspace_client(self, conn, client_name):
+        if str(client_name) != "hermes" or "hermes" not in self.expected_clients:
+            return {"ok": False,
+                    "error": "direct workspace channel is reserved for Hermes"}
+        try:
+            pid, uid, _gid = peer_credentials(conn)
+        except ControlError as exc:
+            return {"ok": False, "error": str(exc)}
+        if uid != os.geteuid():
+            return {"ok": False, "error": "workspace peer uid is not trusted"}
+        fingerprint = self._eligible_workspace_peer(pid)
+        if fingerprint is None:
+            return {"ok": False,
+                    "error": "workspace peer is not the hardened initial client"}
+        with self._admission_lock:
+            if self._workspace_fingerprint is not None:
+                return {"ok": False,
+                        "error": "a workspace client is already pinned"}
+            self._workspace_fingerprint = fingerprint
+            self._workspace_conn = conn
+        return {"ok": True, "admitted": True}
+
+    def _workspace_connection_valid(self, conn):
+        with self._admission_lock:
+            fingerprint = self._workspace_fingerprint
+            pinned = self._workspace_conn is conn
+        if not pinned or fingerprint is None:
+            return False
+        peer = _proc_identity(fingerprint[0])
+        return bool(peer and peer["start_time"] == fingerprint[1] and
+                    self._launch_boundary_valid(peer["pid"]) and
+                    _proc_fds_hidden(peer["pid"]))
 
     def _admit_mcp(self, conn):
         try:
@@ -330,13 +420,54 @@ class ControlServer(object):
         identity_valid = bool(
             peer and client and peer["start_time"] == peer_start and
             client["start_time"] == client_start and
-            (peer_pid == client_pid or peer["ppid"] == client_pid))
+            (peer_pid == client_pid or peer["ppid"] == client_pid) and
+            self._launch_boundary_valid(client_pid))
         if not identity_valid:
             return False
         if self._mcp_destructive_authorized:
             return (_proc_fds_hidden(peer_pid) and
                     _proc_fds_hidden(client_pid))
         return True
+
+    def _release_pinned_connection(self, conn):
+        """Revoke dynamic roots if trusted transport dies before its client."""
+        client_fingerprint = None
+        with self._admission_lock:
+            if self._mcp_conn is conn:
+                if self._mcp_fingerprint is not None:
+                    client_fingerprint = (self._mcp_fingerprint[2],
+                                          self._mcp_fingerprint[3])
+                self._mcp_conn = None
+            if self._workspace_conn is conn:
+                client_fingerprint = self._workspace_fingerprint
+                self._workspace_conn = None
+        if client_fingerprint is None:
+            return
+        if self.transport_revoke_grace <= 0:
+            self._revoke_roots_if_client_live(client_fingerprint)
+            return
+        threading.Thread(
+            target=self._revoke_roots_after_grace,
+            args=(client_fingerprint,), daemon=True).start()
+
+    def _revoke_roots_after_grace(self, client_fingerprint):
+        if self._stop.wait(self.transport_revoke_grace):
+            return
+        self._revoke_roots_if_client_live(client_fingerprint)
+
+    def _revoke_roots_if_client_live(self, client_fingerprint):
+        client = _proc_identity(client_fingerprint[0])
+        if not client or client["start_time"] != client_fingerprint[1]:
+            # Normal client/PID-1 teardown has already ended agent authority;
+            # preserve the last valid roots for immediate finalization.
+            return
+        try:
+            self.handler({"op": WORKSPACE_CONFIRM_OP, "paths": [],
+                          "source": "trusted-transport-closed"})
+        except Exception:
+            # Connection teardown must not kill the control server. A later
+            # trusted replacement/reset still fails closed.
+            pass
 
     def _handle_conn(self, conn):
         try:
@@ -361,6 +492,24 @@ class ControlServer(object):
                     if not resp.get("ok"):
                         return
                     continue
+                if req.get("op") == "workspace-admit":
+                    resp = self._admit_workspace_client(conn, req.get("client"))
+                    _send_line(conn, resp)
+                    if not resp.get("ok"):
+                        return
+                    continue
+                if req.get("op") == WORKSPACE_CONFIRM_OP:
+                    trusted_workspace = (
+                        (self._mcp_connection_valid(conn) and
+                         self._mcp_destructive_authorized) or
+                        self._workspace_connection_valid(conn) or
+                        self._runner_connection_valid(conn))
+                    if not trusted_workspace:
+                        _send_line(conn, {"ok": False,
+                                          "error": "workspace confirmation requires a pinned hardened client or trusted PID 1"})
+                        if self._mcp_conn is conn or self._workspace_conn is conn:
+                            continue
+                        return
                 if (req.get("op") in MCP_ONLY_OPS and
                         self.enforce_mcp_admission and
                         not self._mcp_connection_valid(conn)):
@@ -369,7 +518,8 @@ class ControlServer(object):
                     return
                 if (req.get("op") in MCP_ONLY_OPS and
                         self.enforce_mcp_admission and
-                        (req.get("op") == "turn-request-abort" or
+                        (req.get("op") in ("turn-request-abort",
+                                            "turn-confirm-workspace-roots") or
                          req.get("decision") in ("commit", "discard", "revert",
                                                  "yes", "select")) and
                         not self._mcp_destructive_authorized):
@@ -379,6 +529,11 @@ class ControlServer(object):
                 if self._mcp_conn is conn and not self._mcp_connection_valid(conn):
                     _send_line(conn, {"ok": False,
                                       "error": "pinned MCP process identity changed"})
+                    return
+                if (self._workspace_conn is conn and
+                        not self._workspace_connection_valid(conn)):
+                    _send_line(conn, {"ok": False,
+                                      "error": "pinned workspace client identity changed"})
                     return
                 if req.get("op") in WORKSPACE_HOOK_OPS:
                     if not self.hook_token or req.get("hook_token") != self.hook_token:
@@ -395,11 +550,12 @@ class ControlServer(object):
                     resp = {"ok": False, "error": "%s: %s"
                             % (type(exc).__name__, exc)}
                 _send_line(conn, resp)
-                if self._mcp_conn is not conn:
+                if self._mcp_conn is not conn and self._workspace_conn is not conn:
                     return
         except OSError:
             pass
         finally:
+            self._release_pinned_connection(conn)
             try:
                 conn.close()
             except OSError:
@@ -524,6 +680,13 @@ class MCPControlClient(ControlClient):
     def request_abort(self):
         return self._request({"op": "turn-request-abort"})
 
+    def confirm_workspace_roots(self, paths):
+        return self._request({"op": "turn-confirm-workspace-roots",
+                              "paths": list(paths)})
+
+    def workspace_proposal_status(self):
+        return self._request({"op": "turn-workspace-proposal-status"})
+
     def close(self):
         try:
             self._reader.close()
@@ -533,3 +696,10 @@ class MCPControlClient(ControlClient):
             self._sock.close()
         except OSError:
             pass
+
+
+class WorkspaceControlClient(MCPControlClient):
+    """Persistent process-pinned channel for an in-process client plugin."""
+
+    def admit(self, client):
+        return self._request({"op": "workspace-admit", "client": str(client)})

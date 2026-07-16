@@ -54,6 +54,7 @@ ENV_STABILITY_SECONDS = "CCC_AGENT_STABILITY_SECONDS"
 ENV_DETACH_SECONDS = "CCC_AGENT_DETACH_SECONDS"
 ENV_HARDEN_CLIENT = "CCC_AGENT_HARDEN_CLIENT"
 ENV_MCP_REGISTER_CLIENT = "CCC_AGENT_MCP_REGISTER_CLIENT"
+ENV_CONFIRM_LAUNCH_WORKSPACE = "CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE"
 ENV_CLIENT_PRELOAD = "CCC_AGENT_CLIENT_PRELOAD"
 
 # Values from an enclosing/stale ccc-agent session must never become authority in
@@ -65,7 +66,8 @@ TRANSIENT_INTERNAL_ENV = (
     ENV_SESSION, ENV_STATE_DIR, ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN,
     ENV_HOOK_TOKEN, ENV_HOOK_SESSION, ENV_LIFECYCLE_SOCKET,
     ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
-    ENV_HARDEN_CLIENT, ENV_MCP_REGISTER_CLIENT, ENV_CLIENT_PRELOAD,
+    ENV_HARDEN_CLIENT, ENV_MCP_REGISTER_CLIENT,
+    ENV_CONFIRM_LAUNCH_WORKSPACE, ENV_CLIENT_PRELOAD,
 )
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -77,6 +79,7 @@ BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/b
 SANDBOX_CONTROL_SOCK = "/tmp/ccc-agent/control.sock"
 SANDBOX_LIFECYCLE_SOCK = "/tmp/ccc-agent/lifecycle.sock"
 SANDBOX_ADAPTIVE_RUNNER = "/tmp/ccc-agent/adaptive_pid1.py"
+SANDBOX_CODEX_WORKSPACE = "/tmp/ccc-agent/codex_workspace.py"
 SANDBOX_SESSION_ENV = "/tmp/ccc-agent/session-env.json"
 SANDBOX_HARDENING_LIBRARY = "/opt/ccc-agent/libccc-client-hardening.so"
 
@@ -90,6 +93,7 @@ SANDBOX_HARDENING_LIBRARY = "/opt/ccc-agent/libccc-client-hardening.so"
 # down any remaining processes in that PID namespace.
 BWRAP_AGENT_RUNNER_ARG0 = "ccc-agent-runner"
 BWRAP_AGENT_RUNNER = r"""
+import ctypes
 import errno
 import json
 import os
@@ -97,6 +101,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 
 command = sys.argv[2:]
 if not command:
@@ -125,7 +130,7 @@ def restore_child_signals():
 
 def register_initial_client(pid):
     if os.environ.get("CCC_AGENT_MCP_REGISTER_CLIENT") != "1":
-        return
+        return False
     path = os.environ.get("CCC_AGENT_CONTROL_SOCK")
     token = os.environ.get("CCC_AGENT_CONTROL_TOKEN")
     if not path or not token:
@@ -148,6 +153,43 @@ def register_initial_client(pid):
             raise RuntimeError(response.get("error") or "registration rejected")
     finally:
         conn.close()
+    return True
+
+
+def harden_runner_transport():
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def confirm_runner_workspace(paths):
+    control_path = os.environ.get("CCC_AGENT_CONTROL_SOCK")
+    token = os.environ.get("CCC_AGENT_CONTROL_TOKEN")
+    if isinstance(paths, str):
+        paths = [paths]
+    if (not control_path or not token or not isinstance(paths, list) or
+            any(not isinstance(path, str) or not os.path.isabs(path)
+                for path in paths)):
+        raise RuntimeError("workspace roots/control environment are invalid")
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(5.0)
+        conn.connect(control_path)
+        request = {"op": "turn-confirm-workspace-roots", "token": token,
+                   "paths": paths}
+        conn.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+        data = b""
+        while b"\n" not in data and len(data) <= 65536:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        response = json.loads(data.split(b"\n", 1)[0].decode())
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error") or "workspace rejected")
+    finally:
+        conn.close()
 
 
 client_env = None
@@ -158,18 +200,27 @@ if client_preload:
     client_env["CCC_AGENT_HARDEN_CLIENT"] = "1"
 
 
+is_codex_app_server = (os.path.basename(command[0]) == "codex" and
+                       "app-server" in command[1:])
 try:
-    child = subprocess.Popen(command, preexec_fn=restore_child_signals,
-                             env=client_env)
+    child = subprocess.Popen(
+        command, preexec_fn=restore_child_signals, env=client_env,
+        stdin=subprocess.PIPE if is_codex_app_server else None,
+        stdout=subprocess.PIPE if is_codex_app_server else None)
 except OSError as exc:
     print("ccc-agent-runner: failed to exec %s: %s" % (command[0], exc),
           file=sys.stderr)
     sys.exit(127 if exc.errno == errno.ENOENT else 126)
 
+trusted_runner = False
 try:
-    register_initial_client(child.pid)
+    if register_initial_client(child.pid):
+        harden_runner_transport()
+        trusted_runner = True
+        if os.environ.get("CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE") == "1":
+            confirm_runner_workspace(os.getcwd())
 except Exception as exc:
-    print("ccc-agent-runner: initial MCP client registration unavailable: %s" % exc,
+    print("ccc-agent-runner: initial client/workspace registration unavailable: %s" % exc,
           file=sys.stderr)
 
 
@@ -182,6 +233,51 @@ def forward_signal(sig, _frame):
 
 set_signal(signal.SIGTERM, forward_signal)
 set_signal(signal.SIGHUP, forward_signal)
+
+if is_codex_app_server:
+    from ccc_agent.codex_workspace import CodexWorkspaceMonitor
+    launch_cwd = (os.getcwd() if
+                  os.environ.get("CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE") == "1"
+                  else None)
+    monitor = CodexWorkspaceMonitor(launch_cwd)
+
+    def forward_app_server_input():
+        try:
+            for line in sys.stdin.buffer:
+                try:
+                    monitor.observe_client(json.loads(line))
+                except (TypeError, ValueError):
+                    pass
+                child.stdin.write(line)
+                child.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                child.stdin.close()
+            except OSError:
+                pass
+
+    input_thread = threading.Thread(target=forward_app_server_input,
+                                    daemon=True)
+    input_thread.start()
+    try:
+        for line in child.stdout:
+            try:
+                roots = monitor.observe_server(json.loads(line))
+                if trusted_runner and roots is not None:
+                    confirm_runner_workspace(roots)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                print("ccc-agent-runner: Codex workspace observation failed: %s" % exc,
+                      file=sys.stderr)
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+    finally:
+        try:
+            child.stdout.close()
+        except OSError:
+            pass
+
 returncode = child.wait()
 if returncode < 0:
     returncode = 128 - returncode
@@ -710,8 +806,8 @@ def _mcp_admission_config(config):
     direct = (_agent_token(config.agent_command[0])
               if config.agent_command else "")
     kind = _agent_token(config.agent_kind).split("-", 1)[0]
-    recognized = direct if direct in ("claude", "codex") else (
-        kind if kind in ("claude", "codex") else "")
+    recognized = direct if direct in ("claude", "codex", "hermes") else (
+        kind if kind in ("claude", "codex", "hermes") else "")
     supported = bool(recognized and direct == recognized and
                      config.confinement == "bwrap")
     return ((recognized or "__unsupported_ccc_mcp_client__",), supported)
@@ -1112,6 +1208,8 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
     _expected_mcp, direct_mcp_client = _mcp_admission_config(config)
     if direct_mcp_client:
         argv += ["--setenv", ENV_MCP_REGISTER_CLIENT, "1"]
+        if config.workspace:
+            argv += ["--setenv", ENV_CONFIRM_LAUNCH_WORKSPACE, "1"]
 
     hardening_library = _mcp_client_hardening(config)
     if hardening_library is not None:
@@ -1126,10 +1224,12 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
         host_sock, token, hook_token = control
         argv += ["--bind", host_sock, SANDBOX_CONTROL_SOCK]
     if lifecycle_socket is not None:
-        adaptive_runner = os.path.join(os.path.dirname(__file__),
-                                       "adaptive_pid1.py")
+        module_dir = os.path.dirname(__file__)
+        adaptive_runner = os.path.join(module_dir, "adaptive_pid1.py")
+        codex_workspace = os.path.join(module_dir, "codex_workspace.py")
         argv += ["--bind", lifecycle_socket, SANDBOX_LIFECYCLE_SOCK,
-                 "--ro-bind", adaptive_runner, SANDBOX_ADAPTIVE_RUNNER]
+                 "--ro-bind", adaptive_runner, SANDBOX_ADAPTIVE_RUNNER,
+                 "--ro-bind", codex_workspace, SANDBOX_CODEX_WORKSPACE]
     if session_env_path is not None:
         argv += ["--ro-bind", session_env_path, SANDBOX_SESSION_ENV]
 

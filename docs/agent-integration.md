@@ -271,34 +271,52 @@ itself is not compromised and that the attacker cannot escape containment,
 replace root-owned runtime assets, or obtain privilege that bypasses the
 non-dumpable process restriction.
 
-Hook-only workspace operations are reserved for trusted lifecycle hooks:
+## Authenticated live workspace scopes
+
+Workspace scope affects automatic commit policy, so the hook token is not treated
+as authentication against same-UID agent code. The detailed state model,
+process/transport checks, per-client protocols, attack analysis, failure behavior,
+and implementation map are in the
+[trusted workspace-scope protocol](trusted-workspace-scope-protocol.md).
+
+The bundled lifecycle commands remain:
 
 ```bash
 ccc-agent turn-add-workspace --agent-session <inner-session-id> [PATH]
 ccc-agent turn-remove-workspace --agent-session <inner-session-id> [PATH]
 ```
 
-Server-mode integrations may call the workspace commands when the agent runtime
-starts, resumes, updates, or ends an inner agent session inside the outer
-`ccc-agent run` containment session. Each inner agent session has one current
-workspace. Starting/updating that workspace releases only the previous workspace
-owned by that same inner session; ending it removes only the workspace that the
-hook actually added. The commands require the hook token and update only dynamic
-policy scopes used by later turn/session finalization. They are not a process
-`cd`, and they do not expose the real underlay. Changes outside the active
-workspaces and static scopes remain review/keep candidates.
+They are proposal and cleanup signals. A hook path already under the static
+operator ceiling may refine that existing authority. A new/broader hook path
+returns `workspace-proposed`, remains absent from `allowed_scopes`, and waits for
+an authenticated client root signal. Hook removal can remove its own proposal or
+hook-owned sub-scope, but cannot remove static or authenticated roots. These
+commands do not `cd`, remount BranchFS, expose the underlay, or commit data.
 
-Bundled lifecycle coverage:
+Authenticated dynamic roots use complete replacement sets:
 
-- Hermes: first-turn `pre_llm_call` adds the current workspace; `on_session_end`
-  removes it.
-- Claude: `SessionStart` adds the current workspace; `SessionEnd` removes it.
-  `Stop` remains a turn-boundary finalize/review hook.
-- Codex: documented `SessionStart` adds the root thread workspace;
-  `SubagentStart`/`SubagentStop` add/remove subagent workspaces. Codex does not
-  currently document a root `SessionEnd` event, so the root thread workspace is
-  cleared by the outer `ccc-agent run` lifecycle/resume reset rather than by an
-  in-Codex end hook.
+- **Claude:** the pinned, descriptor-hardened CCC MCP server requests standard
+  MCP Roots after initialization and root-change notifications. Only absolute
+  local `file:` URIs are forwarded.
+- **Codex app-server:** trusted PID 1 observes transparent JSONL requests and
+  matching successful responses, tracks roots per thread, and confirms their
+  union. Failed requests grant nothing. Foreground and adaptive/server PID-1
+  paths both use this mechanism.
+- **Hermes:** the exact registered hardened Hermes process opens one pinned
+  in-process workspace channel. Framework-owned workspace kwargs are preferred;
+  an exact leading `Workspace::v1` tag is accepted only from the WebUI/API
+  adapter (`platform=api_server`, with `webui` retained for compatible runtimes).
+  Missing metadata does not fall back to process cwd. A locked per-session map
+  confirms the active-session union, and session end removes only its own root.
+- **Explicit direct launch:** trusted PID 1 may confirm launch cwd only when the
+  outer operator selected a workspace; incidental server/bootstrap cwd is not
+  authority.
+
+Each privileged replacement rechecks PID/start-time, parentage, pinned connection,
+and `/proc/<pid>/fd` protection, then validates every path beneath configured
+protected roots. A copied token, forged hook, renamed descendant, second socket,
+unhardened client, malformed protocol message, or path outside protected storage
+cannot broaden policy. Failure leaves changes out of scope for normal review.
 
 ## Environment propagation
 

@@ -5,7 +5,7 @@ description: Use in every contained CCC session; operate live containment state 
 
 # CCC containment
 
-Always use this skill when `${CCC_AGENT_SESSION}` is set. You are working in a contained filesystem. Trusted lifecycle hooks maintain workspace scopes and finalize each turn; do not invoke hook lifecycle commands yourself. Process-exit finalization remains authoritative.
+Always use this skill when `${CCC_AGENT_SESSION}` is set. You are working in a contained filesystem. Trusted supervisor policy and authenticated client lifecycle signals maintain effective workspace scopes; shell hooks are proposal/cleanup hints and cannot broaden commit authority. Do not invoke hook lifecycle commands or fabricate workspace metadata yourself. Process-exit finalization remains authoritative.
 
 For direct Claude/Codex clients, use only the `ccc` MCP server for agent-facing decisions:
 

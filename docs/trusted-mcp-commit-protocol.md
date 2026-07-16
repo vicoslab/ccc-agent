@@ -39,9 +39,12 @@ authority. `ccc_keep_kept` records that a change should remain in BranchFS and
 does not write the real underlay.
 
 This protocol does **not** replace session-end policy. In-scope automatic commits
-are still made by the trusted supervisor according to configured policy. It also
-does not remove the explicit trusted operator commands (`ccc-agent commit`,
-`ccc-agent abort`, review commands) that run outside the sandbox.
+are still made by the trusted supervisor according to configured policy. The
+separate [trusted workspace-scope protocol](trusted-workspace-scope-protocol.md)
+specifies how a path may enter or leave that auto-commit policy without trusting
+forgeable shell hooks. This protocol also does not remove explicit trusted
+operator commands (`ccc-agent commit`, `ccc-agent abort`, review commands) that
+run outside the sandbox.
 
 ## Trust boundaries
 
@@ -59,7 +62,7 @@ trusted launcher inside bwrap
   namespace PID-1 ccc-agent runner
     - creates exactly one initial agent child
     - registers that exact child with the supervisor
-    - does not process model output or choose commit paths
+    - does not choose commit paths; workspace protocol observation is separate
 
 conditionally trusted protocol endpoint inside bwrap
   exact initial official Claude/Codex client
@@ -160,8 +163,11 @@ runner, not model-controlled code:
 4. spawns the direct configured client exactly once; and
 5. immediately sends `mcp-register-client` with the child's namespace PID.
 
-The preload is intentionally **not** loaded into PID 1. PID 1 must remain
-observable long enough for the supervisor to authenticate registration.
+The preload is intentionally **not** loaded into PID 1. PID 1 remains observable
+long enough for the supervisor to authenticate registration, then makes itself
+non-dumpable before any PID-1 workspace/protocol signal is treated as authority.
+That post-registration runner hardening is specified in the
+[workspace-scope protocol](trusted-workspace-scope-protocol.md).
 
 The supervisor does not trust the reported PID directly. It verifies:
 
@@ -244,9 +250,10 @@ supervisor actively probes that both the registered client and MCP peer deny
 access to `/proc/<pid>/fd`. Without that observed property, MCP status can still
 work, but destructive authorization is false.
 
-The supervisor repeats the PID/start-time, parent relationship, pinned
-connection, and `/proc/<pid>/fd` checks on every MCP-only mutation. If protection
-or identity changes after admission, the request fails closed.
+The supervisor repeats the launch PID/start-time/ancestry check, client/MCP
+PID/start-time and parent relationship, pinned connection, and
+`/proc/<pid>/fd` checks on every MCP-only mutation. If protection or identity
+changes after admission, the request fails closed.
 
 ### Phase 5: a model requests a CCC tool
 

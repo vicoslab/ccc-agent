@@ -27,9 +27,10 @@ session so out-of-scope paths that were already committed or kept are not
 re-prompted after controller restarts.
 
 Mutating agent decisions are admitted only through the process-pinned MCP
-connection. Lifecycle hooks retain finalize/workspace signaling, while ordinary
-agent subprocesses cannot call turn-approve or turn-resolve on the production
-supervisor.
+connection. Lifecycle hooks retain finalize and non-authoritative workspace
+proposal/cleanup signaling; authenticated client channels replace dynamic roots.
+Ordinary agent subprocesses cannot call turn-approve or turn-resolve on the
+production supervisor.
 """
 
 import binascii
@@ -50,6 +51,11 @@ from .previous_commits import DECISION_COMMITTED, TURN_PATH_DECISIONS
 DECISION_KEPT = "kept"
 WORKSPACE_SCOPES = "workspace_scopes"
 HOOK_WORKSPACE_REFS = "hook_workspace_refs"
+WORKSPACE_SCOPE_CEILING = "workspace_scope_ceiling"
+WORKSPACE_PROPOSALS = "hook_workspace_proposals"
+MCP_WORKSPACE_ROOTS = "mcp_workspace_roots"
+VERDICT_WORKSPACE_PROPOSED = "workspace-proposed"
+VERDICT_WORKSPACE_PROPOSAL_STATUS = "workspace-proposal-status"
 
 
 def _new_token():
@@ -188,8 +194,10 @@ class TurnController(object):
 
     def _workspace_response(self, action, workspace, workspaces, allowed,
                             hook_session=None, added=False, owned=False,
-                            removed=False):
-        return {"verdict": VERDICT_WORKSPACE_UPDATED,
+                            removed=False, proposed=False,
+                            authorized_by_ceiling=False, verdict=None,
+                            proposal_removed=False):
+        return {"verdict": verdict or VERDICT_WORKSPACE_UPDATED,
                 "action": action,
                 "workspace": workspace,
                 "workspaces": list(workspaces),
@@ -197,7 +205,10 @@ class TurnController(object):
                 "hook_session": hook_session,
                 "added": bool(added),
                 "owned": bool(owned),
-                "removed": bool(removed)}
+                "removed": bool(removed),
+                "proposed": bool(proposed),
+                "proposal_removed": bool(proposal_removed),
+                "authorized_by_ceiling": bool(authorized_by_ceiling)}
 
     def _validate_hook_session(self, hook_session):
         hook_session = str(hook_session or "").strip()
@@ -230,39 +241,123 @@ class TurnController(object):
         self.session.policy[HOOK_WORKSPACE_REFS] = clean
         return clean
 
-    def add_workspace(self, path, hook_session):
-        """Hook session start: add a workspace only if the session owns it.
+    def _workspace_ceiling(self):
+        ceiling = self.session.policy.get(WORKSPACE_SCOPE_CEILING)
+        if isinstance(ceiling, list):
+            ceiling = self._unique_paths_by_canonical(ceiling)
+            self.session.policy[WORKSPACE_SCOPE_CEILING] = ceiling
+            return ceiling
 
-        If the path is already an allowed/static scope, the hook session does not
-        take ownership, so its finish event cannot remove the pre-existing scope.
-        If another hook session owns the same dynamic scope, we add a second owner
-        and remove the scope only after the last owner finishes.
+        # Upgrade-safe initialization: scopes owned by old hook state are not
+        # allowed to become the permanent authority ceiling on resume.
+        raw_refs = self.session.policy.get(HOOK_WORKSPACE_REFS)
+        dynamic_keys = set(raw_refs) if isinstance(raw_refs, dict) else set()
+        for path in self.session.policy.get(MCP_WORKSPACE_ROOTS, ()):
+            try:
+                dynamic_keys.add(self._canonical_key(path))
+            except ValueError:
+                continue
+        ceiling = []
+        for scope in self.session.policy.get("allowed_scopes", ()):
+            try:
+                key = self._canonical_key(scope)
+            except ValueError:
+                continue
+            if key not in dynamic_keys:
+                ceiling.append(scope)
+        ceiling = self._unique_paths_by_canonical(ceiling)
+        self.session.policy[WORKSPACE_SCOPE_CEILING] = ceiling
+        return ceiling
+
+    def _workspace_authorized_by_ceiling(self, canonical):
+        return any(is_within(canonical, self._canonical_key(scope))
+                   for scope in self._workspace_ceiling())
+
+    def _workspace_proposals(self):
+        raw = self.session.policy.get(WORKSPACE_PROPOSALS)
+        if not isinstance(raw, dict):
+            raw = {}
+        clean = {}
+        for _key, entry in raw.items():
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path")
+            owners = entry.get("owners")
+            try:
+                visible, canonical = self._validate_workspace(path)
+            except ValueError:
+                continue
+            if not isinstance(owners, list):
+                continue
+            unique = []
+            for owner in owners:
+                owner = str(owner or "").strip()
+                if owner and owner not in unique:
+                    unique.append(owner)
+            if unique:
+                clean[canonical] = {"path": visible, "owners": unique}
+        self.session.policy[WORKSPACE_PROPOSALS] = clean
+        return clean
+
+    @staticmethod
+    def _release_workspace_owner(entries, owner, except_key=None):
+        removed = []
+        for key, entry in list(entries.items()):
+            if key == except_key:
+                continue
+            owners = [item for item in entry.get("owners", []) if item != owner]
+            if owners:
+                entry["owners"] = owners
+            else:
+                entries.pop(key, None)
+                removed.append(key)
+        return removed
+
+    def add_workspace(self, path, hook_session):
+        """Record a hook workspace without trusting the hook to broaden policy.
+
+        A hook may activate a path only beneath the pre-hook operator ceiling.
+        Anything broader/new is a proposal until the process-pinned MCP channel
+        obtains explicit human confirmation.
         """
         with self._lock:
             hook_session = self._validate_hook_session(hook_session)
             workspace, canonical = self._validate_workspace(path)
             workspaces = list(self._workspace_scopes())
             refs = self._hook_workspace_refs()
+            proposals = self._workspace_proposals()
             key = canonical
-            for old_key, entry in list(refs.items()):
-                if old_key == key:
-                    continue
-                owners = [owner for owner in entry.get("owners", [])
-                          if owner != hook_session]
-                if len(owners) == len(entry.get("owners", [])):
-                    continue
-                if owners:
-                    entry["owners"] = owners
-                else:
-                    refs.pop(old_key, None)
-                    workspaces = [item for item in workspaces
-                                  if self._canonical_key(item) != old_key]
+
+            removed_active = self._release_workspace_owner(
+                refs, hook_session, except_key=key)
+            self._release_workspace_owner(
+                proposals, hook_session, except_key=key)
+            if removed_active:
+                workspaces = [item for item in workspaces
+                              if self._canonical_key(item) not in removed_active]
+
+            authorized = self._workspace_authorized_by_ceiling(canonical)
             workspace_keys = {self._canonical_key(item) for item in workspaces}
             allowed_keys = {self._canonical_key(item)
                             for item in self.session.policy.get("allowed_scopes", ())}
             added = False
             owned = False
 
+            if not authorized and key not in workspace_keys and key not in allowed_keys:
+                entry = proposals.setdefault(
+                    key, {"path": workspace, "owners": []})
+                if hook_session not in entry["owners"]:
+                    entry["owners"].append(hook_session)
+                workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
+                self.session.add_event("turn-workspace-proposed",
+                                       "%s %s" % (hook_session, workspace))
+                self.store.save(self.session)
+                return self._workspace_response(
+                    "propose", workspace, workspaces, allowed,
+                    hook_session=hook_session, proposed=True,
+                    verdict=VERDICT_WORKSPACE_PROPOSED)
+
+            proposals.pop(key, None)
             if key in refs:
                 owners = refs[key].setdefault("owners", [])
                 if hook_session not in owners:
@@ -282,9 +377,10 @@ class TurnController(object):
             self.session.add_event("turn-workspace-add",
                                    "%s %s" % (hook_session, workspace))
             self.store.save(self.session)
-            return self._workspace_response("add", workspace, workspaces,
-                                            allowed, hook_session=hook_session,
-                                            added=added, owned=owned)
+            return self._workspace_response(
+                "add", workspace, workspaces, allowed,
+                hook_session=hook_session, added=added, owned=owned,
+                authorized_by_ceiling=authorized)
 
     def remove_workspace(self, path, hook_session):
         """Hook session finish: remove only scopes this hook session added."""
@@ -293,8 +389,19 @@ class TurnController(object):
             workspace, canonical = self._validate_workspace(path)
             workspaces = list(self._workspace_scopes())
             refs = self._hook_workspace_refs()
+            proposals = self._workspace_proposals()
             key = canonical
             removed = False
+            proposal_removed = False
+            proposal = proposals.get(key)
+            if proposal is not None:
+                owners = [owner for owner in proposal.get("owners", [])
+                          if owner != hook_session]
+                if owners:
+                    proposal["owners"] = owners
+                elif hook_session in proposal.get("owners", []):
+                    proposals.pop(key, None)
+                    proposal_removed = True
             entry = refs.get(key)
             if entry is not None:
                 owners = [owner for owner in entry.get("owners", [])
@@ -303,9 +410,12 @@ class TurnController(object):
                     entry["owners"] = owners
                 else:
                     refs.pop(key, None)
-                    workspaces = [item for item in workspaces
-                                  if self._canonical_key(item) != key]
-                    removed = True
+                    mcp_keys = {self._canonical_key(item) for item in
+                                self.session.policy.get(MCP_WORKSPACE_ROOTS, ())}
+                    if key not in mcp_keys:
+                        workspaces = [item for item in workspaces
+                                      if self._canonical_key(item) != key]
+                        removed = True
 
             workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
             try:
@@ -317,20 +427,80 @@ class TurnController(object):
             self.session.add_event("turn-workspace-remove",
                                    "%s %s" % (hook_session, workspace))
             self.store.save(self.session)
-            return self._workspace_response("remove", workspace, workspaces,
-                                            allowed, hook_session=hook_session,
-                                            removed=removed)
+            return self._workspace_response(
+                "remove", workspace, workspaces, allowed,
+                hook_session=hook_session, removed=removed,
+                proposal_removed=proposal_removed)
+
+    def workspace_proposal_status(self):
+        with self._lock:
+            proposals = self._workspace_proposals()
+            paths = sorted(entry["path"] for entry in proposals.values())
+            return {"verdict": VERDICT_WORKSPACE_PROPOSAL_STATUS,
+                    "proposals": paths, "count": len(paths)}
+
+    def confirm_workspace_roots(self, paths):
+        """Synchronize roots reported by the process-pinned official MCP client."""
+        with self._lock:
+            confirmed = self._unique_paths_by_canonical(paths or ())
+            if len(confirmed) != len(set(paths or ())):
+                # _unique_paths_by_canonical silently drops invalid legacy state;
+                # authoritative client input must instead fail closed.
+                for path in paths or ():
+                    self._validate_workspace(path)
+
+            old_roots = self._unique_paths_by_canonical(
+                self.session.policy.get(MCP_WORKSPACE_ROOTS, ()))
+            old_keys = {self._canonical_key(path) for path in old_roots}
+            new_keys = {self._canonical_key(path) for path in confirmed}
+            ceiling_keys = {self._canonical_key(path)
+                            for path in self._workspace_ceiling()}
+            refs = self._hook_workspace_refs()
+            proposals = self._workspace_proposals()
+            workspaces = []
+            for item in self._workspace_scopes():
+                key = self._canonical_key(item)
+                if (key in old_keys and key not in new_keys and
+                        key not in ceiling_keys and key not in refs):
+                    continue
+                workspaces.append(item)
+
+            workspace_keys = {self._canonical_key(path) for path in workspaces}
+            for workspace in confirmed:
+                key = self._canonical_key(workspace)
+                if key not in workspace_keys:
+                    workspaces.append(workspace)
+                    workspace_keys.add(key)
+                proposals.pop(key, None)
+
+            self.session.policy[MCP_WORKSPACE_ROOTS] = list(confirmed)
+            workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
+            if not self.session.workspace and confirmed:
+                self.session.workspace = confirmed[0]
+            self.session.add_event("turn-workspace-roots-confirmed",
+                                   "%d root(s)" % len(confirmed))
+            self.store.save(self.session)
+            return {"verdict": VERDICT_WORKSPACE_UPDATED,
+                    "action": "confirm-roots", "confirmed": confirmed,
+                    "workspaces": workspaces, "allowed_scopes": allowed,
+                    "proposals": sorted(entry["path"]
+                                        for entry in proposals.values())}
 
     def reset_agent_workspaces(self):
-        """Drop stale hook-owned inner agent-session workspace scopes.
+        """Drop stale inner-session proposals and authenticated dynamic roots.
 
         Called before launching/resuming a contained agent process. Any live
         inner agent sessions from the previous process are gone; fresh
-        SessionStart hooks will re-add their current workspace.
+        authenticated client lifecycle signals repopulate current roots while
+        hooks may recreate only proposal/refinement state.
         """
         with self._lock:
             refs = self._hook_workspace_refs()
+            proposals = self._workspace_proposals()
+            mcp_roots = self._unique_paths_by_canonical(
+                self.session.policy.get(MCP_WORKSPACE_ROOTS, ()))
             stale_keys = set(refs)
+            stale_keys.update(self._canonical_key(path) for path in mcp_roots)
             removed = []
             workspaces = []
             for item in self._workspace_scopes():
@@ -340,6 +510,10 @@ class TurnController(object):
                 else:
                     workspaces.append(item)
             self.session.policy[HOOK_WORKSPACE_REFS] = {}
+            self.session.policy[MCP_WORKSPACE_ROOTS] = []
+            proposal_paths = sorted(entry["path"]
+                                    for entry in proposals.values())
+            self.session.policy[WORKSPACE_PROPOSALS] = {}
             workspaces, allowed = self._rewrite_workspace_scopes(workspaces)
             if removed:
                 self.session.add_event("turn-workspace-reset",
@@ -348,6 +522,7 @@ class TurnController(object):
             return {"verdict": VERDICT_WORKSPACE_UPDATED,
                     "action": "reset",
                     "removed": removed,
+                    "proposals_removed": proposal_paths,
                     "workspaces": list(workspaces),
                     "allowed_scopes": list(allowed)}
 
@@ -765,6 +940,10 @@ class TurnController(object):
                                      request.get("paths"))
         if op == "turn-request-abort":
             return self.request_abort()
+        if op == "turn-confirm-workspace-roots":
+            return self.confirm_workspace_roots(request.get("paths"))
+        if op == "turn-workspace-proposal-status":
+            return self.workspace_proposal_status()
         if op == "turn-kept-status":
             return self.kept_status()
         if op == "turn-review-kept":

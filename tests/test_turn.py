@@ -181,6 +181,71 @@ class TestTurnController(unittest.TestCase):
             persisted.policy["turn_path_decisions"]["/storage/user/escape.txt"],
             "kept")
 
+    def test_hook_cannot_broaden_workspace_beyond_operator_ceiling(self):
+        resp = self.h.tc.add_workspace("/storage/user",
+                                       hook_session="malicious-hook")
+
+        self.assertEqual(resp["verdict"], "workspace-proposed")
+        self.assertTrue(resp["proposed"])
+        self.assertNotIn("/storage/user", resp["allowed_scopes"])
+        self.assertEqual(self.h.tc.workspace_proposal_status()["proposals"],
+                         ["/storage/user"])
+
+        self.h.write("escape.txt", "must-stay-branched")
+        finalize = self.h.tc.finalize_turn()
+        self.assertEqual(finalize["verdict"], VERDICT_NEEDS_APPROVAL)
+        self.assertFalse(self.h.base_has("escape.txt"))
+
+    def test_hook_workspace_inside_operator_ceiling_activates_without_new_authority(self):
+        resp = self.h.tc.add_workspace(
+            "/storage/user/Projects/proj-a/subproject",
+            hook_session="hook-a")
+
+        self.assertEqual(resp["verdict"], "workspace-updated")
+        self.assertTrue(resp["authorized_by_ceiling"])
+        self.assertFalse(resp["proposed"])
+        self.assertIn("/storage/user/Projects/proj-a/subproject",
+                      resp["workspaces"])
+
+    def test_pinned_mcp_roots_activate_workspace_without_prompt(self):
+        proposed = self.h.tc.add_workspace(
+            "/storage/user/Projects/proj-b", hook_session="hook-a")
+        self.assertEqual(proposed["verdict"], "workspace-proposed")
+
+        confirmed = self.h.tc.confirm_workspace_roots(
+            ["/storage/user/Projects/proj-b"])
+
+        self.assertEqual(confirmed["verdict"], "workspace-updated")
+        self.assertEqual(confirmed["confirmed"], [
+            "/storage/user/Projects/proj-b"])
+        self.assertEqual(self.h.tc.workspace_proposal_status()["proposals"], [])
+        self.h.write("Projects/proj-b/confirmed.txt", "yes")
+        self.assertEqual(self.h.tc.finalize_turn()["verdict"], VERDICT_COMMITTED)
+        self.assertTrue(self.h.base_has("Projects/proj-b/confirmed.txt"))
+
+    def test_mcp_roots_replace_only_mcp_owned_dynamic_scopes(self):
+        self.h.tc.confirm_workspace_roots(
+            ["/storage/user/Projects/proj-b"])
+        updated = self.h.tc.confirm_workspace_roots(
+            ["/storage/user/Projects/proj-c"])
+
+        self.assertIn("/storage/user/Projects/proj-a", updated["workspaces"])
+        self.assertIn("/storage/user/Projects/proj-c", updated["workspaces"])
+        self.assertNotIn("/storage/user/Projects/proj-b", updated["workspaces"])
+
+    def test_mcp_roots_reject_paths_outside_protected_storage(self):
+        with self.assertRaises(ValueError):
+            self.h.tc.confirm_workspace_roots(["/tmp/not-protected"])
+
+    def test_hook_removal_drops_unconfirmed_workspace_proposal(self):
+        self.h.tc.add_workspace("/storage/user/Projects/proj-b",
+                                hook_session="hook-a")
+        removed = self.h.tc.remove_workspace(
+            "/storage/user/Projects/proj-b", hook_session="hook-a")
+
+        self.assertTrue(removed["proposal_removed"])
+        self.assertEqual(self.h.tc.workspace_proposal_status()["proposals"], [])
+
     def test_first_hook_workspace_initializes_scope_for_server_session(self):
         self.h.session.workspace = None
         self.h.session.policy["workspace_scopes"] = []
@@ -190,7 +255,11 @@ class TestTurnController(unittest.TestCase):
         resp = self.h.tc.add_workspace("/storage/user/Projects/proj-b",
                                        hook_session="hook-a")
 
-        self.assertEqual(resp["workspaces"], [
+        self.assertEqual(resp["verdict"], "workspace-proposed")
+        confirmed = self.h.tc.confirm_workspace_roots([
+            "/storage/user/Projects/proj-b",
+        ])
+        self.assertEqual(confirmed["workspaces"], [
             "/storage/user/Projects/proj-b",
         ])
         persisted = self.h.store.load(self.h.session.session_id)
@@ -205,10 +274,10 @@ class TestTurnController(unittest.TestCase):
     def test_hook_session_add_workspace_allows_new_workspace_changes(self):
         resp = self.h.tc.add_workspace("/storage/user/Projects/proj-b",
                                        hook_session="hook-a")
-        self.assertEqual(resp["verdict"], "workspace-updated")
-        self.assertTrue(resp["added"])
-        self.assertTrue(resp["owned"])
-        self.assertEqual(resp["workspaces"], [
+        self.assertEqual(resp["verdict"], "workspace-proposed")
+        confirmed = self.h.tc.confirm_workspace_roots([
+            "/storage/user/Projects/proj-b"])
+        self.assertEqual(confirmed["workspaces"], [
             "/storage/user/Projects/proj-a",
             "/storage/user/Projects/proj-b",
         ])
@@ -222,10 +291,11 @@ class TestTurnController(unittest.TestCase):
     def test_hook_session_remove_workspace_only_removes_scope_it_added(self):
         self.h.tc.add_workspace("/storage/user/Projects/proj-b",
                                 hook_session="hook-a")
-        resp = self.h.tc.remove_workspace("/storage/user/Projects/proj-b",
-                                          hook_session="hook-a")
-        self.assertEqual(resp["verdict"], "workspace-updated")
-        self.assertTrue(resp["removed"])
+        self.h.tc.confirm_workspace_roots(["/storage/user/Projects/proj-b"])
+        hook_remove = self.h.tc.remove_workspace(
+            "/storage/user/Projects/proj-b", hook_session="hook-a")
+        self.assertFalse(hook_remove["removed"])
+        resp = self.h.tc.confirm_workspace_roots([])
         self.assertEqual(resp["workspaces"], ["/storage/user/Projects/proj-a"])
 
         self.h.write("Projects/proj-b/b.txt", "two")
@@ -257,23 +327,27 @@ class TestTurnController(unittest.TestCase):
         add_b = self.h.tc.add_workspace("/storage/user/Projects/proj-b",
                                         hook_session="hook-b")
         self.assertFalse(add_b["added"])
-        self.assertTrue(add_b["owned"])
+        self.assertTrue(add_b["proposed"])
 
         remove_a = self.h.tc.remove_workspace("/storage/user/Projects/proj-b",
                                               hook_session="hook-a")
         self.assertFalse(remove_a["removed"])
-        self.assertIn("/storage/user/Projects/proj-b", remove_a["workspaces"])
+        self.assertFalse(remove_a["proposal_removed"])
 
         remove_b = self.h.tc.remove_workspace("/storage/user/Projects/proj-b",
                                               hook_session="hook-b")
-        self.assertTrue(remove_b["removed"])
+        self.assertTrue(remove_b["proposal_removed"])
         self.assertNotIn("/storage/user/Projects/proj-b", remove_b["workspaces"])
 
     def test_agent_session_workspace_update_replaces_only_that_session_workspace(self):
         self.h.tc.add_workspace("/storage/user/Projects/proj-b",
                                 hook_session="agent-session-a")
+        self.h.tc.confirm_workspace_roots(["/storage/user/Projects/proj-b"])
         update = self.h.tc.add_workspace("/storage/user/Projects/proj-c",
                                          hook_session="agent-session-a")
+        self.assertEqual(update["verdict"], "workspace-proposed")
+        update = self.h.tc.confirm_workspace_roots([
+            "/storage/user/Projects/proj-c"])
 
         self.assertIn("/storage/user/Projects/proj-c", update["workspaces"])
         self.assertNotIn("/storage/user/Projects/proj-b", update["workspaces"])
@@ -300,6 +374,7 @@ class TestTurnController(unittest.TestCase):
     def test_reset_agent_workspaces_drops_stale_hook_owned_scopes_for_resume(self):
         self.h.tc.add_workspace("/storage/user/Projects/proj-b",
                                 hook_session="agent-session-a")
+        self.h.tc.confirm_workspace_roots(["/storage/user/Projects/proj-b"])
 
         reset = self.h.tc.reset_agent_workspaces()
 

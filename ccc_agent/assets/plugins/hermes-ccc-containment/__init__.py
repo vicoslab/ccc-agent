@@ -9,15 +9,17 @@ Hermes' native equivalent of Claude's ``additionalContext`` is the
 the current turn's user message.  This plugin uses that hook to make the bundled
 ``ccc-containment`` skill mandatory session context instead of relying on the model to
 choose a skill by description.  At final-response/idle boundaries it also
-signals the trusted CCC supervisor, maintains hook-owned workspace scopes, then
-appends or queues a kept-file review
-prompt when non-workspace/out-of-policy files remain in the branch.
+signals the trusted CCC supervisor, sends process-pinned workspace replacements
+while shell hook calls remain proposal/cleanup hints, then appends or queues a
+kept-file review prompt when non-workspace/out-of-policy files remain in the
+branch.
 
-The plugin never freezes, commits, or aborts directly.  It shells out only to
-``ccc-agent turn-*`` commands, which reach the trusted supervisor over
-``CCC_AGENT_CONTROL_SOCK``.  All paths degrade safe: if the control socket,
-``ccc-agent`` command, or Hermes injection surface is unavailable, process-exit
-review in ``ccc-agent run`` remains authoritative.
+The plugin never freezes, commits, or aborts directly. It uses a process-pinned
+`WorkspaceControlClient` only for complete workspace-root replacement and shells
+out to `ccc-agent turn-*` for non-authoritative lifecycle/proposal signals. All
+paths degrade safe: if the control socket, `ccc-agent` command, or Hermes
+injection surface is unavailable, process-exit review in `ccc-agent run` remains
+authoritative.
 """
 
 from __future__ import annotations
@@ -25,16 +27,24 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional, Tuple
+
+from ccc_agent.control import (ControlError, WorkspaceControlClient)
 
 logger = logging.getLogger(__name__)
 
 _FINALIZED_TURNS = set()
 _LAST_REVIEW_DIGEST = None
-_WORKSPACE_SESSION_ID = None
-_WORKSPACE_PATH = None
+_WORKSPACE_PATHS = {}
+_HOOK_WORKSPACE_PATHS = {}
+_WORKSPACE_CONTROL = None
+_WORKSPACE_LOCK = threading.RLock()
+_WORKSPACE_TAG = re.compile(r"^\[Workspace::v1: (/[^\]\n]+)\]")
+_AUTHORITATIVE_WORKSPACE_TAG_PLATFORMS = frozenset(("api_server", "webui"))
 
 
 CCC_REVIEW_HEADER = "CCC contained-session review is pending."
@@ -110,7 +120,17 @@ def _workspace_from_kwargs(**kwargs) -> str:
         value = kwargs.get(key)
         if value:
             return str(value)
-    return os.getcwd()
+    # Hermes documents ``platform`` as a pre_llm_call field. The WebUI/API
+    # adapter authoritatively prepends Workspace::v1; on messaging platforms
+    # this text is ordinary user-controlled content and cannot grant scope.
+    user_message = kwargs.get("user_message")
+    platform = str(kwargs.get("platform") or "")
+    if (platform in _AUTHORITATIVE_WORKSPACE_TAG_PLATFORMS and
+            isinstance(user_message, str)):
+        match = _WORKSPACE_TAG.match(user_message)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _hook_session_from_kwargs(**kwargs) -> str:
@@ -121,52 +141,99 @@ def _hook_session_from_kwargs(**kwargs) -> str:
     return os.environ.get("CCC_AGENT_HOOK_SESSION") or os.environ.get("CCC_AGENT_SESSION", "")
 
 
+def _confirm_workspaces(workspaces) -> bool:
+    """Replace roots through the process-pinned in-process Hermes channel."""
+    global _WORKSPACE_CONTROL
+    roots = sorted(set(str(path) for path in workspaces if path))
+    with _WORKSPACE_LOCK:
+        if _WORKSPACE_CONTROL is None:
+            sock = os.environ.get("CCC_AGENT_CONTROL_SOCK")
+            token = os.environ.get("CCC_AGENT_CONTROL_TOKEN")
+            if not sock or not token:
+                return False
+            try:
+                client = WorkspaceControlClient(sock, token)
+                client.admit("hermes")
+                _WORKSPACE_CONTROL = client
+            except (ControlError, OSError) as exc:
+                logger.debug("ccc Hermes workspace admission failed: %s", exc)
+                return False
+        try:
+            _WORKSPACE_CONTROL.confirm_workspace_roots(roots)
+            return True
+        except (ControlError, OSError) as exc:
+            logger.debug("ccc Hermes workspace confirmation failed: %s", exc)
+            return False
+
+
 def _signal_workspace_start(**kwargs) -> None:
-    """Best-effort hook-owned workspace add for server-style Hermes sessions."""
-    global _WORKSPACE_SESSION_ID, _WORKSPACE_PATH
+    """Confirm the per-session root union; hooks remain proposal hints."""
     if not _contained() or not _has_control_socket():
-        return
-    if not os.environ.get("CCC_AGENT_HOOK_TOKEN"):
         return
     hook_session = _hook_session_from_kwargs(**kwargs)
     workspace = _workspace_from_kwargs(**kwargs)
     if not hook_session or not workspace:
         return
-    try:
-        proc = _run_ctl("turn-add-workspace", "--agent-session", hook_session,
-                        workspace)
-        if proc.returncode == 0:
-            _WORKSPACE_SESSION_ID = hook_session
-            _WORKSPACE_PATH = workspace
-        else:
-            logger.debug("ccc turn-add-workspace exited %s: %s",
-                         proc.returncode, proc.stderr.strip())
-    except Exception as exc:
-        logger.debug("ccc turn-add-workspace signal failed: %s", exc)
+    with _WORKSPACE_LOCK:
+        old_confirmed = _WORKSPACE_PATHS.get(hook_session)
+        old_hook = _HOOK_WORKSPACE_PATHS.get(hook_session)
+        if old_confirmed == workspace and old_hook == workspace:
+            return
+        try:
+            if (old_hook and old_hook != workspace and
+                    os.environ.get("CCC_AGENT_HOOK_TOKEN")):
+                try:
+                    _run_ctl("turn-remove-workspace", "--agent-session",
+                             hook_session, old_hook)
+                except Exception:
+                    pass
+            if os.environ.get("CCC_AGENT_HOOK_TOKEN"):
+                proc = _run_ctl("turn-add-workspace", "--agent-session",
+                                hook_session, workspace)
+                if proc.returncode == 0:
+                    _HOOK_WORKSPACE_PATHS[hook_session] = workspace
+                else:
+                    logger.debug("ccc turn-add-workspace exited %s: %s",
+                                 proc.returncode, proc.stderr.strip())
+
+            candidate = dict(_WORKSPACE_PATHS)
+            candidate[hook_session] = workspace
+            if _confirm_workspaces(candidate.values()):
+                _WORKSPACE_PATHS[hook_session] = workspace
+        except Exception as exc:
+            logger.debug("ccc turn-add-workspace signal failed: %s", exc)
 
 
 def _signal_workspace_end(**kwargs) -> None:
-    """Best-effort hook-owned workspace remove for server-style Hermes sessions."""
-    global _WORKSPACE_SESSION_ID, _WORKSPACE_PATH
+    """Remove only the ending session from confirmed and hook-owned state."""
     if not _contained() or not _has_control_socket():
         return
-    if not os.environ.get("CCC_AGENT_HOOK_TOKEN"):
+    hook_session = _hook_session_from_kwargs(**kwargs)
+    if not hook_session:
         return
-    hook_session = _WORKSPACE_SESSION_ID or _hook_session_from_kwargs(**kwargs)
-    workspace = _WORKSPACE_PATH or _workspace_from_kwargs(**kwargs)
-    if not hook_session or not workspace:
-        return
-    try:
-        proc = _run_ctl("turn-remove-workspace", "--agent-session", hook_session,
-                        workspace)
-        if proc.returncode not in (0,):
-            logger.debug("ccc turn-remove-workspace exited %s: %s",
-                         proc.returncode, proc.stderr.strip())
-    except Exception as exc:
-        logger.debug("ccc turn-remove-workspace signal failed: %s", exc)
-    finally:
-        _WORKSPACE_SESSION_ID = None
-        _WORKSPACE_PATH = None
+    with _WORKSPACE_LOCK:
+        confirmed_workspace = _WORKSPACE_PATHS.get(hook_session)
+        hook_workspace = _HOOK_WORKSPACE_PATHS.get(hook_session)
+        if confirmed_workspace is not None:
+            candidate = dict(_WORKSPACE_PATHS)
+            candidate.pop(hook_session, None)
+            _confirm_workspaces(candidate.values())
+            # Never let a later successful replacement resurrect an ended
+            # session after a transient clear failure.
+            _WORKSPACE_PATHS.pop(hook_session, None)
+        if hook_workspace is None:
+            return
+        try:
+            if os.environ.get("CCC_AGENT_HOOK_TOKEN"):
+                proc = _run_ctl("turn-remove-workspace", "--agent-session",
+                                hook_session, hook_workspace)
+                if proc.returncode not in (0,):
+                    logger.debug("ccc turn-remove-workspace exited %s: %s",
+                                 proc.returncode, proc.stderr.strip())
+        except Exception as exc:
+            logger.debug("ccc turn-remove-workspace signal failed: %s", exc)
+        finally:
+            _HOOK_WORKSPACE_PATHS.pop(hook_session, None)
 
 
 def _signal_turn_boundary(turn_id: Optional[str] = None) -> None:
@@ -244,8 +311,8 @@ def _pre_llm_context(is_first_turn: bool = False, **_) -> Optional[dict]:
     if not _contained():
         return None
     parts = []
+    _signal_workspace_start(**_)
     if is_first_turn:
-        _signal_workspace_start(**_)
         body = _skill_body("ccc-containment")
         if body:
             parts.append("%s\n\n%s" % (FIRST_TURN_PREFIX, body))
