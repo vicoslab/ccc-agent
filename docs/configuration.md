@@ -63,7 +63,7 @@ annotated example.
 | `policy` | Default policy applied to runs unless overridden by CLI flags. |
 | `workspace_admission_roots` | Maximum operator-selected domain for trusted dynamic workspace roots. Paths are CCC-canonicalized and must be under protected storage. Defaults to the protected visible roots for compatibility. |
 | `allow_protected_root_workspace` | Permit a dynamic workspace to equal its admission/protected root. Default `false`; ordinary dynamic roots must be strict descendants. |
-| `session_delta_routing` | Opt into nested per-logical-session provenance. Default `false`. Currently requires bwrap, per-turn control, and a detected direct Codex app-server runtime; failure degrades to the unchanged outer branch. |
+| `session_delta_routing` | Opt into nested per-logical-session provenance. Default `false`. Route capability currently requires bwrap, per-turn control, a detected direct Codex app-server runtime, `bwrap_proc_mode: "fresh"`, and working nested user namespaces. Bound-proc CCC profiles use the trusted outer-sandbox adapter and remain shared/unattributed. |
 | `session_delta_routing_vendors` | Explicit routing vendor allowlist. Defaults to `["codex"]`; unsupported vendors remain shared/unattributed and the key has no effect while routing is disabled. |
 
 ## Protected roots

@@ -30,7 +30,9 @@ class DeltaRouteManager(object):
 
     @property
     def enabled(self):
-        return self.session.policy.get("session_delta_routing") is True
+        return bool(
+            self.session.policy.get("session_delta_routing") is True and
+            self.session.policy.get("route_interposer_available") is True)
 
     @property
     def vendors(self):

@@ -5,7 +5,6 @@ import os
 import tempfile
 import unittest
 
-from ccc_agent.branchfs import FakeBranchFS
 from ccc_agent.route_manager import DeltaRouteManager
 from tests.test_turn import TurnHarness
 
@@ -15,6 +14,7 @@ class TestDeltaRouteManager(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.h = TurnHarness(self.tmp.name)
         self.h.session.policy["session_delta_routing"] = True
+        self.h.session.policy["route_interposer_available"] = True
         self.h.session.policy["session_delta_routing_vendors"] = ["codex"]
         self.manager = DeltaRouteManager(
             self.h.session, self.h.store, self.h.backend)

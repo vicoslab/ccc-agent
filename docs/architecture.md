@@ -113,11 +113,13 @@ signals narrow authority and leave changes for review. See the complete
 ### Optional per-logical-session delta routing
 
 When explicitly enabled for a supported vendor, ccc-agent creates opaque nested
-BranchFS branches over the live outer session branch. A package-owned read-only
-Codex bwrap adapter can route one documented thread ID into its pre-provisioned
-child. The adapter is not an authority endpoint: it cannot admit workspaces,
-create routes, or commit data, and lookup failures delegate to the real bwrap
-unchanged.
+BranchFS branches over the live outer session branch. On a fresh-proc runtime
+that permits Codex's nested user namespace, a package-owned read-only Codex
+bwrap adapter can route one documented thread ID into its pre-provisioned child.
+The adapter is not an authority endpoint: it cannot admit workspaces, create
+routes, or commit data. Bound-proc runtimes instead use the trusted
+external-sandbox adapter, retain the authoritative outer bwrap, and classify
+writes as shared/unattributed.
 
 At thread end, children freeze and merge only into the outer branch. Final outer
 status is reconciled against route snapshots, the outer baseline, merge outcomes,

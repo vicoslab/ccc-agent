@@ -19,7 +19,6 @@ from unittest import mock
 
 from ccc_agent import runner as runner_mod
 from ccc_agent import setup as setup_mod
-runner_module = runner_mod
 from ccc_agent.branchfs import FakeBranchFS, StatusReport, StatusWarning
 from ccc_agent.paths import AliasMap
 from ccc_agent.runner import (BWRAP_AGENT_RUNNER, BWRAP_AGENT_RUNNER_ARG0,
@@ -71,6 +70,24 @@ class TestRunSession(unittest.TestCase):
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def test_selective_apply_replaces_final_symlink_with_empty_directory(self):
+        outside = os.path.join(self._tmp.name, "outside-dir")
+        base = os.path.join(self.h.base, "empty-dir")
+        delta = os.path.join(self._tmp.name, "unused-delta")
+        os.makedirs(outside)
+        os.symlink(outside, base)
+        root = mock.Mock(base=self.h.base)
+        change = mock.Mock(op="A", kind="dir")
+
+        with mock.patch.object(
+                runner_mod, "store_paths",
+                return_value=("empty-dir", delta, base)):
+            runner_mod.apply_change_from_store(root, change, self.h.store)
+
+        self.assertFalse(os.path.islink(base))
+        self.assertTrue(os.path.isdir(base))
+        self.assertEqual(os.listdir(outside), [])
 
     def test_workspace_admission_and_delta_routing_defaults_are_conservative(self):
         config = self.h.config(["true"])
@@ -852,6 +869,41 @@ os.execvpe(command[0], command, env)
         self.assertNotIn(("--ro-bind", route_wrapper,
                           os.path.realpath(bwrap)), triples)
 
+    def test_failed_nested_probe_uses_external_adapter_even_with_fresh_proc(self):
+        runtime_bin = os.path.join(self._tmp.name, "fresh-probe-fail")
+        os.makedirs(runtime_bin)
+        codex = os.path.join(runtime_bin, "codex")
+        bwrap = os.path.join(runtime_bin, "bwrap")
+        for path in (codex, bwrap):
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = self._bwrap_config(
+            [codex, "app-server"], agent_kind="codex", per_turn=True,
+            session_delta_routing=True, bwrap_proc_mode="fresh")
+        with mock.patch.object(
+                runner_mod, "_nested_bwrap_supported", return_value=False), \
+                mock.patch.object(subprocess, "run", side_effect=fake_run):
+            session = run_session(config, env={
+                "PATH": runtime_bin,
+                "CCC_AGENT_SHIM_UNDERLYING_PATH": runtime_bin,
+            })
+
+        self.assertFalse(session.policy["route_interposer_available"])
+        self.assertFalse(
+            session.policy["route_interposer_nested_bwrap_supported"])
+        triples = [tuple(seen["argv"][index:index + 3])
+                   for index in range(len(seen["argv"]) - 2)]
+        adapter = os.path.realpath(os.path.join(
+            os.path.dirname(runner_mod.__file__), "assets", "codex", "bwrap"))
+        self.assertIn(("--ro-bind", adapter, os.path.realpath(bwrap)), triples)
+
     def test_adaptive_requires_bwrap(self):
         with self.assertRaisesRegex(ValueError, "requires bwrap"):
             self.h.config(["true"], lifecycle="adaptive")
@@ -1235,7 +1287,7 @@ raise SystemExit(proc.returncode)
                         env={"CCC_AGENT_SHIM_UNDERLYING_PATH": path})
 
         adapter = os.path.realpath(os.path.join(
-            os.path.dirname(runner_module.__file__), "assets", "codex", "bwrap"))
+            os.path.dirname(runner_mod.__file__), "assets", "codex", "bwrap"))
         triples = [tuple(seen["argv"][index:index + 3])
                    for index in range(len(seen["argv"]) - 2)]
         for target in targets:

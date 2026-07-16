@@ -12,7 +12,7 @@
   "_workspace_admission_comment": "Trusted dynamic client roots must be existing directories strictly below one of these operator ceilings and below a protected BranchFS root. Keep broad-root admission off unless selecting a ceiling/protected root itself is intentional.",
   "workspace_admission_roots": ["/storage/user/Projects"],
   "allow_protected_root_workspace": false,
-  "_session_delta_comment": "Per-logical-session nested BranchFS provenance is opt-in and currently supported only for detected direct Codex app-server bwrap runtimes with per-turn control. Detection/interception failure leaves execution unchanged and labels writes shared/unattributed in the authoritative outer branch. Nested children never commit directly to real storage.",
+  "_session_delta_comment": "Per-logical-session nested BranchFS provenance is opt-in. Route capability currently requires detected direct Codex app-server bwrap, per-turn control, bwrap_proc_mode=fresh, and working nested user namespaces. Bound-proc CCC profiles use the trusted outer-sandbox adapter and label writes shared/unattributed. Detection/interception failure leaves the authoritative outer branch unchanged.",
   "session_delta_routing": false,
   "session_delta_routing_vendors": ["codex"],
 

@@ -15,12 +15,17 @@ status, review, and writes to the real underlay.
 }
 ```
 
-Routing is disabled by default. The initial supported vendor is direct
-`codex app-server` running in bwrap with per-turn control enabled. Claude Code
-remains shared/unattributed because its current official root/session signals
-do not establish a sufficiently stable logical-session-to-bwrap mapping.
-Hermes has per-conversation workspace authority but no vendor bwrap adapter;
-its writes therefore remain in the outer delta.
+Routing is disabled by default. The initial route-capable vendor is direct
+`codex app-server` running in bwrap with per-turn control, a **fresh outer
+procfs**, and a runtime where Codex's inner bwrap can create its user namespace.
+On CCC profiles that bind the parent procfs, ccc-agent deliberately disables
+nested routing and uses the trusted external-sandbox adapter instead; Codex
+keeps running inside the authoritative outer bwrap, but writes are labeled
+shared/unattributed. Claude Code remains shared/unattributed because its current
+official root/session signals do not establish a sufficiently stable
+logical-session-to-bwrap mapping. Hermes has per-conversation workspace
+authority but no vendor bwrap adapter; its writes therefore remain in the outer
+delta.
 
 If capability detection fails, ccc-agent launches normally and records routing
 as unavailable. It never blocks the agent merely because attribution is
@@ -95,13 +100,14 @@ When routing is enabled, the outer launcher:
 The adapter recognizes only documented logical-session environment hints (for
 Codex, `CODEX_THREAD_ID`), sends a bounded read-only lookup, validates the
 response shape and route-source prefix, appends route binds last before the
-bwrap command separator, and `exec`s the real bwrap. When the outer sandbox must
-bind an existing procfs, the adapter removes only nested `--unshare-pid` and
-`/proc` remount options to avoid a parent-namespace procfs/PID mismatch; mount,
-user, IPC, UTS, cgroup, seccomp, and network sandbox options remain intact. A
-fresh outer procfs needs no rewrite. Missing hints, unknown routes, probes,
-malformed argv, lookup timeouts, and protocol errors delegate to the real bwrap
-unchanged.
+bwrap command separator, and `exec`s the real bwrap. This route adapter is
+installed only with a fresh outer procfs. With a bound parent procfs, Codex's
+inner bwrap cannot safely create the required nested namespace on the supported
+CCC deployment; ccc-agent overlays the separately packaged
+`assets/codex/bwrap` external-sandbox adapter instead. That adapter executes the
+requested command directly in the already authoritative outer bwrap and does
+**not** claim per-session attribution. Missing hints, unknown routes, probes,
+malformed argv, lookup timeouts, and protocol errors never grant a route.
 
 Route lookup is tokenless but not anonymous: `SO_PEERCRED`, exact registered
 client PID/start-time, ancestry, launch boundary, vendor match, and the expected

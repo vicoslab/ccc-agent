@@ -61,7 +61,6 @@ ENV_CONFIRM_LAUNCH_WORKSPACE = "CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE"
 ENV_CLIENT_PRELOAD = "CCC_AGENT_CLIENT_PRELOAD"
 ENV_ROUTE_VENDOR = "CCC_AGENT_ROUTE_VENDOR"
 ENV_REAL_BWRAP = "CCC_AGENT_REAL_BWRAP"
-ENV_BWRAP_BOUND_PROC = "CCC_AGENT_BWRAP_BOUND_PROC"
 
 # Values from an enclosing/stale ccc-agent session must never become authority in
 # a new session.  Remove them before assigning this launch's fresh identity and
@@ -74,7 +73,7 @@ TRANSIENT_INTERNAL_ENV = (
     ENV_BOOTSTRAP_SECONDS, ENV_STABILITY_SECONDS, ENV_DETACH_SECONDS,
     ENV_HARDEN_CLIENT, ENV_MCP_REGISTER_CLIENT,
     ENV_CONFIRM_LAUNCH_WORKSPACE, ENV_CLIENT_PRELOAD,
-    ENV_ROUTE_VENDOR, ENV_REAL_BWRAP, ENV_BWRAP_BOUND_PROC,
+    ENV_ROUTE_VENDOR, ENV_REAL_BWRAP,
 )
 BWRAP_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 CODEX_BWRAP_ADAPTER = os.path.join(os.path.dirname(__file__), "assets",
@@ -945,7 +944,7 @@ def _workspace_admission_policy(session, config):
             config, "allow_protected_root_workspace", False))
 
 
-def _codex_bwrap_adapter_binds(config, process_env):
+def _codex_bwrap_adapter_binds(config, process_env, session=None):
     """Return contained-only bwrap masks for Codex's nested Linux sandbox.
 
     With ``bwrap_proc_mode=bind`` (or ``ro``), CCC unshares the outer PID
@@ -958,7 +957,11 @@ def _codex_bwrap_adapter_binds(config, process_env):
     every executable candidate in its actual launch PATH. Resolve symlinks to
     bind over the path Codex ultimately opens inside the BranchFS view.
     """
-    if not _is_codex_agent(config) or config.bwrap_proc_mode == "fresh":
+    external_fallback = bool(
+        session is not None and
+        session.policy.get("route_interposer_external_fallback"))
+    if (not _is_codex_agent(config) or
+            (config.bwrap_proc_mode == "fresh" and not external_fallback)):
         return []
 
     adapter = os.path.realpath(CODEX_BWRAP_ADAPTER)
@@ -1285,6 +1288,45 @@ def _vendor_bwrap_paths(config, env=None):
     return result
 
 
+def _nested_bwrap_supported(config, candidate):
+    """Probe the exact outer->inner user/proc namespace shape before routing."""
+    if (not os.path.isfile(config.bwrap_bin) or
+            not os.access(config.bwrap_bin, os.X_OK)):
+        # Unit/static environments use a synthetic bwrap path; runtime hosts are
+        # always probed before an interposer is declared available.
+        return True
+    uid = str(config.bwrap_uid if config.bwrap_uid is not None else os.getuid())
+    gid = str(_bwrap_gid(config))
+    outer = [
+        config.bwrap_bin, "--unshare-user", "--unshare-pid", "--unshare-ipc",
+        "--unshare-uts", "--unshare-net", "--as-pid-1", "--uid", uid, "--gid", gid,
+        "--die-with-parent",
+    ]
+    for directory in BWRAP_RO_DIRS:
+        if os.path.isdir(directory):
+            outer += ["--ro-bind", directory, directory]
+    for directory in BWRAP_USRMERGE_DIRS:
+        if os.path.islink(directory):
+            outer += ["--symlink", os.readlink(directory), directory]
+        elif os.path.isdir(directory):
+            outer += ["--ro-bind", directory, directory]
+    probe_bwrap = "/tmp/ccc-agent-inner-bwrap"
+    outer += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+              "--ro-bind", candidate, probe_bwrap, "--", probe_bwrap,
+              "--unshare-user", "--unshare-pid", "--unshare-ipc",
+              "--unshare-uts", "--uid", uid, "--gid", gid,
+              "--ro-bind", "/", "/", "--proc", "/proc", "--",
+              "/bin/true"]
+    try:
+        proc = subprocess.run(
+            outer, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=15,
+            env={"PATH": BWRAP_DEFAULT_PATH})
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _prepare_delta_routing(session, config, env=None):
     candidates = _vendor_bwrap_paths(config, env=env)
     wrapper = os.path.join(os.path.dirname(__file__), "assets", "scripts",
@@ -1293,12 +1335,19 @@ def _prepare_delta_routing(session, config, env=None):
         "/dev/shm", "ccc-agent-%s" % session.session_id)
     sandbox_routes = os.path.join(runtime_root, "routes")
     session.policy["sandbox_route_root"] = sandbox_routes
-    available = bool(
+    basic = bool(
         config.session_delta_routing and config.per_turn and
         config.confinement == "bwrap" and
         config.bwrap_proc_mode == "fresh" and candidates and
         os.path.isfile(wrapper) and os.path.isdir("/dev/shm") and
         os.access("/dev/shm", os.W_OK | os.X_OK))
+    nested_supported = bool(
+        basic and _nested_bwrap_supported(config, candidates[0]))
+    available = bool(basic and nested_supported)
+    session.policy["route_interposer_nested_bwrap_supported"] = nested_supported
+    session.policy["route_interposer_external_fallback"] = bool(
+        config.session_delta_routing and config.confinement == "bwrap" and
+        not available)
     session.policy["route_interposer_available"] = available
     session.policy["route_interposer_bwrap_paths"] = candidates if available else []
     if config.session_delta_routing:
@@ -1465,7 +1514,8 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
     # older procfs into its PID namespace, replace only Codex-visible bwrap
     # candidates with the trusted external-sandbox adapter. The outer CCC
     # bwrap executable has already launched and is unaffected by these binds.
-    codex_bwrap_binds = _codex_bwrap_adapter_binds(config, process_env)
+    codex_bwrap_binds = _codex_bwrap_adapter_binds(
+        config, process_env, session=session)
     for src, dest in codex_bwrap_binds:
         argv += ["--ro-bind", src, dest]
     if codex_bwrap_binds:
@@ -1500,8 +1550,6 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
             argv += ["--ro-bind", wrapper, candidate]
         argv += ["--setenv", ENV_ROUTE_VENDOR, "codex",
                  "--setenv", ENV_REAL_BWRAP, real_bwrap]
-        if config.bwrap_proc_mode != "fresh":
-            argv += ["--setenv", ENV_BWRAP_BOUND_PROC, "1"]
 
     _expected_mcp, direct_mcp_client = _mcp_admission_config(config)
     if direct_mcp_client:
@@ -1741,6 +1789,12 @@ def apply_change_from_store(root, change, alias_map):
         elif os.path.isdir(base):
             shutil.rmtree(base)
     elif change.kind == "dir":
+        # Replacing a same-path symlink/file with an empty directory has no
+        # descendant change whose parent preflight would catch the alias. Remove
+        # the final non-directory object explicitly rather than letting
+        # makedirs(exist_ok=True) follow it outside the protected root.
+        if os.path.islink(base) or os.path.isfile(base):
+            os.unlink(base)
         os.makedirs(base, exist_ok=True)
     elif os.path.lexists(delta):
         parent = os.path.dirname(base)

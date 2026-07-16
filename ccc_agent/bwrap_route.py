@@ -15,7 +15,6 @@ import sys
 
 DEFAULT_ROUTE_SOCKET = "/tmp/ccc-agent/control.sock"
 DEFAULT_REAL_BWRAP = "/run/ccc-agent/real-bwrap"
-BOUND_PROC_ENV = "CCC_AGENT_BWRAP_BOUND_PROC"
 ROUTE_SOURCE_ROOT = "/run/ccc-agent/routes"
 MAX_MESSAGE_BYTES = 65536
 MAX_BINDINGS = 16
@@ -142,41 +141,6 @@ def _route_bind_args(route):
     return result
 
 
-def adapt_bound_proc(argv):
-    """Avoid nested PID/proc mismatch while preserving the mount sandbox.
-
-    Outer CCC bwrap may expose procfs from its parent PID namespace. Codex's
-    nested bwrap must then inherit that procfs rather than unsharing PID and
-    mounting another `/proc`; all other mount/user/network options remain intact.
-    Unknown aggregate forms are delegated unchanged.
-    """
-    argv = list(argv)
-    if "--unshare-all" in argv:
-        return argv, False
-    try:
-        separator = argv.index("--")
-    except ValueError:
-        return argv, False
-    result = []
-    changed = False
-    index = 0
-    while index < separator:
-        option = argv[index]
-        if option in ("--unshare-pid", "--unshare-pid-try"):
-            changed = True
-            index += 1
-            continue
-        if option in ("--proc", "--proc-try") and index + 1 < separator:
-            destination = argv[index + 1]
-            if destination == "/proc":
-                changed = True
-                index += 2
-                continue
-        result.append(option)
-        index += 1
-    return result + argv[separator:], changed
-
-
 def apply_route(argv, route):
     """Append route binds after vendor mounts and before the command separator."""
     argv = list(argv)
@@ -212,8 +176,6 @@ def main(argv=None, environ=None, real_bwrap=None,
         raise RouteProtocolError("real bwrap path is outside the trusted runtime")
 
     routed_argv = argv
-    if environ.get(BOUND_PROC_ENV) == "1":
-        routed_argv, _proc_adapted = adapt_bound_proc(argv)
     provider = str(environ.get("CCC_AGENT_ROUTE_VENDOR", "")).lower()
     hint = _logical_hint(provider, environ)
     route = None

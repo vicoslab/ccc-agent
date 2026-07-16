@@ -137,8 +137,20 @@ class TestWorkspaceSessionReplacement(unittest.TestCase):
         self.assertEqual(record["state"], "invalid")
         self.assertEqual(self.h.session.policy["mcp_workspace_roots"], [])
 
+    def test_unavailable_interposer_does_not_provision_nested_route(self):
+        self.h.session.policy["session_delta_routing"] = True
+        self.h.session.policy["route_interposer_available"] = False
+        self.h.session.policy["session_delta_routing_vendors"] = ["codex"]
+
+        response = self.replace(
+            "thread-unrouted", 1, ["/storage/user/Projects/proj-a"])
+
+        self.assertIsNone(response.get("route_id"))
+        self.assertEqual(self.h.session.session_delta_routes, {})
+
     def test_codex_workspace_lifecycle_provisions_and_merges_route(self):
         self.h.session.policy["session_delta_routing"] = True
+        self.h.session.policy["route_interposer_available"] = True
         self.h.session.policy["session_delta_routing_vendors"] = ["codex"]
         active = self.replace(
             "thread-route", 1, ["/storage/user/Projects/proj-a"])
@@ -162,6 +174,7 @@ class TestWorkspaceSessionReplacement(unittest.TestCase):
         self.h.session.policy["allowed_scopes"] = []
         self.h.session.policy["workspace_scope_ceiling"] = []
         self.h.session.policy["session_delta_routing"] = True
+        self.h.session.policy["route_interposer_available"] = True
         self.h.session.policy["session_delta_routing_vendors"] = ["codex"]
         active = self.replace(
             "thread-safe-apply", 1, ["/storage/user/Projects/proj-a"])
