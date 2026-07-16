@@ -35,7 +35,7 @@ from .paths import is_within, normalize
 from .policy import (ABORT, AUTO_COMMIT, NO_CHANGES, PENDING_REVIEW,
                      PolicyConfig, PolicyDecision, evaluate, split_ignored)
 from .previous_commits import split_previously_committed_changes
-from .session import (ProtectedRoot, Session, is_remote_bridge,
+from .session import (TERMINAL_STATES, ProtectedRoot, Session, is_remote_bridge,
                       remote_bridge_agent_kind)
 from .turn import TurnController
 
@@ -1652,6 +1652,7 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
     control_server = None
     listener = None
     session_env_path = None
+    discard_remote_bridge = False
     lifecycle_path = os.path.join(config.store.control_dir(session.session_id),
                                   "lifecycle.sock")
     try:
@@ -1710,7 +1711,10 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
         session.add_event("agent-exit", str(returncode))
 
         if is_remote_bridge(session):
-            _discard_remote_bridge_session(session, config.store, config.backend)
+            # Bundle removal must wait until the control server and handoff files
+            # are closed in ``finally``; otherwise SessionStore.remove races a
+            # concurrently changing non-empty control directory.
+            discard_remote_bridge = True
         else:
             session.transition("finalizing")
             config.store.save(session)
@@ -1734,6 +1738,24 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
             pass
         _unmount_all(session, config.backend)
         _remove_session_env_handoff(session_env_path)
+
+    if discard_remote_bridge:
+        try:
+            _discard_remote_bridge_session(session, config.store, config.backend)
+        except Exception as exc:
+            # Teardown has already completed, so always deliver a terminal status
+            # even if unexpected metadata I/O fails during bundle removal.
+            session.add_event(
+                "error", "unexpected remote bridge cleanup failure: %s" % exc)
+            if session.state not in TERMINAL_STATES:
+                try:
+                    session.transition("failed")
+                except ValueError:
+                    pass
+            try:
+                config.store.save(session)
+            except Exception:
+                pass
 
     _adaptive_status(status_fd, "finished", session=session.to_dict())
     try:
