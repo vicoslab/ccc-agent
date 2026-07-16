@@ -34,6 +34,9 @@ development/validation procedures.
   workspace scope is commit authority, hook proposal limits, Claude MCP Roots,
   Codex app-server observation, Hermes in-process signaling, replacement and
   cleanup rules, and spoofing defenses.
+- [Per-logical-session delta routing](session-delta-routing.md) — optional nested
+  BranchFS provenance, Codex bwrap interception, durable recovery, reconciliation,
+  safe apply, failure behavior, and limitations.
 - [Design decisions](design-decisions.md) — why BranchFS, why rootless bwrap, why
   process-exit finalization remains authoritative, why hooks are best-effort, and
   other selected tradeoffs.

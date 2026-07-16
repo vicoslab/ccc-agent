@@ -63,8 +63,8 @@ annotated example.
 | `policy` | Default policy applied to runs unless overridden by CLI flags. |
 | `workspace_admission_roots` | Maximum operator-selected domain for trusted dynamic workspace roots. Paths are CCC-canonicalized and must be under protected storage. Defaults to the protected visible roots for compatibility. |
 | `allow_protected_root_workspace` | Permit a dynamic workspace to equal its admission/protected root. Default `false`; ordinary dynamic roots must be strict descendants. |
-| `session_delta_routing` | Enable optional per-logical-session delta routing. Default `false`. The outer BranchFS+bwrap boundary is unchanged. |
-| `session_delta_routing_vendors` | Explicit routing vendor allowlist. Defaults to `["codex"]`; it has no effect while routing is disabled. |
+| `session_delta_routing` | Opt into nested per-logical-session provenance. Default `false`. Currently requires bwrap, per-turn control, and a detected direct Codex app-server runtime; failure degrades to the unchanged outer branch. |
+| `session_delta_routing_vendors` | Explicit routing vendor allowlist. Defaults to `["codex"]`; unsupported vendors remain shared/unattributed and the key has no effect while routing is disabled. |
 
 ## Protected roots
 
@@ -111,6 +111,15 @@ An explicit `ccc-agent run --workspace` remains an operator launch decision, but
 it is normalized, checked beneath protected storage, and identity-revalidated
 before the branch session is created. Dynamic admission ceilings do not weaken or
 replace the outer BranchFS+bwrap containment boundary.
+
+When session-delta routing is enabled, no extra path or socket configuration is
+required. ccc-agent detects the Codex launcher and adjacent vendor bwrap, creates
+an ephemeral private adapter runtime, and records capability status in the
+session. Detection/interception failure is fail-open for execution but fail-safe
+for storage: all writes remain in the complete outer branch as
+shared/unattributed changes. Nested children can merge only into that outer
+branch. See [Per-logical-session delta routing](session-delta-routing.md) for
+recovery, review categories, artifacts, and limitations.
 
 ## Agent runtime state
 

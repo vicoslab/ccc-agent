@@ -93,8 +93,8 @@ a proposal and leaves `allowed_scopes` unchanged. Hook removal can clean its own
 proposal or narrow a hook-owned sub-scope, but cannot remove static or
 authenticated roots.
 
-Dynamic roots come from complete replacement sets reported by authenticated
-client channels:
+Dynamic roots come from complete per-logical-session replacement records reported
+by authenticated client channels:
 
 - Claude uses MCP `roots/list` on the pinned hardened MCP connection;
 - direct Codex app-server launches are observed by the trusted foreground or
@@ -109,6 +109,23 @@ revalidates the relevant runner/client/MCP connection and descriptor isolation,
 then validates all paths under protected BranchFS roots. Missing or spoofable
 signals narrow authority and leave changes for review. See the complete
 [trusted workspace-scope protocol](trusted-workspace-scope-protocol.md).
+
+### Optional per-logical-session delta routing
+
+When explicitly enabled for a supported vendor, ccc-agent creates opaque nested
+BranchFS branches over the live outer session branch. A package-owned read-only
+Codex bwrap adapter can route one documented thread ID into its pre-provisioned
+child. The adapter is not an authority endpoint: it cannot admit workspaces,
+create routes, or commit data, and lookup failures delegate to the real bwrap
+unchanged.
+
+At thread end, children freeze and merge only into the outer branch. Final outer
+status is reconciled against route snapshots, the outer baseline, merge outcomes,
+and post-merge fingerprints. Only exact attributed paths beneath that route's
+admitted roots may auto-apply; conflicts, shared influence, stale fingerprints,
+or unresolved route states force pending review. The outer branch remains the
+complete authoritative boundary. See
+[Per-logical-session delta routing](session-delta-routing.md).
 
 ## Sandbox layout in `bwrap` mode
 
@@ -178,6 +195,8 @@ Generated review artifacts live under:
   ignored.<root>.json
   warnings.<root>.json
   policy-decision.json
+  route-reconciliation.json        # when session-delta routing is enabled
+  routes/<route-id>/{route,status,merge}.json
 ```
 
 Rules:

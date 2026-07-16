@@ -128,6 +128,18 @@ The runtime must load trusted hook code that the contained agent can read but no
 edit. At the same time, normal direct agent runs should not be forced through
 containment hooks.
 
+## Nested session deltas are provenance, not containment
+
+**Decision:** optional per-logical-session nested BranchFS branches may improve
+attribution, but the outer session branch remains the sole complete containment
+and review boundary.
+
+**Why:** vendor session signals and bwrap interception are version-sensitive and
+cannot safely become storage authority. A missed route must degrade to an outer
+shared/unattributed delta, not bypass review. Children therefore merge only into
+the outer branch; exact admitted roots, baselines, conflicts, and fingerprints
+are reconciled before any selective real-underlay apply.
+
 ## JSON configuration and session records
 
 **Decision:** use JSON rather than YAML for trusted config/session artifacts.

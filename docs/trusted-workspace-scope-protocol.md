@@ -71,19 +71,26 @@ assets is outside this protocol's guarantees.
 
 ## Persisted state model
 
-The supervisor keeps four distinct categories in session policy:
+The supervisor persists `workspace_state_version: 2` plus an
+`authenticated_workspace_sessions` mapping. Each key is derived from the trusted
+source, process incarnation, and a SHA-256 digest of the logical session ID. Each
+record contains the last accepted generation, `active`/`ended` state, and exact
+admitted root records with canonical paths and identity snapshots. Raw vendor,
+thread, conversation, or hook IDs are not persisted.
+
+The policy retains these compatibility/derived categories:
 
 | State | Meaning | Authority |
 |---|---|---|
 | `workspace_scope_ceiling` | Static/operator-authorized roots present before untrusted hook updates. | Trusted outer configuration/launch. |
-| `mcp_workspace_roots` | Current complete dynamic root set from an authenticated client source. | Process/connection-pinned client or trusted PID 1. |
+| `mcp_workspace_roots` | Derived union of every active authenticated logical-session record. It is not the source of truth. | Derived only. |
 | `hook_workspace_proposals` | Out-of-ceiling hook hints with per-inner-session owners. | Untrusted; never auto-commit authority. |
 | `hook_workspace_refs` | Hook-owned sub-scopes that are already inside the ceiling. | May narrow/refine existing authority, never broaden it. |
 
-`workspace_scopes` and `allowed_scopes` are the effective policy derived from
-static scopes plus authenticated roots and safe hook-owned sub-scopes. Legacy
-state is upgraded conservatively: old hook-owned and authenticated dynamic roots
-are excluded when the operator ceiling is first reconstructed.
+`workspace_scopes` and `allowed_scopes` are derived from static scopes, the
+active authenticated-session union, and safe hook-owned sub-scopes. Legacy
+records load without assigning an old global dynamic union to any logical
+session; fresh trusted replacements repopulate versioned authority.
 
 All comparisons use normalized absolute paths and CCC's alias map, so equivalent
 `/home/<user>` and `/storage/user/...` spellings do not create independent
@@ -120,12 +127,11 @@ observed descriptor isolation provide the authority.
 ### 1. Static operator scope and explicit launch workspace
 
 Paths selected by trusted outer configuration (`workspace`, static
-`allowed_scopes`, or equivalent operator options) form the initial ceiling.
-
-For an ordinary direct launch with an explicit workspace, bwrap sets
-`CCC_AGENT_CONFIRM_LAUNCH_WORKSPACE=1`. After exact-client registration and PID-1
-transport hardening, PID 1 may confirm the launch cwd. An incidental server or
-bootstrap cwd is not confirmed merely because the process started there.
+`allowed_scopes`, or equivalent operator options) form the initial ceiling. An
+explicit launch workspace is admitted and identity-snapshotted before the branch
+session is created, persisted as `launch_workspace_admission`, and revalidated
+before automatic apply. An incidental server/bootstrap cwd is not granted
+workspace authority merely because the process started there.
 
 ### 2. Claude Code: MCP Roots
 
@@ -146,8 +152,9 @@ Only when the client and MCP process are descriptor-hardened does the server:
    response stale, discard it when received, and issue a second list request;
 5. accept only absolute local `file:` URIs (`file:///...` or localhost);
 6. ignore remote/non-file/relative entries; and
-7. send the complete resulting path set to `turn-confirm-workspace-roots` over
-   the already pinned control connection.
+7. replace the MCP transport's single logical root-set session with the complete
+   resulting path set and a strictly increasing generation over the already
+   pinned control connection.
 
 The supervisor revalidates the MCP connection before applying the replacement.
 No Form Mode prompt is used for routine root synchronization. Form Mode remains
@@ -182,9 +189,11 @@ per-thread successful-response generations prevent an older out-of-order respons
 from overwriting a newer root or resurrecting a thread after archive/delete.
 Resume may obtain its stored cwd/roots from the successful response. Fork
 responses are tracked under the new thread ID rather than replacing the parent
-thread. Roots are stored per thread and the supervisor receives their union, so
-one concurrent thread cannot remove another thread's workspace. Archive/delete
-removes only the named thread and can produce an empty replacement set.
+thread. Every successful response produces a typed replacement for that thread
+only. Archive/delete ends only the named thread. The supervisor derives the
+active union for compatibility, so concurrent threads cannot remove one
+another's authority; the original logical ID is retained only transiently on the
+trusted channel and is persisted as a digest.
 
 The proxy preserves the original JSONL bytes on stdout/stdin. It does not modify
 model requests or server responses. The launch cwd is included only when the
@@ -223,11 +232,11 @@ being the component that prepends the tag. Deployments that pass arbitrary API
 message text through without enforcing that prefix do not satisfy this trust
 assumption and must use a framework-owned workspace hook field instead.
 
-Hermes keeps a locked map of active inner session IDs to roots. Every turn/session
-switch sends the complete union, so concurrent WebUI conversations cannot remove
-one another's scope. Session end removes only that session and sends the remaining
-union (possibly empty). The shell-hook call remains a non-authoritative
-proposal/cleanup hint.
+Hermes keeps a locked map of active inner session IDs to roots. Each turn/session
+switch replaces only that session's complete root set with a monotonic generation;
+session end sends an `ended` replacement for only that session. Concurrent WebUI
+conversations therefore cannot remove one another's authority. The shell-hook
+call remains a non-authoritative proposal/cleanup hint.
 
 Only trusted immutable plugins should execute inside the hardened official
 Hermes process. Process pinning cannot distinguish trusted code from malicious
@@ -265,20 +274,25 @@ create broader auto-commit authority.
 
 ## Supervisor replacement algorithm
 
-For an authenticated `turn-confirm-workspace-roots(paths)` request, the
-`TurnController`:
+For an authenticated `workspace-session-replace` request, the control server
+first derives the source and process-incarnation key from its pinned transport,
+overwriting caller claims. `TurnController` then:
 
-1. validates every input as an absolute protected path;
-2. canonicalizes aliases and removes duplicate spellings;
-3. loads the previous authenticated root set;
-4. removes old authenticated roots omitted from the new set unless they remain
-   independently static/ceiling or hook-owned;
-5. adds every new confirmed root to effective workspace and allowed scopes;
+1. validates source, logical ID shape, monotonic integer generation, and state;
+2. rejects stale generations and accepts same-generation retries only when the
+   complete replacement is identical;
+3. admits every absolute path beneath both a protected root and the configured
+   operator ceiling, recording canonical paths and identity snapshots;
+4. stores only a logical-ID digest plus the complete record for that one session;
+5. derives the active authenticated union and rewrites effective
+   workspace/allowed scopes without disturbing concurrent sessions;
 6. removes matching untrusted proposals;
-7. persists the new complete authenticated set and an audit event; and
-8. returns the effective workspace/allowed/proposal state.
+7. optionally provisions or ends an already-authorized nested route; and
+8. persists the replacement and audit event.
 
-The control server accepts this operation only from one of:
+An `ended` record has no roots but retains its last generation so an old message
+cannot resurrect it. Transport teardown revokes records matching only that trusted
+source/process incarnation. The control server accepts this operation only from:
 
 - the pinned hardened MCP connection;
 - the pinned hardened in-process Hermes workspace connection; or
@@ -298,19 +312,18 @@ current roots.
 
 At runtime:
 
-- MCP Roots and Hermes send complete replacement sets;
-- Codex tracks per-thread roots and sends their union;
+- MCP Roots replaces one transport-scoped logical root-set session;
+- Codex and Hermes replace/end each logical thread/conversation independently;
 - hook end events clean only their own proposals/refinements; and
 - process-exit BranchFS finalization remains authoritative even if all dynamic
   signaling fails.
 
-If a pinned MCP/Hermes workspace transport closes, the control server waits a
-short teardown grace period. If the exact official client is still alive, it
-internally replaces authenticated roots with an empty set. If the official client
-has already exited, PID-1 teardown prevents further agent work and the last valid
-roots remain only for immediate finalization. Thus a lost trusted signal cannot
-leave stale policy active while the client continues running; affected live
-changes fall back to normal review.
+If a pinned MCP/Hermes workspace transport closes while the official client is
+still live, the control server revokes only records owned by that exact
+source/process incarnation. If the official client has already exited, PID-1
+teardown prevents further agent work and process-exit finalization reconciles the
+outer branch. Thus a lost trusted signal cannot remove an unrelated concurrent
+session or leave its own stale live authority active.
 
 ## Attack analysis
 
@@ -393,8 +406,8 @@ When modifying this protocol, verify all of the following:
 - [ ] Both foreground and adaptive PID-1 runners register, harden, and observe
       Codex consistently.
 - [ ] Hermes accepts only framework-owned fields or a runtime-enforced WebUI tag
-      on `platform=api_server`/`webui`, rejects messaging-platform prose, keeps
-      concurrent session roots as a union, and removes only the ending session.
+      on `platform=api_server`/`webui`, rejects messaging-platform prose, replaces
+      concurrent sessions independently, and ends only the named session.
 - [ ] Invalid/out-of-protected paths fail before state mutation.
 - [ ] Resume/start cleanup removes stale dynamic roots but preserves static scope.
 - [ ] Full tests, static checks, wheel asset inspection, and packaged-source tests

@@ -293,24 +293,24 @@ an authenticated client root signal. Hook removal can remove its own proposal or
 hook-owned sub-scope, but cannot remove static or authenticated roots. These
 commands do not `cd`, remount BranchFS, expose the underlay, or commit data.
 
-Authenticated dynamic roots use complete replacement sets:
+Authenticated dynamic roots use complete per-logical-session replacements:
 
 - **Claude:** the pinned, descriptor-hardened CCC MCP server requests standard
   MCP Roots after initialization and root-change notifications. Only absolute
-  local `file:` URIs are forwarded.
+  local `file:` URIs replace its transport-scoped logical root-set session.
 - **Codex app-server:** trusted PID 1 observes transparent JSONL requests and
-  matching successful responses, tracks roots per thread, and confirms their
-  union. Failed requests grant nothing. Foreground and adaptive/server PID-1
-  paths both use this mechanism.
+  matching successful responses, replacing only the affected thread with a
+  monotonic generation. Failed requests grant nothing. Foreground and
+  adaptive/server PID-1 paths both use this mechanism.
 - **Hermes:** the exact registered hardened Hermes process opens one pinned
   in-process workspace channel. Framework-owned workspace kwargs are preferred;
   an exact leading `Workspace::v1` tag is accepted only from the WebUI/API
   adapter (`platform=api_server`, with `webui` retained for compatible runtimes).
-  Missing metadata does not fall back to process cwd. A locked per-session map
-  confirms the active-session union, and session end removes only its own root.
-- **Explicit direct launch:** trusted PID 1 may confirm launch cwd only when the
-  outer operator selected a workspace; incidental server/bootstrap cwd is not
-  authority.
+  Missing metadata does not fall back to process cwd. Each conversation is
+  replaced/ended independently rather than as a client-global union.
+- **Explicit direct launch:** the outer supervisor admits and identity-snapshots
+  the operator-selected workspace before creating the session, then revalidates
+  it before automatic apply. Incidental server/bootstrap cwd is not authority.
 
 Each privileged replacement rechecks PID/start-time, parentage, pinned connection,
 and `/proc/<pid>/fd` protection, then validates every path beneath configured
