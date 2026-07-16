@@ -777,8 +777,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             def admit(self, client):
                 confirmations.append(("admit", client))
 
-            def confirm_workspace_roots(self, paths):
-                confirmations.append(("roots", list(paths)))
+            def replace_workspace_session(self, logical_id, generation, paths,
+                                          state="active"):
+                confirmations.append(("replace", logical_id, generation,
+                                      list(paths), state))
 
         old = self.set_contained_env()
         try:
@@ -793,7 +795,9 @@ class TestHermesContainmentPlugin(unittest.TestCase):
         finally:
             self.restore_env(old)
         self.assertIn(("admit", "hermes"), confirmations)
-        self.assertIn(("roots", ["/storage/user/Projects/web"]), confirmations)
+        self.assertIn(("replace", "webui-session", 1,
+                       ["/storage/user/Projects/web"], "active"),
+                      confirmations)
 
     def test_workspace_prefix_is_ignored_outside_authoritative_webui(self):
         mod = self.load_plugin()
@@ -806,8 +810,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             def admit(self, client):
                 confirmations.append(("admit", client))
 
-            def confirm_workspace_roots(self, paths):
-                confirmations.append(("roots", list(paths)))
+            def replace_workspace_session(self, logical_id, generation, paths,
+                                          state="active"):
+                confirmations.append(("replace", logical_id, generation,
+                                      list(paths), state))
 
         old = self.set_contained_env()
         try:
@@ -821,7 +827,7 @@ class TestHermesContainmentPlugin(unittest.TestCase):
                               "continue"))
         finally:
             self.restore_env(old)
-        self.assertFalse(any(item[0] == "roots" for item in confirmations))
+        self.assertFalse(any(item[0] == "replace" for item in confirmations))
 
     def test_session_end_clears_process_pinned_hermes_workspace(self):
         mod = self.load_plugin()
@@ -834,8 +840,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             def admit(self, client):
                 confirmations.append(("admit", client))
 
-            def confirm_workspace_roots(self, paths):
-                confirmations.append(("roots", list(paths)))
+            def replace_workspace_session(self, logical_id, generation, paths,
+                                          state="active"):
+                confirmations.append(("replace", logical_id, generation,
+                                      list(paths), state))
 
         old = self.set_contained_env()
         try:
@@ -851,12 +859,14 @@ class TestHermesContainmentPlugin(unittest.TestCase):
                                       platform="api_server")
         finally:
             self.restore_env(old)
-        self.assertEqual([item for item in confirmations if item[0] == "roots"], [
-            ("roots", ["/storage/user/Projects/web"]),
-            ("roots", []),
-        ])
+        self.assertEqual(
+            [item for item in confirmations if item[0] == "replace"], [
+                ("replace", "webui-session", 1,
+                 ["/storage/user/Projects/web"], "active"),
+                ("replace", "webui-session", 2, [], "ended"),
+            ])
 
-    def test_concurrent_hermes_sessions_confirm_union_and_remove_only_own_root(self):
+    def test_concurrent_hermes_sessions_replace_independently(self):
         mod = self.load_plugin()
         confirmations = []
 
@@ -867,8 +877,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             def admit(self, _client):
                 pass
 
-            def confirm_workspace_roots(self, paths):
-                confirmations.append(list(paths))
+            def replace_workspace_session(self, logical_id, generation, paths,
+                                          state="active"):
+                confirmations.append((logical_id, generation,
+                                      list(paths), state))
 
         old = self.set_contained_env()
         try:
@@ -889,10 +901,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             self.restore_env(old)
 
         self.assertEqual(confirmations, [
-            ["/storage/user/Projects/a"],
-            ["/storage/user/Projects/a", "/storage/user/Projects/b"],
-            ["/storage/user/Projects/b"],
-            [],
+            ("session-a", 1, ["/storage/user/Projects/a"], "active"),
+            ("session-b", 1, ["/storage/user/Projects/b"], "active"),
+            ("session-a", 2, [], "ended"),
+            ("session-b", 2, [], "ended"),
         ])
 
     def test_missing_workspace_metadata_does_not_confirm_process_cwd(self):
@@ -906,8 +918,10 @@ class TestHermesContainmentPlugin(unittest.TestCase):
             def admit(self, client):
                 confirmations.append(("admit", client))
 
-            def confirm_workspace_roots(self, paths):
-                confirmations.append(("roots", list(paths)))
+            def replace_workspace_session(self, logical_id, generation, paths,
+                                          state="active"):
+                confirmations.append(("replace", logical_id, generation,
+                                      list(paths), state))
 
         old = self.set_contained_env()
         try:
@@ -919,7 +933,7 @@ class TestHermesContainmentPlugin(unittest.TestCase):
                                  platform="telegram")
         finally:
             self.restore_env(old)
-        self.assertFalse(any(item[0] == "roots" for item in confirmations))
+        self.assertFalse(any(item[0] == "replace" for item in confirmations))
 
     def test_pre_llm_call_is_inert_outside_contained_session(self):
         mod = self.load_plugin()
