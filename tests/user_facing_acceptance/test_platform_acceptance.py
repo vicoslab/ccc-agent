@@ -21,6 +21,7 @@ class TestPlatformManifest(unittest.TestCase):
                 json.dump({
                     "ccc_agent": "/usr/local/bin/ccc-agent",
                     "ccc_agent_config": "/etc/ccc-agent/config.json",
+                    "codex_command": "/opt/codex/bin/codex",
                     "test_root": "/storage/user/ccc-agent-acceptance-platform",
                     "artifacts_dir": os.path.join(tmp, "artifacts"),
                 }, handle)
@@ -32,6 +33,20 @@ class TestPlatformManifest(unittest.TestCase):
                 "/storage/user/ccc-agent-acceptance-platform")
             self.assertEqual(manifest.ccc_agent, "/usr/local/bin/ccc-agent")
 
+    def test_rejects_manifest_without_codex_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "platform.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "ccc_agent": "/usr/local/bin/ccc-agent",
+                    "ccc_agent_config": "/etc/ccc-agent/config.json",
+                    "test_root": "/storage/user/ccc-agent-acceptance-platform",
+                }, handle)
+
+            with self.assertRaisesRegex(
+                    PlatformAcceptanceError, "codex_command"):
+                load_platform_manifest(path)
+
     def test_rejects_broad_test_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "platform.json")
@@ -39,6 +54,7 @@ class TestPlatformManifest(unittest.TestCase):
                 json.dump({
                     "ccc_agent": "/usr/local/bin/ccc-agent",
                     "ccc_agent_config": "/etc/ccc-agent/config.json",
+                    "codex_command": "/opt/codex/bin/codex",
                     "test_root": "/storage/user",
                 }, handle)
 
@@ -110,20 +126,54 @@ class TestPlatformAcceptanceContract(unittest.TestCase):
             "review-abort",
             "session-cleanup",
             "package-assets",
-            "codex-plugin-mcp",
+            "codex-app-server-mcp",
+            "claude-plugin-mcp",
         }.issubset(expected))
 
-    def test_codex_probe_requires_mcp_row_and_no_registration_warning(self):
-        good = "Name Command Args\nccc ccc-agent mcp-server --client codex\n"
-        self.assertIsNone(PlatformAcceptanceRunner._codex_probe_problem(good, ""))
-        registration = PlatformAcceptanceRunner._codex_probe_problem(
+    def test_codex_protocol_probe_requires_initialized_ccc_tool_inventory(self):
+        tools = {name: {"name": name} for name in
+                 PlatformAcceptanceRunner.CCC_MCP_TOOLS}
+        good = {
+            "id": 2,
+            "result": {"data": [{
+                "name": "ccc",
+                "serverInfo": {"name": "ccc-agent", "version": "1"},
+                "tools": tools,
+            }]},
+        }
+        self.assertIsNone(
+            PlatformAcceptanceRunner._codex_inventory_problem(good, ""))
+        missing_tools = json.loads(json.dumps(good))
+        missing_tools["result"]["data"][0]["tools"].pop("ccc_status")
+        problem = PlatformAcceptanceRunner._codex_inventory_problem(
+            missing_tools, "")
+        self.assertIn("missing tools", problem or "")
+        static_listing = "Name Command Args\nccc ccc-agent mcp-server --client codex\n"
+        problem = PlatformAcceptanceRunner._codex_inventory_problem(
+            static_listing, "")
+        self.assertIn("protocol response", problem or "")
+
+    def test_codex_status_call_requires_successful_structured_result(self):
+        good = {"id": 4, "result": {"structuredContent": {
+            "kept_count": 0, "committed_count": 0}}}
+        self.assertIsNone(
+            PlatformAcceptanceRunner._codex_status_problem(good))
+        error = {"id": 4, "error": {"code": -32001,
+                                      "message": "already pinned"}}
+        self.assertIn("already pinned",
+                      PlatformAcceptanceRunner._codex_status_problem(error) or "")
+
+    def test_claude_probe_requires_connected_plugin_mcp(self):
+        good = ("Checking MCP server health…\n"
+                "plugin:ccc:ccc: ccc-agent mcp-server --client claude - "
+                "✔ Connected\n")
+        self.assertIsNone(PlatformAcceptanceRunner._claude_probe_problem(good, ""))
+        registration = PlatformAcceptanceRunner._claude_probe_problem(
             good, "initial client/workspace registration unavailable")
-        self.assertIsNotNone(registration)
         self.assertIn("registration failed", registration or "")
-        missing = PlatformAcceptanceRunner._codex_probe_problem(
-            "Name Command Args\n", "")
-        self.assertIsNotNone(missing)
-        self.assertIn("did not list", missing or "")
+        disconnected = good.replace("✔ Connected", "✘ Failed to connect")
+        problem = PlatformAcceptanceRunner._claude_probe_problem(disconnected, "")
+        self.assertIn("did not connect", problem or "")
 
     def test_session_selection_requires_one_new_expected_kind(self):
         before = {"old"}

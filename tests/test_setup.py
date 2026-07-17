@@ -421,6 +421,14 @@ raise SystemExit(proc.returncode)
                 claude_seed, "cache", "ccc-agent", "ccc", "0.2.0",
                 ".claude-plugin", "plugin.json")))
             self.assertTrue(os.path.isfile(os.path.join(
+                claude_seed, "cache", "ccc-agent", "ccc", "0.2.0",
+                ".mcp.json")))
+            with open(os.path.join(
+                    claude_seed, "cache", "ccc-agent", "ccc", "0.2.0",
+                    ".mcp.json")) as fh:
+                self.assertEqual(json.load(fh)["mcpServers"]["ccc"]["args"],
+                                 ["mcp-server", "--client", "claude"])
+            self.assertTrue(os.path.isfile(os.path.join(
                 claude_seed, "installed_plugins.json")))
 
             with open(config_path) as fh:

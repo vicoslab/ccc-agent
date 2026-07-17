@@ -26,10 +26,15 @@ The acceptance tooling has two deliberately separate layers:
    both accept and abort endings, outer workspace turn decisions plus
    conservative shared/unattributed routing fallback, protocol-clean server
    output, installed plugin/MCP metadata, configured client-hardening library,
-   package assets, and mount/socket cleanup. When `codex_command` is set in the
-   platform manifest, it also runs `codex mcp list` inside real containment,
-   requires the `ccc` MCP server, and rejects client/workspace registration
-   warnings without making a model call.
+   package assets, and mount/socket cleanup. The required `codex_command` drives
+   a real Codex app-server protocol session: it initializes the `ccc` MCP
+   server, verifies all six CCC tools, and calls non-destructive `ccc_status`.
+   When `claude_command` is set, the harness runs contained `claude mcp list`
+   and requires `plugin:ccc:ccc` to connect. Both probes reject registration
+   failures without making a model call. A wheel reinstall alone does not
+   refresh Claude's separately materialized read-only seed; system deployment
+   must rematerialize the seed from the installed package before this check can
+   pass.
 2. **Model/plugin acceptance** is the existing `core`/`full` matrix below. It
    requires authenticated vendor clients and proves native plugin behavior and
    actual user interaction.
