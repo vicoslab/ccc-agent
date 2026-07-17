@@ -204,6 +204,10 @@ class ControlServer(object):
         self._mcp_client_name = None
         self._mcp_conn = None
         self._mcp_destructive_authorized = False
+        # Recognized server-wrapper topologies may create more than one
+        # thread/global MCP subprocess under the same official app-server. They
+        # are independently pinned but always non-destructive.
+        self._read_only_mcp_connections = {}
         self._workspace_fingerprint = None
         self._workspace_client_name = None
         self._workspace_conn = None
@@ -475,24 +479,45 @@ class ControlServer(object):
         if eligibility is None:
             return {"ok": False,
                     "error": "MCP peer is not the eligible official client child"}
+        destructive_authorized = bool(eligibility["destructive_authorized"])
         with self._admission_lock:
-            if self._mcp_fingerprint is not None:
-                return {"ok": False,
-                        "error": "an MCP process/connection is already pinned"}
-            self._mcp_fingerprint = eligibility["fingerprint"]
-            self._mcp_client_name = client_name
-            self._mcp_conn = conn
-            self._mcp_destructive_authorized = bool(
-                eligibility["destructive_authorized"])
+            if destructive_authorized:
+                if (self._mcp_fingerprint is not None or
+                        self._read_only_mcp_connections):
+                    return {"ok": False,
+                            "error": "an MCP process/connection is already pinned"}
+                self._mcp_fingerprint = eligibility["fingerprint"]
+                self._mcp_client_name = client_name
+                self._mcp_conn = conn
+                self._mcp_destructive_authorized = True
+            else:
+                if self._mcp_fingerprint is not None:
+                    return {"ok": False,
+                            "error": "a destructive MCP connection is already pinned"}
+                self._read_only_mcp_connections[conn] = {
+                    "fingerprint": eligibility["fingerprint"],
+                    "client": client_name,
+                }
         return {"ok": True, "admitted": True,
-                "destructive_authorized": self._mcp_destructive_authorized,
+                "destructive_authorized": destructive_authorized,
                 "authorization_reason": eligibility["authorization_reason"]}
 
-    def _mcp_connection_valid(self, conn):
+    def _mcp_connection_record(self, conn):
         with self._admission_lock:
-            fingerprint = self._mcp_fingerprint
-            pinned = self._mcp_conn is conn
-        if not pinned or fingerprint is None:
+            if self._mcp_conn is conn and self._mcp_fingerprint is not None:
+                return (self._mcp_fingerprint,
+                        bool(self._mcp_destructive_authorized))
+            record = self._read_only_mcp_connections.get(conn)
+            if record is not None:
+                return (record["fingerprint"], False)
+        return (None, False)
+
+    def _is_mcp_connection(self, conn):
+        return self._mcp_connection_record(conn)[0] is not None
+
+    def _mcp_connection_valid(self, conn):
+        fingerprint, destructive_authorized = self._mcp_connection_record(conn)
+        if fingerprint is None:
             return False
         peer_pid, peer_start, client_pid, client_start = fingerprint
         peer = _proc_identity(peer_pid)
@@ -504,10 +529,14 @@ class ControlServer(object):
             self._launch_boundary_valid(client_pid))
         if not identity_valid:
             return False
-        if self._mcp_destructive_authorized:
+        if destructive_authorized:
             return (_proc_fds_hidden(peer_pid) and
                     _proc_fds_hidden(client_pid))
         return True
+
+    def _mcp_connection_destructive_authorized(self, conn):
+        _fingerprint, authorized = self._mcp_connection_record(conn)
+        return bool(authorized and self._mcp_connection_valid(conn))
 
     def _eligible_route_peer(self, conn, request):
         try:
@@ -572,6 +601,10 @@ class ControlServer(object):
     def _release_pinned_connection(self, conn):
         """Revoke only roots owned by a dead trusted transport."""
         client_fingerprint = None
+        with self._admission_lock:
+            if conn in self._read_only_mcp_connections:
+                self._read_only_mcp_connections.pop(conn, None)
+                return
         authority = self._workspace_authority(conn)
         with self._admission_lock:
             if self._mcp_conn is conn:
@@ -671,7 +704,8 @@ class ControlServer(object):
                     if authority is None:
                         _send_line(conn, {"ok": False,
                                           "error": "workspace session replacement requires a live pinned official client"})
-                        if self._mcp_conn is conn or self._workspace_conn is conn:
+                        if (self._is_mcp_connection(conn) or
+                                self._workspace_conn is conn):
                             continue
                         return
                     req = dict(req)
@@ -681,8 +715,7 @@ class ControlServer(object):
                     runner_valid, runner_failures = self._wait_runner_connection(
                         conn)
                     trusted_workspace = (
-                        (self._mcp_connection_valid(conn) and
-                         self._mcp_destructive_authorized) or
+                        self._mcp_connection_destructive_authorized(conn) or
                         self._workspace_connection_valid(conn) or
                         runner_valid)
                     if not trusted_workspace:
@@ -691,7 +724,8 @@ class ControlServer(object):
                                   if runner_failures else "")
                         _send_line(conn, {"ok": False,
                                           "error": "workspace confirmation requires a pinned hardened client or trusted PID 1%s" % detail})
-                        if self._mcp_conn is conn or self._workspace_conn is conn:
+                        if (self._is_mcp_connection(conn) or
+                                self._workspace_conn is conn):
                             continue
                         return
                 if (req.get("op") in MCP_ONLY_OPS and
@@ -706,11 +740,12 @@ class ControlServer(object):
                                             "turn-confirm-workspace-roots") or
                          req.get("decision") in ("commit", "discard", "revert",
                                                  "yes", "select")) and
-                        not self._mcp_destructive_authorized):
+                        not self._mcp_connection_destructive_authorized(conn)):
                     _send_line(conn, {"ok": False,
                                       "error": "destructive MCP operation requires hardened client transport"})
                     continue
-                if self._mcp_conn is conn and not self._mcp_connection_valid(conn):
+                if (self._is_mcp_connection(conn) and
+                        not self._mcp_connection_valid(conn)):
                     _send_line(conn, {"ok": False,
                                       "error": "pinned MCP process identity changed"})
                     return
@@ -734,7 +769,8 @@ class ControlServer(object):
                     resp = {"ok": False, "error": "%s: %s"
                             % (type(exc).__name__, exc)}
                 _send_line(conn, resp)
-                if self._mcp_conn is not conn and self._workspace_conn is not conn:
+                if (not self._is_mcp_connection(conn) and
+                        self._workspace_conn is not conn):
                     return
         except OSError:
             pass

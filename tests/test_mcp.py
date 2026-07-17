@@ -530,6 +530,48 @@ raise SystemExit(proc.returncode)
         self.assertFalse(eligible["destructive_authorized"])
         self.assertIn("server wrapper", eligible["authorization_reason"])
 
+    def test_multiple_server_wrapper_mcp_connections_are_read_only_and_independent(self):
+        server = ControlServer(
+            "/unused", lambda req: {}, "token", expected_clients=("codex",),
+            allow_unregistered_mcp_parent=True)
+        server._launch_pid = 100
+        server._launch_start_time = 1
+        server._launch_supported = True
+        conn_a, conn_b = object(), object()
+        identities = {
+            10: {"pid": 10, "ppid": 20, "start_time": 3,
+                 "argv": ["ccc-agent", "mcp-server"], "exe": "/bin/python"},
+            11: {"pid": 11, "ppid": 20, "start_time": 4,
+                 "argv": ["ccc-agent", "mcp-server"], "exe": "/bin/python"},
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["codex", "app-server"], "exe": "/usr/bin/codex"},
+            50: {"pid": 50, "ppid": 100, "start_time": 5,
+                 "argv": ["sh", "-c", "codex app-server"], "exe": "/bin/sh"},
+            100: {"pid": 100, "ppid": 1, "start_time": 1,
+                  "argv": ["bwrap"], "exe": "/usr/bin/bwrap"},
+        }
+
+        with mock.patch.object(control_mod, "peer_credentials",
+                               side_effect=[
+                                   (10, os.geteuid(), os.getegid()),
+                                   (11, os.geteuid(), os.getegid()),
+                               ]), mock.patch.object(
+                                   control_mod, "_proc_identity",
+                                   side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_is_descendant",
+                                  side_effect=lambda pid, ancestor: (
+                                      pid in (10, 11, 20, 50) and ancestor == 100)):
+            admitted_a = server._admit_mcp(conn_a, "codex")
+            admitted_b = server._admit_mcp(conn_b, "codex")
+            self.assertTrue(server._mcp_connection_valid(conn_a))
+            self.assertTrue(server._mcp_connection_valid(conn_b))
+            server._release_pinned_connection(conn_a)
+            self.assertTrue(server._mcp_connection_valid(conn_b))
+
+        self.assertFalse(admitted_a["destructive_authorized"])
+        self.assertFalse(admitted_b["destructive_authorized"])
+        self.assertIsNone(server._mcp_conn)
+
     def test_only_registered_initial_client_can_parent_production_mcp(self):
         server = ControlServer("/unused", lambda req: {}, "token",
                                expected_clients=("codex",))
