@@ -25,7 +25,11 @@ The acceptance tooling has two deliberately separate layers:
    foreground `run`, dedicated `serve`, the generic pending-review boundary,
    both accept and abort endings, outer workspace turn decisions plus
    conservative shared/unattributed routing fallback, protocol-clean server
-   output, package assets, and mount/socket cleanup.
+   output, installed plugin/MCP metadata, configured client-hardening library,
+   package assets, and mount/socket cleanup. When `codex_command` is set in the
+   platform manifest, it also runs `codex mcp list` inside real containment,
+   requires the `ccc` MCP server, and rejects client/workspace registration
+   warnings without making a model call.
 2. **Model/plugin acceptance** is the existing `core`/`full` matrix below. It
    requires authenticated vendor clients and proves native plugin behavior and
    actual user interaction.

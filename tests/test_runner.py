@@ -1686,10 +1686,10 @@ raise SystemExit(proc.returncode)
         triples = [(seen["argv"][i], seen["argv"][i + 1], seen["argv"][i + 2])
                    for i in range(len(seen["argv"]) - 2)]
         self.assertIn(("--ro-bind", library,
-                       "/opt/ccc-agent/libccc-client-hardening.so"), triples)
+                       "/tmp/ccc-agent/libccc-client-hardening.so"), triples)
         self.assertIn(("--setenv", "CCC_AGENT_MCP_REGISTER_CLIENT", "1"), triples)
         self.assertIn(("--setenv", "CCC_AGENT_CLIENT_PRELOAD",
-                       "/opt/ccc-agent/libccc-client-hardening.so"), triples)
+                       "/tmp/ccc-agent/libccc-client-hardening.so"), triples)
         self.assertNotIn("CCC_AGENT_HARDEN_CLIENT", seen["env"])
         self.assertNotIn("LD_PRELOAD", seen["env"])
 

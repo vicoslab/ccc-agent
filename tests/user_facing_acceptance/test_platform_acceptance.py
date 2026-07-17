@@ -7,6 +7,7 @@ from unittest import mock
 from tests.user_facing_acceptance.platform import (
     PlatformAcceptanceError,
     PlatformAcceptanceRunner,
+    _deployment_integration_problems,
     load_platform_manifest,
     main,
 )
@@ -44,6 +45,25 @@ class TestPlatformManifest(unittest.TestCase):
             with self.assertRaisesRegex(
                     PlatformAcceptanceError, "dedicated.*acceptance"):
                 load_platform_manifest(path)
+
+
+class TestDeploymentIntegration(unittest.TestCase):
+    def test_requires_configured_hardening_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.so")
+            self.assertTrue(_deployment_integration_problems({
+                "mcp_client_hardening_library": missing,
+            }))
+
+    def test_accepts_readable_executable_hardening_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = os.path.join(tmp, "hardening.so")
+            with open(library, "wb") as handle:
+                handle.write(b"test")
+            os.chmod(library, 0o555)
+            self.assertEqual(_deployment_integration_problems({
+                "mcp_client_hardening_library": library,
+            }), [])
 
 
 class TestPlatformMain(unittest.TestCase):
@@ -90,7 +110,20 @@ class TestPlatformAcceptanceContract(unittest.TestCase):
             "review-abort",
             "session-cleanup",
             "package-assets",
+            "codex-plugin-mcp",
         }.issubset(expected))
+
+    def test_codex_probe_requires_mcp_row_and_no_registration_warning(self):
+        good = "Name Command Args\nccc ccc-agent mcp-server --client codex\n"
+        self.assertIsNone(PlatformAcceptanceRunner._codex_probe_problem(good, ""))
+        registration = PlatformAcceptanceRunner._codex_probe_problem(
+            good, "initial client/workspace registration unavailable")
+        self.assertIsNotNone(registration)
+        self.assertIn("registration failed", registration or "")
+        missing = PlatformAcceptanceRunner._codex_probe_problem(
+            "Name Command Args\n", "")
+        self.assertIsNotNone(missing)
+        self.assertIn("did not list", missing or "")
 
     def test_session_selection_requires_one_new_expected_kind(self):
         before = {"old"}

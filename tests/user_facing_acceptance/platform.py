@@ -30,6 +30,7 @@ class PlatformManifest:
     ccc_agent_config: str
     test_root: str
     artifacts_dir: str
+    codex_command: Optional[str] = None
     timeout_seconds: float = 180.0
     poll_seconds: float = 0.2
 
@@ -56,6 +57,19 @@ def _atomic_json(path: str, value: Mapping) -> None:
     os.replace(temporary, path)
 
 
+def _deployment_integration_problems(config: Mapping) -> List[str]:
+    problems = []
+    hardening = config.get("mcp_client_hardening_library")
+    if not hardening or not os.path.isfile(str(hardening)):
+        problems.append(
+            "mcp_client_hardening_library is missing: %s" % hardening)
+    elif not os.access(str(hardening), os.R_OK | os.X_OK):
+        problems.append(
+            "mcp_client_hardening_library is not readable/executable: %s" %
+            hardening)
+    return problems
+
+
 def load_platform_manifest(path: str) -> PlatformManifest:
     data = _read_json(path)
     missing = [key for key in ("ccc_agent", "ccc_agent_config", "test_root")
@@ -76,6 +90,8 @@ def load_platform_manifest(path: str) -> PlatformManifest:
         ccc_agent_config=os.path.expanduser(str(data["ccc_agent_config"])),
         test_root=test_root,
         artifacts_dir=artifacts,
+        codex_command=(os.path.expanduser(str(data["codex_command"]))
+                       if data.get("codex_command") else None),
         timeout_seconds=float(data.get("timeout_seconds", 180)),
         poll_seconds=float(data.get("poll_seconds", 0.2)),
     )
@@ -84,6 +100,7 @@ def load_platform_manifest(path: str) -> PlatformManifest:
 class PlatformAcceptanceRunner:
     CHECKS = (
         "package-assets",
+        "codex-plugin-mcp",
         "foreground-review-boundary",
         "review-accept",
         "review-abort",
@@ -105,12 +122,17 @@ class PlatformAcceptanceRunner:
         self.results: Dict[str, Mapping] = {}
 
     def preflight(self) -> None:
-        problems = []
+        problems = _deployment_integration_problems(self.config)
         if os.environ.get("CCC_AGENT_SESSION"):
             problems.append("CCC_AGENT_SESSION is set; run outside containment")
         if not (os.path.isfile(self.manifest.ccc_agent)
                 and os.access(self.manifest.ccc_agent, os.X_OK)):
             problems.append("ccc_agent is not executable: %s" % self.manifest.ccc_agent)
+        if self.manifest.codex_command and not (
+                os.path.isfile(self.manifest.codex_command) and
+                os.access(self.manifest.codex_command, os.X_OK)):
+            problems.append("codex_command is not executable: %s" %
+                            self.manifest.codex_command)
         if self.config.get("backend", "branchfs") != "branchfs":
             problems.append("backend must be branchfs")
         if self.config.get("confinement") != "bwrap":
@@ -328,6 +350,48 @@ class PlatformAcceptanceRunner:
                 "route_interposer_external_fallback"),
         }
 
+    @staticmethod
+    def _codex_probe_problem(stdout: str, stderr: str) -> Optional[str]:
+        combined = stdout + "\n" + stderr
+        if "initial client/workspace registration unavailable" in combined:
+            return "Codex client/workspace registration failed"
+        rows = [line.split() for line in stdout.splitlines() if line.strip()]
+        if not any(parts and parts[0] == "ccc" and "mcp-server" in parts
+                   for parts in rows):
+            return "contained Codex did not list the ccc MCP server"
+        return None
+
+    def _exercise_codex_plugin_mcp(self) -> Mapping:
+        if not self.manifest.codex_command:
+            return {"skipped": True, "reason": "codex_command is not configured"}
+        workspace = os.path.join(self.root, "codex-plugin-mcp", "workspace")
+        os.makedirs(workspace, exist_ok=False)
+        before = self.session_ids()
+        proc = self._run(
+            self._ccc("run", "--agent", "codex", "--workspace", workspace,
+                      "--", self.manifest.codex_command, "mcp", "list"),
+            "codex-plugin-mcp", check=False)
+        session = self._wait_new(before, "codex")
+        session_id = str(session["session_id"])
+        problem = self._codex_probe_problem(proc.stdout, proc.stderr)
+        if proc.returncode != 0 and problem is None:
+            problem = "contained Codex MCP probe failed with rc=%d" % proc.returncode
+        try:
+            if problem:
+                raise PlatformAcceptanceError(problem)
+        finally:
+            current = self._load(session_id)
+            if current.get("state") in ("running", "pending-review", "frozen"):
+                self._run(self._ccc("abort", session_id),
+                          "codex-plugin-mcp-abort")
+        final = self._load(session_id)
+        if final.get("state") != "aborted":
+            raise PlatformAcceptanceError(
+                "Codex MCP probe session did not abort cleanly")
+        self._assert_no_runtime_leak(session_id)
+        return {"session_id": session_id, "mcp_server": "ccc",
+                "registration": "hardened", "state": "aborted"}
+
     def _verify_package_assets(self) -> Mapping:
         script = """import json, os, pathlib, ccc_agent
 root = pathlib.Path(ccc_agent.__file__).parent
@@ -335,10 +399,13 @@ paths = [
     root / 'assets/scripts/ccc-bwrap-route',
     root / 'assets/codex/bwrap',
     root / 'assets/shims/ccc-agent-ssh-shell-router.sh',
+    root / 'assets/plugins/codex-ccc-containment/.mcp.json',
+    root / 'assets/plugins/codex-ccc-containment/.codex-plugin/plugin.json',
 ]
+executable = [p.is_file() and os.access(p, os.X_OK) for p in paths[:3]]
+readable = [p.is_file() and os.access(p, os.R_OK) for p in paths[3:]]
 print(json.dumps({'package_root': str(root), 'assets': [str(p) for p in paths],
-                  'executable': [p.is_file() and os.access(p, os.X_OK)
-                                 for p in paths]}))
+                  'executable': executable, 'readable_metadata': readable}))
 """
         proc = subprocess.run(
             [sys.executable, "-I", "-c", script], cwd="/", text=True,
@@ -351,12 +418,19 @@ print(json.dumps({'package_root': str(root), 'assets': [str(p) for p in paths],
         except ValueError as exc:
             raise PlatformAcceptanceError(
                 "installed package inspection returned invalid JSON") from exc
-        missing = [path for path, executable in
-                   zip(result.get("assets", ()), result.get("executable", ()))
-                   if not executable]
-        if missing or len(result.get("assets", ())) != 3:
+        missing_exec = [path for path, executable in
+                        zip(result.get("assets", ())[:3],
+                            result.get("executable", ()))
+                        if not executable]
+        missing_metadata = [path for path, readable in
+                            zip(result.get("assets", ())[3:],
+                                result.get("readable_metadata", ()))
+                            if not readable]
+        if (missing_exec or missing_metadata or
+                len(result.get("assets", ())) != 5):
             raise PlatformAcceptanceError(
-                "missing executable installed package assets: %s" % missing)
+                "missing installed package assets: executables=%s metadata=%s" %
+                (missing_exec, missing_metadata))
         return result
 
     def run(self) -> dict:
@@ -366,6 +440,8 @@ print(json.dumps({'package_root': str(root), 'assets': [str(p) for p in paths],
         os.makedirs(self.root)
         os.makedirs(self.artifact_dir, exist_ok=True)
         self.results["package-assets"] = self._verify_package_assets()
+        codex_probe = self._exercise_codex_plugin_mcp()
+        self.results["codex-plugin-mcp"] = codex_probe
         accepted = self._exercise_review("accept")
         self.results["foreground-review-boundary"] = accepted
         self.results["review-accept"] = accepted
@@ -375,9 +451,12 @@ print(json.dumps({'package_root': str(root), 'assets': [str(p) for p in paths],
         self.results["serve-protocol-cleanliness"] = {
             "session_id": served["session_id"], "clean": True}
         self.results["bound-proc-routing-fallback"] = served
+        cleanup_sessions = [accepted["session_id"], aborted["session_id"],
+                            served["session_id"]]
+        if not codex_probe.get("skipped"):
+            cleanup_sessions.append(codex_probe["session_id"])
         self.results["session-cleanup"] = {
-            "sessions": [accepted["session_id"], aborted["session_id"],
-                         served["session_id"]],
+            "sessions": cleanup_sessions,
             "mounts_and_sockets_clean": True,
         }
         result = {

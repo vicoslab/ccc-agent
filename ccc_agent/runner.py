@@ -89,7 +89,7 @@ SANDBOX_LIFECYCLE_SOCK = "/tmp/ccc-agent/lifecycle.sock"
 SANDBOX_ADAPTIVE_RUNNER = "/tmp/ccc-agent/adaptive_pid1.py"
 SANDBOX_CODEX_WORKSPACE = "/tmp/ccc-agent/codex_workspace.py"
 SANDBOX_SESSION_ENV = "/tmp/ccc-agent/session-env.json"
-SANDBOX_HARDENING_LIBRARY = "/opt/ccc-agent/libccc-client-hardening.so"
+SANDBOX_HARDENING_LIBRARY = "/tmp/ccc-agent/libccc-client-hardening.so"
 SANDBOX_CODEX_BWRAP_MARKER = "/tmp/ccc-agent/codex-external-sandbox"
 
 # Run the sandbox command under a tiny PID-1 lifecycle wrapper.  Without this,
@@ -1517,7 +1517,7 @@ def _bwrap_command(session, config, control=None, lifecycle_socket=None,
         argv += ["--dev-bind", "/dev", "/dev"]
     else:
         argv += ["--dev", "/dev"]
-    argv += ["--tmpfs", "/tmp"]
+    argv += ["--tmpfs", "/tmp", "--dir", "/tmp/ccc-agent"]
     if config.container_run_access and os.path.isdir("/var"):
         # Expose the container's /var read-only in default runtime-access mode.
         # This makes the conventional /var/run/docker.sock path work when the
