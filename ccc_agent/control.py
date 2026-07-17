@@ -174,7 +174,8 @@ class ControlServer(object):
     def __init__(self, socket_path, handler, token, hook_token=None,
                  expected_clients=(), require_launch_boundary=True,
                  enforce_mcp_admission=True, transport_revoke_grace=0.25,
-                 route_wrapper_paths=None):
+                 route_wrapper_paths=None,
+                 allow_unregistered_mcp_parent=False):
         self.socket_path = socket_path
         self.handler = handler
         self.token = token
@@ -186,6 +187,8 @@ class ControlServer(object):
             if isinstance(path, str) and os.path.isabs(path))
         self.require_launch_boundary = bool(require_launch_boundary)
         self.enforce_mcp_admission = bool(enforce_mcp_admission)
+        self.allow_unregistered_mcp_parent = bool(
+            allow_unregistered_mcp_parent)
         self.transport_revoke_grace = max(0.0, float(transport_revoke_grace))
         self._sock = None
         self._thread = None
@@ -301,7 +304,21 @@ class ControlServer(object):
                     self._launch_ready.wait(timeout=2.0)
                 registered = self._registered_client_fingerprint
             if registered is None:
-                return None
+                if not self.allow_unregistered_mcp_parent:
+                    return None
+                client = _proc_identity(peer["ppid"])
+                client_name = _process_match_name(client, self.expected_clients)
+                if (client is None or client_name is None or
+                        not self._launch_boundary_valid(client["pid"])):
+                    return None
+                return {
+                    "fingerprint": (peer["pid"], peer["start_time"],
+                                    client["pid"], client["start_time"]),
+                    "destructive_authorized": False,
+                    "authorization_reason": (
+                        "official client is behind a server wrapper; "
+                        "destructive operations require external review"),
+                }
             client = _proc_identity(registered[0])
             if (client is None or client["start_time"] != registered[1] or
                     peer["ppid"] != client["pid"] or

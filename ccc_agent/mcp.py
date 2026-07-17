@@ -8,10 +8,36 @@ from urllib.parse import unquote, urlparse
 
 from .control import (ControlError, MCPControlClient,
                       peer_credentials as peer_credentials)
-from .runner import ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN
+from .runner import (ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN,
+                     SANDBOX_SESSION_ENV)
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "ccc-agent", "version": "1"}
+MCP_SESSION_ENV_NAMES = (
+    "CCC_AGENT_SESSION", ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN,
+)
+
+
+def restore_session_environment(env, path=SANDBOX_SESSION_ENV):
+    """Recover Codex-stripped CCC authority from the read-only handoff.
+
+    Codex may rebuild the environment for plugin MCP subprocesses. The handoff
+    is launcher-created and mounted read-only at a fixed sandbox path. Restore
+    only the values required by this MCP transport, and never replace values
+    already supplied directly by the containing process.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+    except (OSError, TypeError, ValueError):
+        return env
+    if not isinstance(values, dict):
+        return env
+    for name in MCP_SESSION_ENV_NAMES:
+        value = values.get(name)
+        if name not in env and isinstance(value, str):
+            env[name] = value
+    return env
 DESTRUCTIVE = frozenset(("ccc_commit_kept", "ccc_discard_kept",
                          "ccc_abort_session"))
 
@@ -375,6 +401,7 @@ def main(argv=None, env=None):
     parser.add_argument("--client", choices=("claude", "codex"), required=True)
     args = parser.parse_args(argv)
     env = os.environ if env is None else env
+    restore_session_environment(env)
     sock = env.get(ENV_CONTROL_SOCK)
     token = env.get(ENV_CONTROL_TOKEN)
     if not sock or not token:

@@ -884,6 +884,12 @@ def _mcp_admission_config(config):
     return ((recognized or "__unsupported_ccc_mcp_client__",), supported)
 
 
+def _allow_server_wrapper_mcp(config):
+    """Permit read-only MCP admission behind a recognized Codex server wrapper."""
+    return bool(config.server_mode and _is_codex_agent(config) and
+                config.confinement == "bwrap")
+
+
 def _secure_root_owned_path(path, agent_uid):
     if not path or not os.path.isabs(path):
         return False
@@ -2515,7 +2521,8 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
                 host_sock, turn_ctl.handle, token, hook_token=hook_token,
                 expected_clients=expected_clients,
                 route_wrapper_paths=session.policy.get(
-                    "route_interposer_bwrap_paths"))
+                    "route_interposer_bwrap_paths"),
+                allow_unregistered_mcp_parent=_allow_server_wrapper_mcp(config))
             control_server.start()
             session.add_event("control-server", host_sock)
             run_env[ENV_CONTROL_SOCK] = host_sock
@@ -2543,8 +2550,9 @@ def _run_adaptive_supervisor(session, config, env, before_finalize, status_fd,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 bufsize=0)
         if control_server is not None:
-            control_server.set_launch_process(proc.pid,
-                                              supported=_mcp_supported)
+            control_server.set_launch_process(
+                proc.pid, supported=(_mcp_supported or
+                                     _allow_server_wrapper_mcp(config)))
         _handed_off, returncode = _adaptive_supervise_process(
             proc, listener, session, config, status_fd, frontend_pid)
         listener = None
@@ -2706,7 +2714,8 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
                 host_sock, turn_ctl.handle, token, hook_token=hook_token,
                 expected_clients=expected_clients,
                 route_wrapper_paths=session.policy.get(
-                    "route_interposer_bwrap_paths"))
+                    "route_interposer_bwrap_paths"),
+                allow_unregistered_mcp_parent=_allow_server_wrapper_mcp(config))
             control_server.start()
             session.add_event("control-server", host_sock)
             run_env[ENV_CONTROL_SOCK] = host_sock
@@ -2736,7 +2745,8 @@ def _run_agent_and_finalize(session, config, env, before_finalize=None,
                               else "disabled")
             proc = _run_wait_with_launch_identity(
                 argv, env=bwrap_env, control_server=control_server,
-                mcp_supported=_mcp_supported)
+                mcp_supported=(_mcp_supported or
+                               _allow_server_wrapper_mcp(config)))
         else:
             proc = _run_wait_with_launch_identity(
                 config.agent_command, cwd=cwd, env=run_env,

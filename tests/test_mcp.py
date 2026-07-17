@@ -65,6 +65,30 @@ def rpc(req_id, method, params=None):
     return json.dumps(obj) + "\n"
 
 
+class TestMCPEnvironmentRecovery(unittest.TestCase):
+    def test_recovers_stripped_control_environment_from_mounted_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handoff = os.path.join(tmp, "session-env.json")
+            with open(handoff, "w") as fh:
+                json.dump({
+                    "CCC_AGENT_SESSION": "agent-current",
+                    "CCC_AGENT_CONTROL_SOCK": "/tmp/ccc-agent/control.sock",
+                    "CCC_AGENT_CONTROL_TOKEN": "control-secret",
+                    "CCC_AGENT_HOOK_TOKEN": "must-not-enter-mcp-env",
+                    "UNTRUSTED": "ignored",
+                }, fh)
+            env = {"CCC_AGENT_SESSION": "already-current"}
+
+            mcp.restore_session_environment(env, handoff)
+
+            self.assertEqual(env["CCC_AGENT_SESSION"], "already-current")
+            self.assertEqual(env["CCC_AGENT_CONTROL_SOCK"],
+                             "/tmp/ccc-agent/control.sock")
+            self.assertEqual(env["CCC_AGENT_CONTROL_TOKEN"], "control-secret")
+            self.assertNotIn("CCC_AGENT_HOOK_TOKEN", env)
+            self.assertNotIn("UNTRUSTED", env)
+
+
 class TestMCPProtocol(unittest.TestCase):
     def run_server(self, lines, client="claude", destructive_authorized=True):
         reader = io.StringIO("".join(lines))
@@ -477,6 +501,34 @@ raise SystemExit(proc.returncode)
             result = json.loads(proc.stdout)
             self.assertTrue(result["admission"]["destructive_authorized"])
             self.assertEqual(result["resolved"]["verdict"], "ok")
+
+    def test_server_wrapper_can_admit_direct_official_mcp_child_read_only(self):
+        server = ControlServer(
+            "/unused", lambda req: {}, "token", expected_clients=("codex",),
+            allow_unregistered_mcp_parent=True)
+        server._launch_pid = 100
+        server._launch_start_time = 1
+        server._launch_supported = True
+        identities = {
+            10: {"pid": 10, "ppid": 20, "start_time": 3,
+                 "argv": ["ccc-agent", "mcp-server"], "exe": "/bin/python"},
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["codex", "app-server"], "exe": "/usr/bin/codex"},
+            50: {"pid": 50, "ppid": 100, "start_time": 4,
+                 "argv": ["sh", "-c", "codex app-server"], "exe": "/bin/sh"},
+            100: {"pid": 100, "ppid": 1, "start_time": 1,
+                  "argv": ["bwrap"], "exe": "/usr/bin/bwrap"},
+        }
+        with mock.patch.object(control_mod, "_proc_identity",
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_is_descendant",
+                                  side_effect=lambda pid, ancestor: (
+                                      pid in (10, 20, 50) and ancestor == 100)):
+            eligible = server._eligible_mcp_peer(10)
+
+        self.assertEqual(eligible["fingerprint"], (10, 3, 20, 2))
+        self.assertFalse(eligible["destructive_authorized"])
+        self.assertIn("server wrapper", eligible["authorization_reason"])
 
     def test_only_registered_initial_client_can_parent_production_mcp(self):
         server = ControlServer("/unused", lambda req: {}, "token",

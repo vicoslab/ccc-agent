@@ -1664,6 +1664,17 @@ raise SystemExit(proc.returncode)
                     fh.write(b"tampered")
                 self.assertFalse(runner_mod._secure_hardening_library(library))
 
+    def test_remote_codex_server_wrapper_allows_only_read_only_mcp_fallback(self):
+        remote = self._bwrap_config(
+            ["/bin/bash", "-c", "codex app-server proxy"],
+            agent_kind="codex-remote", server_mode=True)
+        foreground = self._bwrap_config(
+            ["/bin/bash", "-c", "codex"],
+            agent_kind="codex-remote", server_mode=False)
+
+        self.assertTrue(runner_mod._allow_server_wrapper_mcp(remote))
+        self.assertFalse(runner_mod._allow_server_wrapper_mcp(foreground))
+
     def test_bwrap_hardens_direct_claude_client_with_read_only_preload(self):
         seen = {}
         library = os.path.join(self._tmp.name, "libccc-client-hardening.so")
