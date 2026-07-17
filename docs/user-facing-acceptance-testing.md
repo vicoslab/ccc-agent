@@ -4,11 +4,10 @@ This suite certifies the behavior a user actually sees when running Codex,
 Claude Code, or Hermes through `ccc-agent`. It complements unit tests; it does
 not replace them.
 
-The tests intentionally start real agents, use real BranchFS/FUSE and bwrap,
-write through the protected view, inspect the real underlay from the trusted
-side, and exercise review decisions. They are opt-in because they require a
-capable deployment, authenticated model clients, real model calls, and a
-dedicated writable test root.
+The deterministic platform layer requires a capable deployed target but no model
+call or vendor authentication. The separate model/plugin layer is opt-in because
+it starts interactive agents, uses authenticated clients, and incurs real model
+calls. Both layers require a dedicated writable test root.
 
 Run the harness on the CCC node/container that owns the tested `ccc-agent`
 state, BranchFS mounts, and server process. An SSH client may connect back to
@@ -27,9 +26,12 @@ The acceptance tooling has two deliberately separate layers:
    conservative shared/unattributed routing fallback, protocol-clean server
    output, installed plugin/MCP metadata, configured client-hardening library,
    package assets, and mount/socket cleanup. The required `codex_command` drives
-   a real Codex app-server protocol session: it initializes the `ccc` MCP
-   server, verifies all six CCC tools, and calls non-destructive `ccc_status`.
-   When `claude_command` is set, the harness runs contained `claude mcp list`
+   a real Codex app-server protocol session: it sends `initialize`, performs a
+   global `mcpServerStatus/list`, starts an ephemeral thread, calls the
+   non-destructive `ccc_status` tool, and repeats thread-scoped inventory. It
+   requires all six CCC tools and thereby tests both global and per-thread MCP
+   subprocess admission under the real server wrapper. When `claude_command` is
+   set, the harness runs contained `claude mcp list`
    and requires `plugin:ccc:ccc` to connect. Both probes reject registration
    failures without making a model call. A wheel reinstall alone does not
    refresh Claude's separately materialized read-only seed; system deployment
@@ -39,19 +41,40 @@ The acceptance tooling has two deliberately separate layers:
    requires authenticated vendor clients and proves native plugin behavior and
    actual user interaction.
 
-Run platform acceptance first after every install or upgrade:
+Run platform acceptance first after every install or upgrade. For release or
+deployment certification, use the deploy-first wrapper so the tested executable
+is proven to come from the current working tree:
 
 ```bash
 cp tests/user_facing_acceptance/platform.example.json \
    /tmp/ccc-agent-platform.json
+scripts/deploy-server-acceptance.sh \
+  --ssh USER@SERVER --port PORT --identity /path/to/key \
+  --container CONTAINER --container-user UID:GID --home /home/USER \
+  --manifest /tmp/ccc-agent-platform.json
+```
+
+The repository, generated wheel, and manifest must be visible at the same
+absolute paths inside the target container. The wrapper builds one wheel,
+records its SHA-256 and the working-tree patch SHA-256, installs it with the
+explicit PEP 668 override required by the dedicated Ubuntu container,
+rematerializes `/opt/claude-seed`, runs platform acceptance as the target user,
+and retains deployment plus protocol evidence below
+`.artifacts/server-acceptance/`.
+
+For development against an already deployed executable, the non-deploying form
+remains available:
+
+```bash
 scripts/run-user-facing-acceptance.sh \
    --platform /tmp/ccc-agent-platform.json
 ```
 
-A platform pass does not imply that Codex, Claude, or Hermes credentials,
-plugins, or official remote drivers are installed. Conversely, model prose is
-not a substitute for the platform checks. Release certification should report
-both layers and explicitly list unavailable vendor cells.
+A platform pass proves real Codex plugin loading, MCP initialization and tool
+inventory, a thread-scoped `ccc_status` call, and the core BranchFS lifecycle on
+that exact target. It does not imply that Hermes or every authenticated
+model/remote-driver matrix cell is available; those remain separate and must be
+reported explicitly.
 
 ## Model/plugin certification boundary
 

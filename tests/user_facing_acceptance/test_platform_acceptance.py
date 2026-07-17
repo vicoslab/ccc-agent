@@ -115,6 +115,20 @@ class TestPlatformAcceptanceContract(unittest.TestCase):
             "/etc/ccc-agent/config.json"])
         self.assertEqual(command[-3:], ["bash", "-lc", "true"])
 
+    def test_serve_places_agent_before_config(self):
+        runner = object.__new__(PlatformAcceptanceRunner)
+        runner.manifest = mock.Mock(
+            ccc_agent="/usr/local/bin/ccc-agent",
+            ccc_agent_config="/etc/ccc-agent/config.json")
+
+        command = runner._serve(
+            "codex", "--workspace", "/storage/user/w",
+            "--", "codex", "app-server", "--stdio")
+
+        self.assertEqual(command[:5], [
+            "/usr/local/bin/ccc-agent", "serve", "codex", "--config",
+            "/etc/ccc-agent/config.json"])
+
     def test_expected_checks_cover_branch_functionality(self):
         expected = set(PlatformAcceptanceRunner.CHECKS)
 

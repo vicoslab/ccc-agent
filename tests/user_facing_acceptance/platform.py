@@ -228,7 +228,16 @@ class PlatformAcceptanceRunner:
         return proc
 
     def _ccc(self, op: str, *args: str) -> List[str]:
+        if op == "serve":
+            if not args:
+                raise PlatformAcceptanceError("serve requires an agent")
+            return [self.manifest.ccc_agent, op, args[0], "--config",
+                    self.manifest.ccc_agent_config, *args[1:]]
         return [self.manifest.ccc_agent, op, "--config",
+                self.manifest.ccc_agent_config, *args]
+
+    def _serve(self, agent: str, *args: str) -> List[str]:
+        return [self.manifest.ccc_agent, "serve", agent, "--config",
                 self.manifest.ccc_agent_config, *args]
 
     def _assert_no_runtime_leak(self, session_id: str) -> None:
@@ -434,8 +443,8 @@ class PlatformAcceptanceRunner:
         before = self.session_ids()
         shell = "exec %s app-server --stdio" % shlex.quote(
             self.manifest.codex_command)
-        command = self._ccc(
-            "serve", "codex", "--workspace", workspace,
+        command = self._serve(
+            "codex", "--workspace", workspace,
             "--lifecycle", "foreground", "--", "/bin/bash", "-lc", shell)
         env = dict(os.environ)
         env["PATH"] = os.pathsep.join((
