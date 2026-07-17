@@ -11,6 +11,7 @@ import os
 import socket
 import struct
 import threading
+import time
 
 PROTOCOL_VERSION = 1
 
@@ -338,26 +339,62 @@ class ControlServer(object):
         return bool(launch and launch["start_time"] == launch_start and
                     _is_descendant(descendant_pid, launch_pid))
 
-    def _runner_connection_valid(self, conn):
+    def _runner_connection_state(self, conn):
         try:
             pid, uid, _gid = peer_credentials(conn)
         except ControlError:
-            return False
+            return False, ("peer-credentials",)
         with self._launch_ready:
             runner_fingerprint = self._registered_runner_fingerprint
             client_fingerprint = self._registered_client_fingerprint
         runner = _proc_identity(pid)
         client = (_proc_identity(client_fingerprint[0])
                   if client_fingerprint else None)
-        return bool(
-            uid == os.geteuid() and runner_fingerprint and client_fingerprint and
-            runner and client and pid == runner_fingerprint[0] and
-            runner["start_time"] == runner_fingerprint[1] and
-            client["start_time"] == client_fingerprint[1] and
-            client["ppid"] == runner["pid"] and
-            self._launch_boundary_valid(runner["pid"]) and
-            _proc_fds_hidden(runner["pid"]) and
-            _proc_fds_hidden(client["pid"]))
+        checks = (
+            ("uid", uid == os.geteuid()),
+            ("runner-pinned", bool(runner_fingerprint)),
+            ("client-pinned", bool(client_fingerprint)),
+            ("runner-live", bool(runner)),
+            ("client-live", bool(client)),
+            ("runner-peer", bool(runner_fingerprint and
+                                  pid == runner_fingerprint[0])),
+            ("runner-start", bool(runner and runner_fingerprint and
+                                   runner["start_time"] ==
+                                   runner_fingerprint[1])),
+            ("client-start", bool(client and client_fingerprint and
+                                   client["start_time"] ==
+                                   client_fingerprint[1])),
+            ("direct-child", bool(client and runner and
+                                   client["ppid"] == runner["pid"])),
+            ("launch-boundary", bool(runner and
+                                     self._launch_boundary_valid(runner["pid"]))),
+            ("runner-fds-hidden", bool(runner and
+                                       _proc_fds_hidden(runner["pid"]))),
+            ("client-fds-hidden", bool(client and
+                                       _proc_fds_hidden(client["pid"]))),
+        )
+        failed = tuple(name for name, passed in checks if not passed)
+        return not failed, failed
+
+    def _wait_runner_connection(self, conn, timeout=1.0):
+        """Wait briefly for the trusted child's preload constructor to run.
+
+        ``Popen`` returns after ``exec`` closes its error pipe, which may precede
+        dynamic-loader constructors. Retry only the one expected transient;
+        every identity, ancestry, and runner-hardening failure remains immediate.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            valid, failures = self._runner_connection_state(conn)
+            if valid or failures != ("client-fds-hidden",):
+                return valid, failures
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return valid, failures
+            time.sleep(min(0.01, remaining))
+
+    def _runner_connection_valid(self, conn):
+        return self._runner_connection_state(conn)[0]
 
     def _eligible_workspace_peer(self, peer_pid):
         peer = _proc_identity(peer_pid)
@@ -624,14 +661,19 @@ class ControlServer(object):
                     req["source"] = authority[0]
                     req["authority_instance"] = authority[1]
                 if req.get("op") == WORKSPACE_CONFIRM_OP:
+                    runner_valid, runner_failures = self._wait_runner_connection(
+                        conn)
                     trusted_workspace = (
                         (self._mcp_connection_valid(conn) and
                          self._mcp_destructive_authorized) or
                         self._workspace_connection_valid(conn) or
-                        self._runner_connection_valid(conn))
+                        runner_valid)
                     if not trusted_workspace:
+                        detail = ("; runner checks failed: %s" %
+                                  ", ".join(runner_failures)
+                                  if runner_failures else "")
                         _send_line(conn, {"ok": False,
-                                          "error": "workspace confirmation requires a pinned hardened client or trusted PID 1"})
+                                          "error": "workspace confirmation requires a pinned hardened client or trusted PID 1%s" % detail})
                         if self._mcp_conn is conn or self._workspace_conn is conn:
                             continue
                         return

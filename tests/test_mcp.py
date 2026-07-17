@@ -684,6 +684,35 @@ raise SystemExit(proc.returncode)
                                   return_value=True):
             self.assertTrue(server._runner_connection_valid(object()))
 
+    def test_trusted_runner_waits_for_client_preload_constructor(self):
+        server = ControlServer("/unused", lambda req: {}, "token",
+                               require_launch_boundary=False)
+        server._registered_runner_fingerprint = (50, 6)
+        server._registered_client_fingerprint = (20, 2)
+        identities = {
+            50: {"pid": 50, "ppid": 100, "start_time": 6,
+                 "argv": ["ccc-agent-runner"], "exe": "/usr/bin/python"},
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["codex"], "exe": "/usr/bin/codex"},
+        }
+        client_checks = iter((False, True))
+
+        def hidden(pid):
+            return True if pid == 50 else next(client_checks)
+
+        with mock.patch.object(control_mod, "peer_credentials",
+                               return_value=(50, os.geteuid(), os.getegid())), \
+                mock.patch.object(control_mod, "_proc_identity",
+                                  side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_proc_fds_hidden",
+                                  side_effect=hidden), \
+                mock.patch.object(control_mod.time, "sleep") as sleep:
+            valid, failures = server._wait_runner_connection(object())
+
+        self.assertTrue(valid)
+        self.assertEqual(failures, ())
+        sleep.assert_called_once()
+
     def test_process_lineage_without_hidden_proc_fds_is_read_only(self):
         server = ControlServer("/unused", lambda req: {}, "token",
                                expected_clients=("codex",),
