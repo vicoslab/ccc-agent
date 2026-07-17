@@ -68,14 +68,16 @@ The client then starts the bundled stdio MCP server. The supervisor uses Unix
 `SO_PEERCRED` and admits only an MCP process whose direct parent is that exact
 registered client; a later descendant merely naming itself `claude`/`codex`
 cannot gain destructive authority. The first eligible persistent connection is
-pinned to MCP PID/start-time and client PID/start-time. For recognized Codex
-server-wrapper topologies, Codex may strip the CCC environment before spawning
+pinned to MCP PID/start-time and client PID/start-time. For recognized remote
+server-wrapper topologies, the client may strip the CCC environment before spawning
 plugin MCP processes; the MCP server recovers only the session ID, control socket,
 and control token from the launcher-created read-only handoff. If no exact initial
 client was registered, the supervisor may pin a direct MCP child of the live Codex
-app-server inside the launch boundary for status/read-only use, but marks the
-transport non-destructive and grants no workspace authority. Process identity
-alone is not commit authority: setup
+app-server or Claude Remote `ccd-cli` inside the launch boundary for status/read-only
+use, but marks the transport non-destructive and grants no workspace authority.
+Initial MCP admission retries only the transient client-registration readiness
+failure for a bounded interval; identity, ancestry, and authorization failures
+remain immediate. Process identity alone is not commit authority: setup
 also installs a root-owned client preload
 that makes the trusted client/MCP processes non-dumpable and their transports
 close-on-exec. The supervisor probes that `/proc/<pid>/fd` is inaccessible for

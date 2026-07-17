@@ -373,6 +373,37 @@ class TestMCPProtocol(unittest.TestCase):
 
 
 class TestMCPControlAdmission(unittest.TestCase):
+    def test_startup_admission_reconnects_after_one_transient_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "control.sock")
+            server = ControlServer(path, lambda req: {}, "token",
+                                   expected_clients=("claude",),
+                                   require_launch_boundary=False)
+            attempts = []
+
+            def eligible(pid):
+                attempts.append(pid)
+                if len(attempts) == 1:
+                    return None
+                return {
+                    "fingerprint": (pid, 1, pid, 1),
+                    "destructive_authorized": False,
+                    "authorization_reason": "test read-only",
+                }
+
+            with mock.patch.object(server, "_eligible_mcp_peer",
+                                   side_effect=eligible):
+                server.start()
+                self.addCleanup(server.stop)
+                client = MCPControlClient(
+                    path, "token", admission_retry_seconds=0.5,
+                    admission_retry_interval=0.01)
+                self.addCleanup(client.close)
+                admission = client.admit("claude")
+
+            self.assertTrue(admission["admitted"])
+            self.assertEqual(len(attempts), 2)
+
     def test_so_peercred_is_used_and_ordinary_mutation_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "control.sock")
@@ -501,6 +532,43 @@ raise SystemExit(proc.returncode)
             result = json.loads(proc.stdout)
             self.assertTrue(result["admission"]["destructive_authorized"])
             self.assertEqual(result["resolved"]["verdict"], "ok")
+
+    def test_claude_remote_cli_can_parent_read_only_mcp(self):
+        server = ControlServer(
+            "/unused", lambda req: {}, "token", expected_clients=("claude",),
+            allow_unregistered_mcp_parent=True)
+        server._launch_pid = 100
+        server._launch_start_time = 1
+        server._launch_supported = True
+        identities = {
+            10: {"pid": 10, "ppid": 20, "start_time": 3,
+                 "argv": ["ccc-agent", "mcp-server"], "exe": "/bin/python"},
+            20: {"pid": 20, "ppid": 50, "start_time": 2,
+                 "argv": ["/home/domen/.claude/remote/ccd-cli/2.1.209",
+                          "--output-format", "stream-json"],
+                 "exe": "/storage/user/profile/.claude/remote/ccd-cli/2.1.209"},
+            50: {"pid": 50, "ppid": 100, "start_time": 4,
+                 "argv": ["/home/domen/.claude/remote/srv/rev/server", "--serve"],
+                 "exe": "/storage/user/profile/.claude/remote/srv/rev/server"},
+            100: {"pid": 100, "ppid": 1, "start_time": 1,
+                  "argv": ["bwrap"], "exe": "/usr/bin/bwrap"},
+        }
+        with mock.patch.object(control_mod, "_proc_identity",
+                               side_effect=lambda pid: identities.get(pid)), \
+                mock.patch.object(control_mod, "_is_descendant",
+                                  side_effect=lambda pid, ancestor: (
+                                      pid in (10, 20, 50) and ancestor == 100)):
+            eligible = server._eligible_mcp_peer(10)
+
+        self.assertEqual(eligible["fingerprint"], (10, 3, 20, 2))
+        self.assertFalse(eligible["destructive_authorized"])
+
+    def test_unrelated_versioned_executable_is_not_a_claude_remote_client(self):
+        identity = {
+            "argv": ["/tmp/ccd-cli/2.1.209", "--output-format", "stream-json"],
+            "exe": "/tmp/ccd-cli/2.1.209",
+        }
+        self.assertFalse(control_mod._is_claude_remote_client(identity))
 
     def test_server_wrapper_can_admit_direct_official_mcp_child_read_only(self):
         server = ControlServer(

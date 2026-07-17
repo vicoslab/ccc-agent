@@ -1671,8 +1671,12 @@ raise SystemExit(proc.returncode)
         foreground = self._bwrap_config(
             ["/bin/bash", "-c", "codex"],
             agent_kind="codex-remote", server_mode=False)
+        claude_remote = self._bwrap_config(
+            ["/bin/bash", "-c", "ccd server --serve"],
+            agent_kind="claude-remote", server_mode=True)
 
         self.assertTrue(runner_mod._allow_server_wrapper_mcp(remote))
+        self.assertTrue(runner_mod._allow_server_wrapper_mcp(claude_remote))
         self.assertFalse(runner_mod._allow_server_wrapper_mcp(foreground))
 
     def test_bwrap_hardens_direct_claude_client_with_read_only_preload(self):

@@ -885,8 +885,9 @@ def _mcp_admission_config(config):
 
 
 def _allow_server_wrapper_mcp(config):
-    """Permit read-only MCP admission behind a recognized Codex server wrapper."""
-    return bool(config.server_mode and _is_codex_agent(config) and
+    """Permit read-only MCP admission behind recognized remote server wrappers."""
+    return bool(config.server_mode and
+                (_is_codex_agent(config) or _is_claude_agent(config)) and
                 config.confinement == "bwrap")
 
 

@@ -144,6 +144,26 @@ def _process_match_name(identity, expected):
     return None
 
 
+def _is_claude_remote_client(identity):
+    """Recognize Claude Desktop's versioned remote ``ccd-cli`` executable."""
+    if identity is None:
+        return False
+    argv = identity.get("argv") or ()
+    candidates = [identity.get("exe")]
+    if argv:
+        candidates.append(argv[0])
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not os.path.isabs(candidate):
+            continue
+        parts = os.path.normpath(candidate).split(os.sep)
+        for index in range(max(0, len(parts) - 3)):
+            if (parts[index:index + 3] ==
+                    [".claude", "remote", "ccd-cli"] and
+                    len(parts) == index + 4 and parts[-1]):
+                return True
+    return False
+
+
 def _process_matches(identity, expected):
     return _process_match_name(identity, expected) is not None
 
@@ -312,6 +332,9 @@ class ControlServer(object):
                     return None
                 client = _proc_identity(peer["ppid"])
                 client_name = _process_match_name(client, self.expected_clients)
+                if (client_name is None and "claude" in self.expected_clients and
+                        _is_claude_remote_client(client)):
+                    client_name = "claude"
                 if (client is None or client_name is None or
                         not self._launch_boundary_valid(client["pid"])):
                     return None
@@ -877,13 +900,31 @@ class ControlClient(object):
 class MCPControlClient(ControlClient):
     """Persistent connection used only by the admitted stdio MCP process."""
 
-    def __init__(self, socket_path, token, timeout=30):
+    TRANSIENT_ADMISSION_ERROR = (
+        "MCP peer is not the eligible official client child")
+
+    def __init__(self, socket_path, token, timeout=30,
+                 admission_retry_seconds=0,
+                 admission_retry_interval=0.05):
         super().__init__(socket_path, token, timeout=timeout)
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.settimeout(timeout)
-        self._sock.connect(socket_path)
-        self._reader = self._sock.makefile("r")
+        self.admission_retry_seconds = max(
+            0.0, float(admission_retry_seconds))
+        self.admission_retry_interval = max(
+            0.001, float(admission_retry_interval))
+        self._sock = None
+        self._reader = None
         self._lock = threading.Lock()
+        self._connect()
+
+    def _connect(self):
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(self.timeout)
+        self._sock.connect(self.socket_path)
+        self._reader = self._sock.makefile("r")
+
+    def _reconnect(self):
+        self.close()
+        self._connect()
 
     def _request(self, payload):
         req = dict(payload, token=self.token, version=PROTOCOL_VERSION)
@@ -895,7 +936,26 @@ class MCPControlClient(ControlClient):
         return resp
 
     def admit(self, client):
-        return self._request({"op": "mcp-admit", "client": str(client)})
+        deadline = time.monotonic() + self.admission_retry_seconds
+        reconnecting = False
+        while True:
+            try:
+                if reconnecting:
+                    self._reconnect()
+                return self._request({"op": "mcp-admit",
+                                      "client": str(client)})
+            except ControlError as exc:
+                if (str(exc) != self.TRANSIENT_ADMISSION_ERROR or
+                        time.monotonic() >= deadline):
+                    raise
+            except OSError:
+                if not reconnecting or time.monotonic() >= deadline:
+                    raise
+            reconnecting = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ControlError(self.TRANSIENT_ADMISSION_ERROR)
+            time.sleep(min(self.admission_retry_interval, remaining))
 
     def request_abort(self):
         return self._request({"op": "turn-request-abort"})
@@ -918,12 +978,16 @@ class MCPControlClient(ControlClient):
         return self._request({"op": "turn-workspace-proposal-status"})
 
     def close(self):
+        reader, self._reader = self._reader, None
+        sock, self._sock = self._sock, None
         try:
-            self._reader.close()
+            if reader is not None:
+                reader.close()
         except OSError:
             pass
         try:
-            self._sock.close()
+            if sock is not None:
+                sock.close()
         except OSError:
             pass
 

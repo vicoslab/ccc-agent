@@ -408,7 +408,9 @@ def main(argv=None, env=None):
         sys.stderr.write("ccc-agent mcp-server: not in a contained session\n")
         return 1
     try:
-        control = MCPControlClient(sock, token)
+        control = MCPControlClient(
+            sock, token, admission_retry_seconds=5,
+            admission_retry_interval=0.05)
     except (ControlError, OSError) as exc:
         sys.stderr.write("ccc-agent mcp-server: control connection failed: %s\n" % exc)
         return 1
