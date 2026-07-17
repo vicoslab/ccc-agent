@@ -11,99 +11,186 @@
         "local-cli": {
           "driver": "tmux",
           "command": [
-            "{ccc_agent}", "run", "--config", "{ccc_agent_config}",
-            "--workspace", "{workspace}", "--agent", "codex", "--",
-            "codex", "--dangerously-bypass-approvals-and-sandbox"
+            "{ccc_agent}",
+            "run",
+            "--config",
+            "{ccc_agent_config}",
+            "--workspace",
+            "{workspace}",
+            "--agent",
+            "codex",
+            "--",
+            "/home/domen/conda/envs/codex/bin/codex",
+            "--dangerously-bypass-approvals-and-sandbox"
           ],
           "expected_agent_kind": "codex",
           "final_review_action": "abort",
           "startup_seconds": 8,
-          "exit_text": "/exit"
+          "exit_text": "/exit",
+          "user_flow": "direct-cli"
         },
         "ssh-cli": {
           "driver": "tmux",
           "command": [
-            "ssh", "-tt", "REPLACE_WITH_SSH_TARGET",
-            "cd {workspace_shell} && codex --dangerously-bypass-approvals-and-sandbox"
+            "ssh",
+            "-tt",
+            "REPLACE_WITH_SSH_TARGET",
+            "cd {workspace_shell} && /home/domen/conda/envs/codex/bin/codex --dangerously-bypass-approvals-and-sandbox"
           ],
           "expected_agent_kind": "codex-remote",
           "startup_seconds": 10,
-          "exit_text": "/exit"
+          "exit_text": "/exit",
+          "user_flow": "direct-cli"
         },
         "remote-server": {
           "driver": "external",
           "command": [
-            "REPLACE_WITH_CODEX_DESKTOP_PROTOCOL_DRIVER", "{scenario_file}"
+            "python",
+            "scripts/manual-observed-client-driver.py",
+            "{scenario_file}"
           ],
-          "expected_agent_kind": "codex-remote"
+          "expected_agent_kind": "codex-remote",
+          "user_flow": "observed-client",
+          "evidence": {
+            "basis": "direct-observation",
+            "client_product": "Codex Desktop",
+            "client_version": "REPLACE_WITH_OBSERVED_CLIENT_VERSION",
+            "observed_at": "REPLACE_WITH_OBSERVATION_TIMESTAMP",
+            "artifact": "REPLACE_WITH_SCREENSHOT_OR_CAPTURE_PATH"
+          },
+          "operator_instructions": [
+            "Open Codex Desktop; do not launch a substitute CLI or server command.",
+            "Use the product UI to connect to REPLACE_WITH_SSH_TARGET through the configured CCC SSH router.",
+            "Open {workspace} in that remote client and capture a screenshot showing product, target, and workspace.",
+            "Paste each prompt printed by the manual driver exactly and return to its terminal when requested."
+          ]
         }
-      }
+      },
+      "client_executable": "/home/domen/conda/envs/codex/bin/codex"
     },
     "claude": {
       "transports": {
         "local-cli": {
           "driver": "tmux",
           "command": [
-            "{ccc_agent}", "run", "--config", "{ccc_agent_config}",
-            "--workspace", "{workspace}", "--agent", "claude", "--",
-            "claude", "--dangerously-skip-permissions"
+            "{ccc_agent}",
+            "run",
+            "--config",
+            "{ccc_agent_config}",
+            "--workspace",
+            "{workspace}",
+            "--agent",
+            "claude",
+            "--",
+            "/home/domen/.local/bin/claude",
+            "--dangerously-skip-permissions"
           ],
           "expected_agent_kind": "claude",
           "final_review_action": "abort",
           "startup_seconds": 8,
-          "exit_text": "/exit"
+          "exit_text": "/exit",
+          "user_flow": "direct-cli"
         },
         "ssh-cli": {
           "driver": "tmux",
           "command": [
-            "ssh", "-tt", "REPLACE_WITH_SSH_TARGET",
-            "cd {workspace_shell} && claude --dangerously-skip-permissions"
+            "ssh",
+            "-tt",
+            "REPLACE_WITH_SSH_TARGET",
+            "cd {workspace_shell} && /home/domen/.local/bin/claude --dangerously-skip-permissions"
           ],
           "expected_agent_kind": "claude-remote",
           "startup_seconds": 10,
-          "exit_text": "/exit"
+          "exit_text": "/exit",
+          "user_flow": "direct-cli"
         },
         "remote-server": {
           "driver": "external",
           "command": [
-            "REPLACE_WITH_CLAUDE_DESKTOP_REMOTE_DRIVER", "{scenario_file}"
+            "python",
+            "scripts/manual-observed-client-driver.py",
+            "{scenario_file}"
           ],
-          "expected_agent_kind": "claude-remote"
+          "expected_agent_kind": "claude-remote",
+          "user_flow": "observed-client",
+          "evidence": {
+            "basis": "direct-observation",
+            "client_product": "Claude Desktop / Claude Code remote client",
+            "client_version": "REPLACE_WITH_OBSERVED_CLIENT_VERSION",
+            "observed_at": "REPLACE_WITH_OBSERVATION_TIMESTAMP",
+            "artifact": "REPLACE_WITH_SCREENSHOT_OR_CAPTURE_PATH"
+          },
+          "operator_instructions": [
+            "Open Claude Desktop / Claude Code remote client; do not launch a substitute CLI or server command.",
+            "Use the product UI to connect to REPLACE_WITH_SSH_TARGET through the configured CCC SSH router.",
+            "Open {workspace} in that remote client and capture a screenshot showing product, target, and workspace.",
+            "Paste each prompt printed by the manual driver exactly and return to its terminal when requested."
+          ]
         }
-      }
+      },
+      "client_executable": "/home/domen/.local/bin/claude"
     },
     "hermes": {
       "transports": {
         "local-cli": {
           "driver": "tmux",
           "command": [
-            "{ccc_agent}", "run", "--config", "{ccc_agent_config}",
-            "--workspace", "{workspace}", "--agent", "hermes", "--",
-            "hermes", "--yolo"
+            "{ccc_agent}",
+            "run",
+            "--config",
+            "{ccc_agent_config}",
+            "--workspace",
+            "{workspace}",
+            "--agent",
+            "hermes",
+            "--",
+            "/home/domen/conda/envs/hermes/bin/hermes",
+            "--yolo"
           ],
           "expected_agent_kind": "hermes",
           "final_review_action": "abort",
           "startup_seconds": 8,
-          "exit_text": "/exit"
+          "exit_text": "/exit",
+          "user_flow": "direct-cli"
         },
         "ssh-cli": {
           "driver": "tmux",
           "command": [
-            "ssh", "-tt", "REPLACE_WITH_SSH_TARGET",
-            "cd {workspace_shell} && hermes --yolo"
+            "ssh",
+            "-tt",
+            "REPLACE_WITH_SSH_TARGET",
+            "cd {workspace_shell} && /home/domen/conda/envs/hermes/bin/hermes --yolo"
           ],
           "expected_agent_kind": "hermes-remote",
           "startup_seconds": 10,
-          "exit_text": "/exit"
+          "exit_text": "/exit",
+          "user_flow": "direct-cli"
         },
         "remote-server": {
           "driver": "external",
           "command": [
-            "REPLACE_WITH_HERMES_GATEWAY_API_DRIVER", "{scenario_file}"
+            "python",
+            "scripts/manual-observed-client-driver.py",
+            "{scenario_file}"
           ],
-          "expected_agent_kind": "hermes-remote"
+          "expected_agent_kind": "hermes-remote",
+          "user_flow": "observed-client",
+          "evidence": {
+            "basis": "direct-observation",
+            "client_product": "Hermes WebUI or gateway client",
+            "client_version": "REPLACE_WITH_OBSERVED_CLIENT_VERSION",
+            "observed_at": "REPLACE_WITH_OBSERVATION_TIMESTAMP",
+            "artifact": "REPLACE_WITH_SCREENSHOT_OR_CAPTURE_PATH"
+          },
+          "operator_instructions": [
+            "Open Hermes WebUI or gateway client; do not launch a substitute CLI or server command.",
+            "Use the product UI to connect to REPLACE_WITH_SSH_TARGET through the configured CCC SSH router.",
+            "Open {workspace} in that remote client and capture a screenshot showing product, target, and workspace.",
+            "Paste each prompt printed by the manual driver exactly and return to its terminal when requested."
+          ]
         }
-      }
+      },
+      "client_executable": "/home/domen/conda/envs/hermes/bin/hermes"
     }
   }
 }

@@ -140,7 +140,7 @@ class TestPlatformAcceptanceContract(unittest.TestCase):
             "review-abort",
             "session-cleanup",
             "package-assets",
-            "codex-app-server-mcp",
+            "codex-app-server-stdio-smoke",
             "claude-plugin-mcp",
         }.issubset(expected))
 

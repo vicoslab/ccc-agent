@@ -117,6 +117,13 @@ class AcceptanceManifest:
             if not isinstance(agents.get(agent), dict):
                 raise AcceptanceError("manifest missing agent %s" % agent)
             transports = agents[agent].get("transports")
+            client_executable = agents[agent].get("client_executable")
+            if (not isinstance(client_executable, str) or
+                    not os.path.isabs(client_executable) or
+                    os.path.basename(client_executable) != agent):
+                raise AcceptanceError(
+                    "%s requires an absolute real client executable ending in %s" %
+                    (agent, agent))
             if not isinstance(transports, dict):
                 raise AcceptanceError("%s transports must be an object" % agent)
             for transport in required:
@@ -140,10 +147,62 @@ class AcceptanceManifest:
                     raise AcceptanceError(
                         "%s %s final_review_action must be accept or abort" %
                         (agent, transport))
-                if transport == "remote-server" and entry["driver"] != "external":
-                    raise AcceptanceError(
-                        "%s remote-server must use an external official-client "
-                        "driver" % agent)
+                if transport == "local-cli":
+                    if entry.get("user_flow") != "direct-cli":
+                        raise AcceptanceError(
+                            "%s local-cli must declare user_flow=direct-cli" % agent)
+                    try:
+                        separator = entry["command"].index("--")
+                        client = entry["command"][separator + 1]
+                    except (ValueError, IndexError):
+                        raise AcceptanceError(
+                            "%s local-cli must invoke its direct client after --" %
+                            agent)
+                    if str(client) != client_executable:
+                        raise AcceptanceError(
+                            "%s local-cli direct client executable must be %s" %
+                            (agent, client_executable))
+                if transport == "ssh-cli":
+                    if entry.get("user_flow") != "direct-cli":
+                        raise AcceptanceError(
+                            "%s ssh-cli must declare user_flow=direct-cli" % agent)
+                    if not any(client_executable in str(item)
+                               for item in entry["command"]):
+                        raise AcceptanceError(
+                            "%s ssh-cli must invoke the direct remote client %s" %
+                            (agent, client_executable))
+                if transport == "remote-server":
+                    if entry["driver"] != "external":
+                        raise AcceptanceError(
+                            "%s remote-server must use an external observed-client "
+                            "driver" % agent)
+                    if entry.get("user_flow") != "observed-client":
+                        raise AcceptanceError(
+                            "%s remote-server must declare user_flow=observed-client" %
+                            agent)
+                    evidence = entry.get("evidence")
+                    if not isinstance(evidence, dict):
+                        raise AcceptanceError(
+                            "%s remote-server requires evidence" % agent)
+                    basis = evidence.get("basis")
+                    if basis not in ("direct-observation", "official-public-source"):
+                        raise AcceptanceError(
+                            "%s remote-server evidence basis must be direct-observation "
+                            "or official-public-source" % agent)
+                    if basis == "direct-observation":
+                        missing = [name for name in (
+                            "client_product", "client_version", "observed_at", "artifact")
+                            if not evidence.get(name)]
+                    else:
+                        missing = [] if evidence.get("source_urls") else ["source_urls"]
+                    if missing:
+                        raise AcceptanceError(
+                            "%s remote-server evidence missing: %s" %
+                            (agent, ", ".join(missing)))
+                    instructions = entry.get("operator_instructions")
+                    if not isinstance(instructions, list) or not instructions:
+                        raise AcceptanceError(
+                            "%s remote-server requires operator_instructions" % agent)
 
         artifacts = data.get("artifacts_dir")
         if not artifacts:
@@ -468,6 +527,12 @@ class AcceptanceRunner:
 
     def preflight(self) -> None:
         problems = []
+        requested_agent = os.environ.get("CCC_AGENT_ACCEPTANCE_AGENT")
+        requested_transport = os.environ.get("CCC_AGENT_ACCEPTANCE_TRANSPORT")
+        preflight_agents = (requested_agent,) if requested_agent else AGENTS
+        preflight_transports = ((requested_transport,)
+                                if requested_transport
+                                else self.manifest.required_transports)
         if os.environ.get("CCC_AGENT_SESSION"):
             problems.append(
                 "CCC_AGENT_SESSION is set; run acceptance outside containment")
@@ -495,7 +560,7 @@ class AcceptanceRunner:
         plugins = self.deployment_config.get("agent_plugins")
         if not isinstance(plugins, dict):
             plugins = {}
-        for agent in AGENTS:
+        for agent in preflight_agents:
             spec = plugins.get(agent)
             if not isinstance(spec, dict):
                 problems.append("agent_plugins.%s is not configured" % agent)
@@ -507,17 +572,31 @@ class AcceptanceRunner:
 
         # Catch manifest placeholders and missing client/driver launchers before
         # the first paid model call rather than midway through the matrix.
-        for agent in AGENTS:
-            for transport in self.manifest.required_transports:
+        for agent in preflight_agents:
+            client_executable = self.manifest.agent(agent).get("client_executable")
+            if (any(item in ("local-cli", "ssh-cli")
+                    for item in preflight_transports) and
+                    (not isinstance(client_executable, str) or
+                     not (os.path.isfile(client_executable) and
+                          os.access(client_executable, os.X_OK)))):
+                problems.append(
+                    "%s real client executable is unavailable: %s" %
+                    (agent, client_executable))
+            for transport in preflight_transports:
                 scenario = build_scenario(
                     self.manifest.test_root, agent, transport,
                     run_id="preflight")
                 context = self._context(
                     scenario, os.path.join(self.manifest.artifacts_dir,
                                            "preflight-scenario.json"))
+                entry = self.manifest.transport(agent, transport)
+                if "REPLACE_WITH_" in json.dumps(entry, sort_keys=True):
+                    problems.append(
+                        "%s/%s entry still contains REPLACE_WITH_ placeholder" %
+                        (agent, transport))
                 try:
                     command = render_command(
-                        self.manifest.transport(agent, transport)["command"],
+                        entry["command"],
                         context)
                 except AcceptanceError as exc:
                     problems.append(
@@ -807,7 +886,8 @@ class AcceptanceRunner:
                 driver.kill()
 
     @staticmethod
-    def _validate_external_result(value: Mapping) -> None:
+    def _validate_external_result(
+            value: Mapping, expected_evidence: Optional[Mapping] = None) -> None:
         required_true = (
             "used_official_client", "server_started_through_ssh_router",
             "protocol_clean", "plugin_loaded", "plugin_used",
@@ -817,6 +897,26 @@ class AcceptanceRunner:
         if missing:
             raise AcceptanceError(
                 "external driver did not prove: %s" % ", ".join(missing))
+        evidence = value.get("evidence")
+        if (not isinstance(evidence, dict) or
+                evidence.get("basis") != "direct-observation"):
+            raise AcceptanceError(
+                "external official-client result requires direct observation evidence")
+        missing_evidence = [name for name in (
+            "client_product", "client_version", "observed_at", "artifact")
+            if not evidence.get(name)]
+        if missing_evidence:
+            raise AcceptanceError(
+                "external direct observation evidence missing: %s" %
+                ", ".join(missing_evidence))
+        if expected_evidence is not None:
+            mismatched = [name for name in (
+                "basis", "client_product", "client_version", "observed_at", "artifact")
+                if evidence.get(name) != expected_evidence.get(name)]
+            if mismatched:
+                raise AcceptanceError(
+                    "external observation does not match manifest evidence: %s" %
+                    ", ".join(mismatched))
         inventory = value.get("plugin_inventory")
         if not isinstance(inventory, dict):
             raise AcceptanceError("external driver omitted plugin_inventory")
@@ -863,6 +963,8 @@ class AcceptanceRunner:
         payload = _read_json(scenario_file)
         payload["driver_result_file"] = result_file
         payload["driver_continue_file"] = continue_file
+        payload["evidence"] = entry.get("evidence")
+        payload["operator_instructions"] = entry.get("operator_instructions")
         _atomic_json(scenario_file, payload)
         env = dict(os.environ)
         env.update({
@@ -928,7 +1030,7 @@ class AcceptanceRunner:
                 (returncode, stderr))
 
         result = self._wait_external_phase(result_file, "complete", proc)
-        self._validate_external_result(result)
+        self._validate_external_result(result, entry.get("evidence"))
         transcript = "\n".join(str(result.get(key, "")) for key in (
             "first_response", "decision_response", "transcript"))
         session = self._wait_decisions(session_id)

@@ -56,24 +56,41 @@ class TestManifest(unittest.TestCase):
     def complete_manifest(self):
         agents = {}
         for agent in AGENTS:
+            client = "/opt/%s/bin/%s" % (agent, agent)
             agents[agent] = {
+                "client_executable": client,
                 "transports": {
                     "local-cli": {
                         "driver": "tmux",
+                        "user_flow": "direct-cli",
                         "command": ["ccc-agent", "run", "--agent", agent,
-                                    "--workspace", "{workspace}", "--", agent],
+                                    "--workspace", "{workspace}", "--", client],
                         "expected_agent_kind": agent,
                     },
                     "ssh-cli": {
                         "driver": "tmux",
+                        "user_flow": "direct-cli",
                         "command": ["ssh", "-tt", "host",
-                                    "cd {workspace_shell} && %s" % agent],
+                                    "cd {workspace_shell} && %s" % client],
                         "expected_agent_kind": agent + "-remote",
                     },
                     "remote-server": {
                         "driver": "external",
+                        "user_flow": "observed-client",
                         "command": ["driver", agent, "{scenario_file}"],
                         "expected_agent_kind": agent + "-remote",
+                        "evidence": {
+                            "basis": "direct-observation",
+                            "client_product": agent + " desktop",
+                            "client_version": "test-version",
+                            "observed_at": "2026-07-17T00:00:00Z",
+                            "artifact": "/tmp/observed-client.json",
+                        },
+                        "operator_instructions": [
+                            "Open the named desktop client.",
+                            "Connect it to the configured SSH target.",
+                            "Paste the prompts printed by the driver.",
+                        ],
                     },
                 }
             }
@@ -102,6 +119,45 @@ class TestManifest(unittest.TestCase):
         self.write(data)
 
         with self.assertRaisesRegex(AcceptanceError, "hermes.*remote-server"):
+            AcceptanceManifest.load(self.path, level="full")
+
+    def test_remote_client_requires_observation_or_official_source_evidence(self):
+        data = self.complete_manifest()
+        del data["agents"]["codex"]["transports"]["remote-server"]["evidence"]
+        self.write(data)
+
+        with self.assertRaisesRegex(
+                AcceptanceError, "codex.*remote-server.*evidence"):
+            AcceptanceManifest.load(self.path, level="full")
+
+    def test_remote_client_requires_operator_instructions(self):
+        data = self.complete_manifest()
+        data["agents"]["claude"]["transports"]["remote-server"][
+            "operator_instructions"] = []
+        self.write(data)
+
+        with self.assertRaisesRegex(
+                AcceptanceError, "claude.*operator_instructions"):
+            AcceptanceManifest.load(self.path, level="full")
+
+    def test_local_cli_must_invoke_real_client_after_separator(self):
+        data = self.complete_manifest()
+        data["agents"]["hermes"]["transports"]["local-cli"]["command"] = [
+            "ccc-agent", "run", "--agent", "hermes", "--", "/bin/true"]
+        self.write(data)
+
+        with self.assertRaisesRegex(
+                AcceptanceError, "hermes.*direct client executable"):
+            AcceptanceManifest.load(self.path, level="full")
+
+    def test_local_cli_rejects_path_lookup_or_shim(self):
+        data = self.complete_manifest()
+        data["agents"]["codex"]["client_executable"] = "codex"
+        data["agents"]["codex"]["transports"]["local-cli"]["command"][-1] = "codex"
+        self.write(data)
+
+        with self.assertRaisesRegex(
+                AcceptanceError, "codex.*absolute real client executable"):
             AcceptanceManifest.load(self.path, level="full")
 
     def test_core_manifest_requires_only_local_cli(self):
@@ -315,6 +371,18 @@ class TestExternalDriverHandshake(unittest.TestCase):
         proc = subprocess.Popen(["/bin/true"])
         proc.wait()
         return proc
+
+    def test_external_result_rejects_unobserved_desktop_claim(self):
+        result = dict((name, True) for name in (
+                "used_official_client", "server_started_through_ssh_router",
+                "protocol_clean", "plugin_loaded", "plugin_used",
+                "workspace_registered", "asked_user", "status_used",
+            ))
+        result["plugin_inventory"] = {"hooks": ["stop"], "skills": ["ccc"]}
+        result["evidence"] = {"basis": "synthetic-protocol-smoke"}
+
+        with self.assertRaisesRegex(AcceptanceError, "direct observation"):
+            AcceptanceRunner._validate_external_result(result)
 
     def test_accepts_only_the_requested_atomic_phase(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -105,7 +105,7 @@ def load_platform_manifest(path: str) -> PlatformManifest:
 class PlatformAcceptanceRunner:
     CHECKS = (
         "package-assets",
-        "codex-app-server-mcp",
+        "codex-app-server-stdio-smoke",
         "claude-plugin-mcp",
         "foreground-review-boundary",
         "review-accept",
@@ -437,8 +437,10 @@ class PlatformAcceptanceRunner:
                 if isinstance(item, Mapping) and item.get("name") == "ccc"]
         return compact
 
-    def _exercise_codex_app_server_mcp(self) -> Mapping:
-        workspace = os.path.join(self.root, "codex-app-server-mcp", "workspace")
+    def _exercise_codex_app_server_stdio_smoke(self) -> Mapping:
+        """Exercise the documented stdio API; this is not a Desktop claim."""
+        workspace = os.path.join(
+            self.root, "codex-app-server-stdio-smoke", "workspace")
         os.makedirs(workspace, exist_ok=False)
         before = self.session_ids()
         shell = "exec %s app-server --stdio" % shlex.quote(
@@ -563,7 +565,13 @@ class PlatformAcceptanceRunner:
                     proc.wait(timeout=5)
             stderr_thread.join(timeout=2)
             _atomic_json(os.path.join(
-                self.artifact_dir, "codex-app-server-protocol.json"), {
+                self.artifact_dir, "codex-app-server-stdio-protocol.json"), {
+                    "classification": "documented-protocol-smoke",
+                    "desktop_equivalent": False,
+                    "public_source": (
+                        "https://github.com/openai/codex/blob/"
+                        "315195492c80fdade38e917c18f9584efd599304/"
+                        "codex-rs/app-server/README.md#protocol"),
                     "command": command,
                     "returncode": proc.returncode,
                     "messages": transcript,
@@ -591,13 +599,19 @@ class PlatformAcceptanceRunner:
             current = self._load(session_id)
             if current.get("state") in ("running", "pending-review", "frozen"):
                 self._run(self._ccc("abort", session_id),
-                          "codex-app-server-mcp-abort")
+                          "codex-app-server-stdio-smoke-abort")
         final = self._load(session_id)
         if final.get("state") != "aborted":
             raise PlatformAcceptanceError(
                 "Codex app-server MCP session did not abort cleanly")
         self._assert_no_runtime_leak(session_id)
         return {
+            "classification": "documented-protocol-smoke",
+            "desktop_equivalent": False,
+            "public_source": (
+                "https://github.com/openai/codex/blob/"
+                "315195492c80fdade38e917c18f9584efd599304/"
+                "codex-rs/app-server/README.md#protocol"),
             "session_id": session_id,
             "thread_id": thread_id,
             "mcp_server": "ccc",
@@ -698,8 +712,8 @@ print(json.dumps({'package_root': str(root), 'assets': [str(p) for p in paths],
         os.makedirs(self.root)
         os.makedirs(self.artifact_dir, exist_ok=True)
         self.results["package-assets"] = self._verify_package_assets()
-        codex_probe = self._exercise_codex_app_server_mcp()
-        self.results["codex-app-server-mcp"] = codex_probe
+        codex_probe = self._exercise_codex_app_server_stdio_smoke()
+        self.results["codex-app-server-stdio-smoke"] = codex_probe
         claude_probe = self._exercise_claude_plugin_mcp()
         self.results["claude-plugin-mcp"] = claude_probe
         accepted = self._exercise_review("accept")

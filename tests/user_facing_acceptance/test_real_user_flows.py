@@ -36,7 +36,12 @@ class TestRealUserFacingFlows(unittest.TestCase):
     def _run_transport(self, transport):
         if transport not in self.manifest.required_transports:
             self.skipTest("%s is outside the selected acceptance level" % transport)
-        for agent in AGENTS:
+        requested_transport = os.environ.get("CCC_AGENT_ACCEPTANCE_TRANSPORT")
+        if requested_transport and requested_transport != transport:
+            self.skipTest("single-cell run selected %s" % requested_transport)
+        requested_agent = os.environ.get("CCC_AGENT_ACCEPTANCE_AGENT")
+        agents = (requested_agent,) if requested_agent else AGENTS
+        for agent in agents:
             with self.subTest(agent=agent, transport=transport):
                 session = self.runner.run(agent, transport)
                 expected_state = (
@@ -59,8 +64,8 @@ class TestRealUserFacingFlows(unittest.TestCase):
         """Direct SSH agent CLIs routed to foreground ``ccc-agent serve``."""
         self._run_transport("ssh-cli")
 
-    def test_remote_server_desktop_equivalent_matrix(self):
-        """Official server protocol used by desktop/remote clients."""
+    def test_observed_remote_client_matrix(self):
+        """Human-observed official clients; never inferred from protocol smoke."""
         self._run_transport("remote-server")
 
 

@@ -64,6 +64,24 @@ class TestShellSyntax(unittest.TestCase):
         self.assertIn("install that exact wheel", help_result.stdout)
         self.assertIn("black-box platform acceptance", help_result.stdout)
 
+    def test_user_facing_acceptance_supports_single_observed_cell(self):
+        path = os.path.join(AGENT_DIR, "scripts", "run-user-facing-acceptance.sh")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("--cell AGENT TRANSPORT MANIFEST", text)
+        self.assertIn("CCC_AGENT_ACCEPTANCE_AGENT", text)
+        self.assertIn("CCC_AGENT_ACCEPTANCE_TRANSPORT", text)
+        self.assertIn("human-observed Desktop/WebUI", text)
+        manual = os.path.join(
+            AGENT_DIR, "scripts", "manual-observed-client-driver.py")
+        self.assertTrue(os.path.isfile(manual))
+        self.assertTrue(os.access(manual, os.X_OK))
+        help_result = subprocess.run(
+            [manual, "--help"], cwd=AGENT_DIR, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("real desktop/remote-client", help_result.stdout)
+
 
 class TestCodexBwrapAdapter(unittest.TestCase):
     def test_adapter_is_packaged_and_executable(self):

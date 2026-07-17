@@ -26,14 +26,17 @@ The acceptance tooling has two deliberately separate layers:
    conservative shared/unattributed routing fallback, protocol-clean server
    output, installed plugin/MCP metadata, configured client-hardening library,
    package assets, and mount/socket cleanup. The required `codex_command` drives
-   a real Codex app-server protocol session: it sends `initialize`, performs a
-   global `mcpServerStatus/list`, starts an ephemeral thread, calls the
-   non-destructive `ccc_status` tool, and repeats thread-scoped inventory. It
-   requires all six CCC tools and thereby tests both global and per-thread MCP
-   subprocess admission under the real server wrapper. When `claude_command` is
-   set, the harness runs contained `claude mcp list`
-   and requires `plugin:ccc:ccc` to connect. Both probes reject registration
-   failures without making a model call. A wheel reinstall alone does not
+   a **documented stdio app-server protocol smoke**, sourced from OpenAI's public
+   [`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/app-server/README.md#protocol):
+   it sends `initialize`, performs a global `mcpServerStatus/list`, starts an
+   ephemeral thread, calls non-destructive `ccc_status`, and repeats
+   thread-scoped inventory. It requires all six CCC tools. This proves CCC works
+   with the documented app-server stdio API; it **does not claim that Codex
+   Desktop launches this command**. When `claude_command` is set, the harness
+   runs the directly installed Claude Code CLI's `claude mcp list` and requires
+   `plugin:ccc:ccc` to connect. This is a Claude Code CLI check, not a Claude
+   Desktop implementation claim. Both probes reject registration failures
+   without making a model call. A wheel reinstall alone does not
    refresh Claude's separately materialized read-only seed; system deployment
    must rematerialize the seed from the installed package before this check can
    pass.
@@ -70,30 +73,138 @@ scripts/run-user-facing-acceptance.sh \
    --platform /tmp/ccc-agent-platform.json
 ```
 
-A platform pass proves real Codex plugin loading, MCP initialization and tool
-inventory, a thread-scoped `ccc_status` call, and the core BranchFS lifecycle on
-that exact target. It does not imply that Hermes or every authenticated
-model/remote-driver matrix cell is available; those remain separate and must be
-reported explicitly.
+A platform pass proves the documented Codex stdio protocol smoke, CCC MCP
+initialization/tool inventory and a thread-scoped `ccc_status` call, plus the core
+BranchFS lifecycle on that exact target. It is **not** a Codex Desktop, Claude
+Desktop, or Hermes WebUI pass. Those product/UI claims require the observed
+client layer below. Unavailable clients must be reported explicitly rather than
+replaced by inferred server commands.
 
 ## Model/plugin certification boundary
 
 A full pass covers this matrix:
 
-| Agent | Local interactive CLI | Direct SSH CLI | Desktop/server-equivalent remote client |
+| Agent | Direct local CLI | Direct SSH CLI | Human-observed official remote client |
 |---|---:|---:|---:|
-| Codex | `ccc-agent run ... codex` | SSH router -> foreground `ccc-agent serve codex` | official Codex app-server/remote client over SSH |
-| Claude Code | `ccc-agent run ... claude` | SSH router -> foreground `ccc-agent serve claude` | official Claude remote server + `ccd-cli`/desktop client over SSH |
-| Hermes | `ccc-agent run ... hermes` | SSH router -> foreground `ccc-agent serve hermes` | Hermes gateway/API-server client using the same remote route as WebUI |
+| Codex | actual `ccc-agent run ... -- codex` TTY | actual `ssh ... codex` TTY routed by CCC | Codex Desktop operated through its own UI |
+| Claude Code | actual `ccc-agent run ... -- claude` TTY | actual `ssh ... claude` TTY routed by CCC | Claude Desktop/remote client operated through its own UI |
+| Hermes | actual `ccc-agent run ... -- hermes` TTY | actual `ssh ... hermes` TTY routed by CCC | Hermes WebUI/gateway operated through its own UI/API |
 
-`core` runs the three local CLI cells. `full` requires all nine cells. Release
-or deployment certification should use `full`; `core` is only a faster
-development gate.
+`core` runs the three direct local CLI cells. `full` requires all nine cells.
+The local cells are schema-checked to invoke the named client executable directly
+after `ccc-agent run ... --`; the SSH cells must invoke the named client in the
+remote shell. The harness drives their real TTYs, pastes the same user prompts a
+human would, captures the visible responses, and verifies server-side files,
+events, MCP/skill behavior, review UI, and cleanup rather than trusting model
+prose.
 
-A server test is not valid if it merely runs `ccc-agent serve AGENT -- true`, a
-fake shell server, or a direct command that bypasses the vendor client protocol.
-The remote driver must initiate the same server/bootstrap path used by the
-actual desktop or remote client.
+The third column is intentionally called **observed remote client**, not
+"desktop-equivalent." A qualifying run must use an external/manual driver,
+declare `user_flow: observed-client`, provide direct-observation or exact
+official-source provenance, and include operator instructions. The completed
+result must contain direct-observation evidence with product, version,
+timestamp, and screenshot/log artifact. A protocol smoke, guessed launch
+command, or process that merely resembles a desktop backend cannot satisfy this
+column.
+
+A remote-client test is invalid if it merely runs `ccc-agent serve AGENT --
+true`, a fake shell server, `codex app-server --stdio`, or another direct command
+that bypasses the product UI. Protocol smokes remain useful lower-level checks,
+but are reported separately.
+
+## Direct CLI user simulation
+
+The local and SSH CLI cells are automated real-user simulations, not protocol
+stubs. Each agent declares an absolute `client_executable`; preflight requires it
+to exist and be executable so PATH shims cannot silently recurse through
+`ccc-agent`. Their manifest entries must declare `user_flow: direct-cli`. Local
+entries must place that exact executable immediately after the `ccc-agent run ...
+--` separator; SSH entries must invoke that same named executable in the remote
+shell. For example:
+
+```json
+{
+  "driver": "tmux",
+  "user_flow": "direct-cli",
+  "command": [
+    "{ccc_agent}", "run", "--config", "{ccc_agent_config}",
+    "--workspace", "{workspace}", "--agent", "codex", "--",
+    "/home/domen/conda/envs/codex/bin/codex",
+    "--dangerously-bypass-approvals-and-sandbox"
+  ]
+}
+```
+
+The harness starts the real CLI in a TTY, pastes the generated first prompt as a
+user, waits for the real CCC review question, validates the filesystem/session,
+pastes the second user decision, verifies CCC operations, sends the product's
+normal exit command, and exercises the host review UI. The same scenario and
+objective assertions are used for Codex, Claude Code, and Hermes. The dangerous
+client flags disable the vendor's *inner* approval/sandbox only so CCC is the
+boundary under test; they do not bypass CCC's outer BranchFS/bwrap containment.
+
+## Running an observed Desktop/WebUI cell
+
+No Desktop application is installed on the deployment server, so this gate is
+operator-driven. Configure the `remote-server` entry in
+`acceptance.example.json` with the client product/version, observation time,
+artifact destination, SSH target, and the bundled driver:
+
+```json
+{
+  "driver": "external",
+  "user_flow": "observed-client",
+  "command": [
+    "python", "scripts/manual-observed-client-driver.py", "{scenario_file}"
+  ],
+  "evidence": {
+    "basis": "direct-observation",
+    "client_product": "Codex Desktop",
+    "client_version": "<version shown by the app>",
+    "observed_at": "<UTC timestamp>",
+    "artifact": "<screenshot or screen-recording path>"
+  },
+  "operator_instructions": [
+    "Open Codex Desktop; do not launch a substitute CLI or app-server.",
+    "Use the product UI to connect to <SSH target> through the CCC router.",
+    "Open {workspace}, capture the UI, and paste prompts from the driver."
+  ]
+}
+```
+
+Then run only the required observed cell (recommended while an operator is
+present):
+
+```bash
+scripts/run-user-facing-acceptance.sh \
+  --cell codex remote-server /path/to/acceptance.json
+```
+
+Use `claude` or `hermes` in place of `codex` for those products. Run the entire
+nine-cell matrix separately when all products/operators are available:
+
+```bash
+scripts/run-user-facing-acceptance.sh \
+  /path/to/acceptance.json full
+```
+
+For each observed-client cell, the driver prints exact instructions and two
+paste-ready prompts. The operator must:
+
+1. open the named official client and record its displayed version;
+2. use its normal SSH/remote UI—not a hand-written `serve`/app-server command;
+3. open the exact workspace printed by the driver;
+4. capture a screenshot showing client, target, and workspace;
+5. paste the first prompt, wait for the visible CCC commit/discard/keep question,
+   return to the terminal, and paste the visible response there;
+6. after server-side verification releases the driver, paste the second prompt,
+   wait for CCC status, and paste that response back;
+7. close the client and record observed hooks, skills, and artifact paths.
+
+The harness independently checks the resulting CCC session, actual underlay,
+plugin events, remembered decisions, review state, and cleanup. Operator answers
+and screenshots establish which UI/product was used; they do not replace those
+objective server-side assertions.
 
 ## What the automated flow proves
 
