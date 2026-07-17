@@ -36,6 +36,8 @@ CLAUDE_CONTEXT_HOOK = os.path.join(
     PLUGINS, "claude-ccc-containment", "hooks", "ccc-context-hook.sh")
 HERMES_PLUGIN_INIT = os.path.join(
     PLUGINS, "hermes-ccc-containment", "__init__.py")
+DEPLOY_ACCEPTANCE_SH = os.path.join(
+    AGENT_DIR, "scripts", "deploy-server-acceptance.sh")
 
 
 class TestShellSyntax(unittest.TestCase):
@@ -47,6 +49,20 @@ class TestShellSyntax(unittest.TestCase):
                                   stderr=subprocess.PIPE, text=True)
             self.assertEqual(proc.returncode, 0,
                              "%s: %s" % (script, proc.stderr))
+
+    def test_deploy_acceptance_entrypoint_is_executable_and_documents_scope(self):
+        self.assertTrue(os.path.isfile(DEPLOY_ACCEPTANCE_SH))
+        self.assertTrue(os.access(DEPLOY_ACCEPTANCE_SH, os.X_OK))
+        syntax = subprocess.run(
+            ["bash", "-n", DEPLOY_ACCEPTANCE_SH],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        help_result = subprocess.run(
+            [DEPLOY_ACCEPTANCE_SH, "--help"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("install that exact wheel", help_result.stdout)
+        self.assertIn("black-box platform acceptance", help_result.stdout)
 
 
 class TestCodexBwrapAdapter(unittest.TestCase):
