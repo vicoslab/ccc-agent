@@ -89,6 +89,23 @@ class TestMCPEnvironmentRecovery(unittest.TestCase):
             self.assertNotIn("UNTRUSTED", env)
 
 
+class TestMCPProcessHardening(unittest.TestCase):
+    def test_mcp_process_makes_itself_non_dumpable(self):
+        libc = mock.Mock()
+        libc.prctl.return_value = 0
+        with mock.patch("ccc_agent.mcp.ctypes.CDLL", return_value=libc):
+            mcp.harden_mcp_process()
+        libc.prctl.assert_called_once_with(4, 0, 0, 0, 0)
+
+    def test_mcp_process_hardening_failure_is_fatal(self):
+        libc = mock.Mock()
+        libc.prctl.return_value = -1
+        with mock.patch("ccc_agent.mcp.ctypes.CDLL", return_value=libc), \
+                mock.patch("ccc_agent.mcp.ctypes.get_errno", return_value=1):
+            with self.assertRaises(PermissionError):
+                mcp.harden_mcp_process()
+
+
 class TestMCPProtocol(unittest.TestCase):
     def run_server(self, lines, client="claude", destructive_authorized=True):
         reader = io.StringIO("".join(lines))
@@ -639,6 +656,33 @@ raise SystemExit(proc.returncode)
         self.assertFalse(admitted_a["destructive_authorized"])
         self.assertFalse(admitted_b["destructive_authorized"])
         self.assertIsNone(server._mcp_conn)
+
+    def test_closed_destructive_mcp_connection_can_reconnect_from_same_client(self):
+        server = ControlServer(
+            "/unused", lambda req: {}, "token", expected_clients=("codex",))
+        conn_a, conn_b = object(), object()
+        eligible = [
+            {"fingerprint": (10, 3, 20, 2),
+             "destructive_authorized": True, "authorization_reason": None},
+            {"fingerprint": (11, 4, 20, 2),
+             "destructive_authorized": True, "authorization_reason": None},
+        ]
+
+        with mock.patch.object(control_mod, "peer_credentials",
+                               side_effect=[
+                                   (10, os.geteuid(), os.getegid()),
+                                   (11, os.geteuid(), os.getegid()),
+                               ]), mock.patch.object(
+                                   server, "_eligible_mcp_peer",
+                                   side_effect=eligible):
+            admitted_a = server._admit_mcp(conn_a, "codex")
+            server._release_pinned_connection(conn_a)
+            admitted_b = server._admit_mcp(conn_b, "codex")
+
+        self.assertTrue(admitted_a["destructive_authorized"])
+        self.assertTrue(admitted_b["destructive_authorized"])
+        self.assertIs(server._mcp_conn, conn_b)
+        self.assertEqual(server._mcp_fingerprint, (11, 4, 20, 2))
 
     def test_only_registered_initial_client_can_parent_production_mcp(self):
         server = ControlServer("/unused", lambda req: {}, "token",

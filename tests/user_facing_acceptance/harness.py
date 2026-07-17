@@ -462,11 +462,15 @@ class TmuxDriver:
     def alive(self) -> bool:
         return self._run("has-session", "-t", self.name, check=False).returncode == 0
 
-    def send(self, text: str) -> None:
+    def send(self, text: str, submit_keys: Optional[Sequence[str]] = None,
+             submit_delay: float = 0.25) -> None:
         buffer_name = self.name + "-input"
         self._run("load-buffer", "-b", buffer_name, "-", input_text=text)
         self._run("paste-buffer", "-b", buffer_name, "-t", self.name, "-d")
-        self._run("send-keys", "-t", self.name, "Enter")
+        keys = tuple(submit_keys or ("Enter",))
+        for key in keys:
+            time.sleep(submit_delay)
+            self._run("send-keys", "-t", self.name, key)
 
     def send_key(self, key: str) -> None:
         self._run("send-keys", "-t", self.name, key)
@@ -474,6 +478,16 @@ class TmuxDriver:
     def capture(self) -> str:
         proc = self._run("capture-pane", "-p", "-J", "-S", "-", "-t", self.name)
         return proc.stdout
+
+    def wait_for_text(self, expected: str, timeout: float, poll: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.alive():
+                return False
+            if expected in self.capture():
+                return True
+            time.sleep(poll)
+        return False
 
     def write_capture(self, name: str) -> str:
         os.makedirs(self.artifact_dir, exist_ok=True)
@@ -732,10 +746,14 @@ class AcceptanceRunner:
         shown = json.loads(outputs["show"])
         if shown.get("session_id") != session_id:
             raise AcceptanceError("ccc-agent show returned the wrong session")
+        # Live status includes current branch entries and the committed-file
+        # summary. A committed deletion has no live inode/tombstone after apply,
+        # so its durable proof is the session's turn_path_decisions checked
+        # above, not continued presence in `ccc-agent status`.
         for path in (scenario.workspace_new, scenario.workspace_nested,
-                     scenario.workspace_modify, scenario.workspace_delete,
-                     scenario.outside_commit, scenario.outside_discard,
-                     scenario.outside_keep, scenario.deny_file):
+                     scenario.workspace_modify, scenario.outside_commit,
+                     scenario.outside_discard, scenario.outside_keep,
+                     scenario.deny_file):
             if path not in outputs["status"]:
                 raise AcceptanceError("ccc-agent status omitted %s" % path)
         for path in (scenario.outside_commit, scenario.outside_discard,
@@ -839,6 +857,35 @@ class AcceptanceRunner:
             "pending-review after agent exit",
             self.manifest.timeout_seconds, self.manifest.poll_seconds)
 
+    def _handle_startup_interactions(
+            self, driver: TmuxDriver, entry: Mapping) -> None:
+        interactions = entry.get("startup_interactions", [])
+        if not isinstance(interactions, list):
+            raise AcceptanceError("startup_interactions must be a list")
+        for interaction in interactions:
+            if not isinstance(interaction, dict):
+                raise AcceptanceError("startup interaction must be an object")
+            expected = interaction.get("expect")
+            response = interaction.get("response")
+            if not isinstance(expected, str):
+                raise AcceptanceError(
+                    "startup interaction requires a string expect value")
+            if response is not None and not isinstance(response, str):
+                raise AcceptanceError(
+                    "startup interaction response must be a string when set")
+            appeared = driver.wait_for_text(
+                expected, float(interaction.get("timeout_seconds", 15)),
+                self.manifest.poll_seconds)
+            if not appeared:
+                if interaction.get("optional", False):
+                    continue
+                raise AcceptanceError(
+                    "required startup prompt did not appear: %s" % expected)
+            if response is not None:
+                driver.send(response)
+        if interactions:
+            driver.write_capture("startup-interactions.txt")
+
     def _run_tmux(self, scenario: Scenario, entry: Mapping,
                   scenario_file: str, artifact_dir: str) -> dict:
         context = self._context(scenario, scenario_file)
@@ -852,8 +899,21 @@ class AcceptanceRunner:
             command, artifact_dir)
         driver.start()
         try:
-            time.sleep(float(entry.get("startup_seconds", 5)))
-            driver.send(scenario.initial_prompt)
+            self._handle_startup_interactions(driver, entry)
+            time.sleep(float(entry.get("post_startup_seconds", 2)))
+            initial_submit_keys = entry.get(
+                "initial_submit_keys", entry.get("submit_keys"))
+            decision_submit_keys = entry.get(
+                "decision_submit_keys", entry.get("submit_keys"))
+            for label, keys in (("initial_submit_keys", initial_submit_keys),
+                                ("decision_submit_keys", decision_submit_keys)):
+                if (keys is not None and
+                        (not isinstance(keys, list) or
+                         not all(isinstance(key, str) for key in keys))):
+                    raise AcceptanceError(
+                        "%s must be a list of tmux key names" % label)
+            driver.send(
+                scenario.initial_prompt, submit_keys=initial_submit_keys)
             session = self.registry.wait_new(
                 before, expected_kind, scenario.workspace,
                 self.manifest.timeout_seconds, self.manifest.poll_seconds)
@@ -864,7 +924,8 @@ class AcceptanceRunner:
             self._verify_first_turn(
                 scenario, session, transcript, artifact_dir)
 
-            driver.send(scenario.decision_prompt)
+            driver.send(
+                scenario.decision_prompt, submit_keys=decision_submit_keys)
             session = self._wait_decisions(session_id)
             driver.write_capture("decision-turn.txt")
             self._verify_decisions(scenario, session, driver.capture())

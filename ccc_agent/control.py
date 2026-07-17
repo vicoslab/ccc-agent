@@ -635,6 +635,9 @@ class ControlServer(object):
                     client_fingerprint = (self._mcp_fingerprint[2],
                                           self._mcp_fingerprint[3])
                 self._mcp_conn = None
+                self._mcp_fingerprint = None
+                self._mcp_client_name = None
+                self._mcp_destructive_authorized = False
             if self._workspace_conn is conn:
                 client_fingerprint = self._workspace_fingerprint
                 self._workspace_conn = None

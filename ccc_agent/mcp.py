@@ -1,6 +1,7 @@
 """Dependency-free stdio MCP server for contained CCC agent sessions."""
 
 import argparse
+import ctypes
 import json
 import os
 import sys
@@ -16,6 +17,22 @@ SERVER_INFO = {"name": "ccc-agent", "version": "1"}
 MCP_SESSION_ENV_NAMES = (
     "CCC_AGENT_SESSION", ENV_CONTROL_SOCK, ENV_CONTROL_TOKEN,
 )
+PR_SET_DUMPABLE = 4
+
+
+def harden_mcp_process():
+    """Deny same-UID reopening of this trusted MCP transport via procfs.
+
+    Some official clients sanitize ``LD_PRELOAD`` for plugin subprocesses, so
+    the initial-client hardening library cannot be relied on to reach the MCP
+    child. The MCP entrypoint applies the same non-dumpable boundary itself
+    before connecting to the supervisor. Admission still requires the pinned
+    official-client parent and exact process ancestry.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 def restore_session_environment(env, path=SANDBOX_SESSION_ENV):
@@ -406,6 +423,12 @@ def main(argv=None, env=None):
     token = env.get(ENV_CONTROL_TOKEN)
     if not sock or not token:
         sys.stderr.write("ccc-agent mcp-server: not in a contained session\n")
+        return 1
+    try:
+        harden_mcp_process()
+    except OSError as exc:
+        sys.stderr.write(
+            "ccc-agent mcp-server: process hardening failed: %s\n" % exc)
         return 1
     try:
         control = MCPControlClient(

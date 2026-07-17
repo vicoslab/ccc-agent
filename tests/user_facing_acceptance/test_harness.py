@@ -407,6 +407,61 @@ class TestExternalDriverHandshake(unittest.TestCase):
                     result, "first-turn-ready", self.completed_process())
 
 
+class TestStartupInteractions(unittest.TestCase):
+    class Driver:
+        def __init__(self, visible):
+            self.visible = visible
+            self.sent = []
+            self.captures = []
+
+        def wait_for_text(self, expected, timeout, poll):
+            return expected in self.visible
+
+        def send(self, response):
+            self.sent.append(response)
+
+        def write_capture(self, name):
+            self.captures.append(name)
+
+    def runner(self):
+        runner = object.__new__(AcceptanceRunner)
+        runner.manifest = type("Manifest", (), {"poll_seconds": 0.01})()
+        return runner
+
+    def test_answers_real_startup_prompt_before_task(self):
+        driver = self.Driver("Do you trust the contents of this directory?")
+        entry = {"startup_interactions": [{
+            "expect": "Do you trust the contents of this directory?",
+            "response": "1", "timeout_seconds": 1,
+        }]}
+
+        self.runner()._handle_startup_interactions(driver, entry)
+
+        self.assertEqual(driver.sent, ["1"])
+        self.assertEqual(driver.captures, ["startup-interactions.txt"])
+
+    def test_waits_for_ready_marker_without_sending_response(self):
+        driver = self.Driver("bypass permissions on")
+        entry = {"startup_interactions": [{
+            "expect": "bypass permissions on", "timeout_seconds": 1,
+        }]}
+
+        self.runner()._handle_startup_interactions(driver, entry)
+
+        self.assertEqual(driver.sent, [])
+        self.assertEqual(driver.captures, ["startup-interactions.txt"])
+
+    def test_required_startup_prompt_missing_fails(self):
+        driver = self.Driver("")
+        entry = {"startup_interactions": [{
+            "expect": "required prompt", "response": "yes",
+            "timeout_seconds": 0.01,
+        }]}
+
+        with self.assertRaisesRegex(AcceptanceError, "required prompt"):
+            self.runner()._handle_startup_interactions(driver, entry)
+
+
 @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
 class TestTmuxDriver(unittest.TestCase):
     def test_starts_sends_captures_and_exits_a_real_tty_process(self):
@@ -417,17 +472,22 @@ class TestTmuxDriver(unittest.TestCase):
             self.addCleanup(driver.kill)
 
             driver.send("printf 'CCC_TMUX_DRIVER_OK\\n'")
-            deadline = time.monotonic() + 5
-            output = ""
-            while time.monotonic() < deadline:
-                output = driver.capture()
-                if "CCC_TMUX_DRIVER_OK" in output:
-                    break
-                time.sleep(0.05)
-            self.assertIn("CCC_TMUX_DRIVER_OK", output)
+            self.assertTrue(driver.wait_for_text(
+                "CCC_TMUX_DRIVER_OK", 5, 0.05))
+            self.assertIn("CCC_TMUX_DRIVER_OK", driver.capture())
 
             driver.send("exit")
             self.assertTrue(driver.wait_exit(5, 0.05))
+
+    def test_wait_for_text_returns_false_when_prompt_never_appears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = TmuxDriver(
+                "ccc-harness-missing-%d" % os.getpid(), ["/bin/sh"], tmp)
+            driver.start()
+            self.addCleanup(driver.kill)
+
+            self.assertFalse(driver.wait_for_text(
+                "PROMPT_THAT_DOES_NOT_EXIST", 0.1, 0.02))
 
 
 if __name__ == "__main__":

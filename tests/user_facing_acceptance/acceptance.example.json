@@ -21,13 +21,31 @@
             "codex",
             "--",
             "/home/domen/conda/envs/codex/bin/codex",
+            "-c",
+            "features.code_mode_host=false",
             "--dangerously-bypass-approvals-and-sandbox"
           ],
           "expected_agent_kind": "codex",
           "final_review_action": "abort",
-          "startup_seconds": 8,
           "exit_text": "/exit",
-          "user_flow": "direct-cli"
+          "user_flow": "direct-cli",
+          "startup_interactions": [
+            {
+              "expect": "Do you trust the contents of this directory?",
+              "response": "1",
+              "timeout_seconds": 30
+            }
+          ],
+          "post_startup_seconds": 2,
+          "initial_submit_keys": [
+            "Enter",
+            "Enter",
+            "Enter"
+          ],
+          "decision_submit_keys": [
+            "Enter",
+            "Enter"
+          ]
         },
         "ssh-cli": {
           "driver": "tmux",
@@ -87,9 +105,20 @@
           ],
           "expected_agent_kind": "claude",
           "final_review_action": "abort",
-          "startup_seconds": 8,
           "exit_text": "/exit",
-          "user_flow": "direct-cli"
+          "user_flow": "direct-cli",
+          "startup_interactions": [
+            {
+              "expect": "Yes, I trust this folder",
+              "response": "1",
+              "timeout_seconds": 30
+            },
+            {
+              "expect": "bypass permissions on",
+              "timeout_seconds": 30
+            }
+          ],
+          "post_startup_seconds": 1
         },
         "ssh-cli": {
           "driver": "tmux",
